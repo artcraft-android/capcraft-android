@@ -803,14 +803,14 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
     }
 
     /**
-     * A finished voice-over recording (or any sound file) placed on an audio row at [atUs];
-     * [then] gets the new clip's id once it is on the timeline.
+     * A finished voice-over recording (or any sound file, its sound alone) placed on an audio row at
+     * [atUs]; [then] gets the new clip's id once it is on the timeline.
      */
     fun addRecording(file: java.io.File, atUs: Long, then: ((String) -> Unit)? = null) {
         val s = session ?: return
         viewModelScope.launch {
             val result = withContext(Threads.commands) {
-                runCatching { s.addAudio(s.import(file.absolutePath).id, atUs) }
+                runCatching { s.addAudio(s.importSound(file.absolutePath).id, atUs) }
             }
             result.onSuccess { v ->
                 timeline = v
