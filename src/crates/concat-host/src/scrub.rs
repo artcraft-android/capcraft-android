@@ -174,10 +174,10 @@ pub fn sweep(project: &Path, keep: &HashSet<PathBuf>) -> usize {
 /// `target`, through a temporary name moved into place only when whole.
 /// Each slot of the copy's rate takes the file's frame nearest it, so a
 /// sixty-frame file comes out at fifteen and a variable-rate one at an
-/// even pace. On a phone the file is decoded on its chip, which is many times
-/// faster than its cores at a camera's sizes; elsewhere in software on two
-/// threads, as a proxy is, so the machine stays usable. Returns the frames
-/// written.
+/// even pace. In software: on a phone on every core, as its pictures are too
+/// small to be given one of the chip's few decoders (see
+/// `concat_media::hardware`); elsewhere on two threads, as a proxy is, so
+/// the machine stays usable. Returns the frames written.
 pub fn write(
     source: &str,
     target: &Path,

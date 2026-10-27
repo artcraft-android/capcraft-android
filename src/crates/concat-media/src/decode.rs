@@ -548,6 +548,11 @@ struct Source {
     pts: Option<Rational>,
 }
 
+/// The device a codec decodes on and the pixel format its frames arrive
+/// in, none for a phone's chip, whose frames arrive in memory; `None` in
+/// software.
+type OnDevice = Option<(HwDevice, Option<Pixel>)>;
+
 /// Decodes a file through libavcodec and libavfilter.
 pub struct Decoder {
     path: PathBuf,
@@ -575,7 +580,10 @@ pub struct Decoder {
     discard_through: Option<Rational>,
     /// The device the codec is on and the pixel format its frames arrive
     /// in, or `None` in software, which is also where a failed device ends.
-    hardware: Option<(HwDevice, Pixel)>,
+    /// No format for a phone's chip, whose frames arrive in memory.
+    hardware: OnDevice,
+    /// This reader's place on a phone's chip, held while it decodes there.
+    chip: Option<hardware::ChipClaim>,
     /// The last picture's timestamp, for picking up in software after it.
     last_pts: Option<Rational>,
     /// The output frame instant the pacer is at, when pacing.
@@ -637,6 +645,24 @@ impl Decoder {
             .hardware
             .device_for(codec, format)
             .and_then(hardware::device);
+        // A phone's chip has few decoders: a reader that finds them all
+        // held decodes in software, as one whose codec the chip lacks does,
+        // and one drawing a small picture does not ask.
+        let small = options.size.is_some_and(|(width, height)| {
+            u64::from(width) * u64::from(height) < hardware::CHIP_SMALLEST
+        });
+        let mut chip = None;
+        let device = match device {
+            Some(device) if device.kind() == HwDevice::MediaCodec => {
+                if options.keyframes_only || small || hardware::chip_decoder(codec).is_none() {
+                    None
+                } else {
+                    chip = hardware::ChipClaim::take();
+                    chip.as_ref().map(|_| device)
+                }
+            }
+            other => other,
+        };
         let (decoder, accelerated) = match device {
             Some(device) => match Self::open_codec(path, &stream, options, Some(&device)) {
                 Ok(opened) => opened,
@@ -689,6 +715,7 @@ impl Decoder {
             graph: None,
             discard_before: None,
             discard_through: None,
+            chip: chip.filter(|_| accelerated.is_some()),
             hardware: accelerated,
             last_pts: None,
             tick: 0,
@@ -710,13 +737,14 @@ impl Decoder {
 
     /// Opens the stream's codec, on `device` where the codec can decode on
     /// it. Gives back the opened decoder and, when it is on the device, the
-    /// device and the pixel format its frames arrive in.
+    /// device and the pixel format its frames arrive in (none for a
+    /// phone's chip, whose frames arrive in memory).
     fn open_codec(
         path: &Path,
         stream: &ffmpeg::format::stream::Stream<'_>,
         options: &DecodeOptions,
         device: Option<&Device>,
-    ) -> Result<(decoder::Video, Option<(HwDevice, Pixel)>)> {
+    ) -> Result<(decoder::Video, OnDevice)> {
         let mut context = ffmpeg::codec::Context::from_parameters(stream.parameters())
             .map_err(|error| ffi::fail("codec parameters", path, error))?;
         // Every core. libavcodec's API opens a decoder on one thread unless
@@ -733,10 +761,23 @@ impl Decoder {
             (*raw).thread_type = ffmpeg::sys::FF_THREAD_FRAME | ffmpeg::sys::FF_THREAD_SLICE;
             (*raw).thread_count = i32::from(options.threads);
         }
+        // A phone's chip: its own decoder, by name, with no device attached;
+        // see `hardware`'s section on it.
+        if let Some(device) = device
+            && device.kind() == HwDevice::MediaCodec
+            && let Some(chip) = hardware::chip_decoder(context.id())
+        {
+            let decoder = context
+                .decoder()
+                .open_as(chip)
+                .and_then(|opened| opened.video())
+                .map_err(|error| ffi::fail("open decoder", path, error))?;
+            return Ok((decoder, Some((HwDevice::MediaCodec, None))));
+        }
         let accelerated = device.and_then(|device| {
             device
                 .attach(&mut context)
-                .map(|format| (device.kind(), format))
+                .map(|format| (device.kind(), Some(format)))
         });
         let mut decoder = context
             .decoder()
@@ -783,6 +824,7 @@ impl Decoder {
             .map_err(|error| ffi::fail("seek", &self.path, error))?;
         self.decoder = decoder;
         self.hardware = None;
+        self.chip = None;
         if !self.options.keyframes_only {
             if after {
                 self.discard_through = Some(at);
@@ -827,7 +869,7 @@ impl Decoder {
                         .timestamp()
                         .and_then(|ticks| ffi::seconds(ticks, self.time_base))
                         .map(|pts| pts - self.start);
-                    if let Some((device, format)) = self.hardware {
+                    if let Some((device, Some(format))) = self.hardware {
                         if frame.format() == format {
                             frame = match hardware::download(&frame) {
                                 Ok(copy) => copy,
@@ -851,7 +893,23 @@ impl Decoder {
                                 "the codec decoded it in software",
                             );
                             self.hardware = None;
+                            self.chip = None;
                         }
+                    }
+                    // A phone's chip labels its pictures' colour from its own
+                    // reading of the stream, which for an untagged file is not
+                    // the one software makes, and the scaler reads the labels:
+                    // the colours shifted. The stream's own tags go back on,
+                    // so a picture converts the same whichever decoder made it.
+                    if let Some((_, None)) = self.hardware {
+                        frame.set_color_primaries(self.color.primaries);
+                        frame.set_color_transfer_characteristic(self.color.transfer);
+                        frame.set_color_space(self.color.matrix);
+                        frame.set_color_range(if self.color.implied {
+                            ffmpeg::color::Range::Unspecified
+                        } else {
+                            self.color.range
+                        });
                     }
                     if let (Some(before), Some(pts)) = (self.discard_before, pts)
                         && pts < before

@@ -131,6 +131,27 @@ pub fn init(files_dir: String, cache_dir: String) -> Result<(), MobileError> {
     }
     start_logging(&dirs);
     concat_host::logs::catch_panics();
+    // Video decodes on the phone's chip wherever it can: its cores fell
+    // behind playing a camera's files, and a stream the chip refuses, or a
+    // reader past the few it has room for, decodes in software anyway.
+    concat_media::set_hardware_decode(true);
+    // Readers nobody has asked a frame of for ten seconds are closed, looked
+    // at every five, as the desktop editor does: each holds buffers, one on
+    // the chip holds one of its few decoders, and the playhead leaves files
+    // behind. One reopens on its next frame.
+    let _ = std::thread::Builder::new()
+        .name("capcraft-readers".to_owned())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let closed = concat_host::scheduler()
+                    .pool()
+                    .close_idle(std::time::Duration::from_secs(10));
+                if closed > 0 {
+                    log::debug!("memory: closed {closed} idle decoder(s)");
+                }
+            }
+        });
     let titles = Titles::new(&dirs);
     let _ = CONTEXT.set(Context {
         dirs,

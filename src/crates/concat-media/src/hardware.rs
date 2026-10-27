@@ -40,6 +40,17 @@
 //! logged once per process, and the reader carries on in software from the
 //! frame it was at.
 //!
+//! ## A phone's chip
+//!
+//! libavcodec reaches MediaCodec through decoders of its own, not through
+//! the software decoders' hardware tables, so a reader on a phone's chip
+//! opens one of those by name ([`chip_decoder`]) with no device attached:
+//! with no surface to draw on, MediaCodec hands its pictures back in
+//! memory, and nothing is copied back. The chip has few decoders and the
+//! export's encoder needs one, so only a few readers hold one at a time
+//! ([`ChipClaim`]), and none drawing a small picture ([`CHIP_SMALLEST`]);
+//! the rest decode in software.
+//!
 //! ## What this is not, yet
 //!
 //! The frame is copied back to the CPU. On macOS the decoded picture lives
@@ -50,7 +61,7 @@
 
 use std::collections::HashMap;
 use std::ptr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, Once};
 
 use ffmpeg_the_third as ffmpeg;
@@ -141,6 +152,59 @@ impl HwDevice {
             HwDevice::MediaCodec => sys::AVHWDeviceType::MEDIACODEC,
             HwDevice::Vaapi => sys::AVHWDeviceType::VAAPI,
         }
+    }
+}
+
+/// The decoder on a phone's chip for streams of `codec`, when the linked
+/// FFmpeg has one. See the module's section on a phone's chip.
+pub(crate) fn chip_decoder(codec: ffmpeg::codec::Id) -> Option<ffmpeg::Codec> {
+    use ffmpeg::codec::Id;
+    let name = match codec {
+        Id::H264 => "h264_mediacodec",
+        Id::HEVC => "hevc_mediacodec",
+        Id::VP8 => "vp8_mediacodec",
+        Id::VP9 => "vp9_mediacodec",
+        Id::AV1 => "av1_mediacodec",
+        _ => return None,
+    };
+    decoder::find_by_name(name)
+}
+
+/// How many readers may hold a decoder on a phone's chip at once: the clip
+/// under the playhead, the one a cut leads into, and one more for a layer.
+/// A cheaper phone runs out of decoders after a handful, and an export can
+/// only encode on the chip.
+const CHIP_READERS: usize = 3;
+
+/// Pictures smaller than this, in pixels, are decoded in software even on a
+/// phone: a filmstrip tile, a thumbnail or a scrub copy wants a frame or a
+/// few at no particular pace, and took the chip's places from the picture
+/// the editor plays when a project opened. About 640 by 360.
+pub(crate) const CHIP_SMALLEST: u64 = 640 * 360;
+
+/// The readers holding a decoder on the chip now.
+static CHIP_HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// A reader's place on a phone's chip, given back when it is dropped.
+#[derive(Debug)]
+pub(crate) struct ChipClaim(());
+
+impl ChipClaim {
+    /// A place on the chip, or `None` when every place is taken and the
+    /// reader should decode in software.
+    pub(crate) fn take() -> Option<Self> {
+        CHIP_HELD
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held < CHIP_READERS).then_some(held + 1)
+            })
+            .ok()
+            .map(|_| ChipClaim(()))
+    }
+}
+
+impl Drop for ChipClaim {
+    fn drop(&mut self) {
+        CHIP_HELD.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
