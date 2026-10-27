@@ -168,7 +168,8 @@ fun EditorScreen(path: String, incoming: List<Uri>, then: String? = null, close:
                             belowPreview = root - at.boundsInRoot().bottom
                         },
                     ) {
-                        Preview(vm, Modifier.fillMaxSize())
+                        // under the full-screen player it is hidden, and would make every frame a second time
+                        if (!vm.fullscreen) Preview(vm, Modifier.fillMaxSize())
                     }
                     PlayBar(vm)
                     Box(Modifier.fillMaxWidth().height(timelineHeight)) {
@@ -256,7 +257,7 @@ fun resolutionLabel(short: Int): String = when {
 
 /**
  * The composited frame at the playhead. While paused, every playhead or edit change asks for a new
- * frame (the newest wins); while playing, frames are drawn as fast as the engine makes them.
+ * frame (the newest wins); while playing, each frame of the timeline is drawn once, when the display reaches it.
  */
 @Composable
 fun Preview(vm: EditorViewModel, modifier: Modifier) {
@@ -329,14 +330,17 @@ private class ScrubMeter {
     }
 }
 
-/** Two bitmaps the engine draws into in turn, so the one on screen is never written mid-frame. */
+/**
+ * Three bitmaps the engine draws into in turn: the one on screen, the one made ahead of it while playing, and one
+ * more, so the one on screen is never written mid-frame.
+ */
 private class FrameBuffers {
-    private val bitmaps = arrayOfNulls<Bitmap>(2)
+    private val bitmaps = arrayOfNulls<Bitmap>(3)
     private var next = 0
     fun take(): Bitmap? = bitmaps[next]
     fun put(b: Bitmap) {
         bitmaps[next] = b
-        next = 1 - next
+        next = (next + 1) % bitmaps.size
     }
 }
 
@@ -350,23 +354,50 @@ private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageB
     LaunchedEffect(session, revision, width, height, vm.playing) {
         val s = session ?: return@LaunchedEffect
         if (vm.playing) {
-            var frames = 0
-            var since = System.nanoTime()
-            while (isActive && vm.playing) {
-                val at = vm.playhead
-                frames++
-                val now = System.nanoTime()
-                if (now - since >= 2_000_000_000L) {
-                    android.util.Log.d("CapCraft", "preview %.1f fps at %dx%d".format(frames * 1e9 / (now - since), width, height))
-                    frames = 0
-                    since = now
-                }
+            // which frame of the timeline an instant falls in, and the instant a frame is made for: a quarter of the way
+            // in, as the engine takes the frame nearest the time it is asked for, and the middle was a tie that
+            // rounding settled both ways, so one frame in three came back as the one before it
+            val num = (vm.timeline?.fpsNum ?: 30L).coerceAtLeast(1L)
+            val den = (vm.timeline?.fpsDen ?: 1L).coerceAtLeast(1L)
+            fun frameAt(us: Long) = us * num / (den * 1_000_000L)
+            fun timeOf(frame: Long) = (4 * frame + 1) * den * 1_000_000L / (4 * num)
+            suspend fun make(frame: Long): Bitmap? {
                 val pic = withContext(Threads.preview) {
-                    runCatching { s.frame(at, width.toUInt(), height.toUInt(), Motion.PLAYING) }.getOrNull()
-                } ?: break
-                val b = pic.intoBitmap(buffers.take()) ?: break
+                    runCatching { s.frame(timeOf(frame), width.toUInt(), height.toUInt(), Motion.PLAYING) }.getOrNull()
+                } ?: return null
+                val b = pic.intoBitmap(buffers.take()) ?: return null
                 buffers.put(b)
-                image = b.asImageBitmap()
+                return b
+            }
+            var shown = -1L
+            var ready: Bitmap? = null
+            var readyFrame = -1L
+            var frames = 0
+            var skipped = 0L
+            var since = System.nanoTime()
+            withContext(AndroidUiDispatcher.Main) {
+                while (isActive && vm.playing) {
+                    // each frame of the timeline is made once, while the one before it is on screen, and shown on the
+                    // display frame the playhead reaches it; one the engine was too slow for is skipped, not caught up
+                    // on, so the picture keeps time with the sound
+                    androidx.compose.runtime.withFrameNanos { }
+                    val frame = frameAt(vm.playhead)
+                    if (frame == shown) continue
+                    if (shown >= 0 && frame > shown + 1) skipped += frame - shown - 1
+                    val b = (if (frame == readyFrame) ready else null) ?: make(frame) ?: break
+                    image = b.asImageBitmap()
+                    shown = frame
+                    frames++
+                    val now = System.nanoTime()
+                    if (now - since >= 2_000_000_000L) {
+                        android.util.Log.d("CapCraft", "preview %.1f fps at %dx%d, %d frames skipped".format(frames * 1e9 / (now - since), width, height, skipped))
+                        frames = 0
+                        skipped = 0
+                        since = now
+                    }
+                    readyFrame = frame + 1
+                    ready = make(readyFrame) ?: break
+                }
             }
         } else {
             suspend fun show(at: Long, motion: Motion) {
