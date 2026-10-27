@@ -17,7 +17,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -78,40 +80,43 @@ fun ColumnScope.HslSheet(params: JSONObject, set: (Map<String, Double?>, String?
     var band by remember { mutableIntStateOf(0) }
     val (key, hue) = HSL_BANDS[band]
     SheetHead("HSL", onReset = { set(HSL_KEYS.associateWith { null }, null) }, onClose = close)
-    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-        HSL_BANDS.forEachIndexed { i, (_, h) ->
-            Box(
-                Modifier.size(30.dp).clip(CircleShape)
-                    .then(if (i == band) Modifier.border(2.dp, Color.White, CircleShape) else Modifier)
-                    .padding(if (i == band) 4.dp else 2.dp).clip(CircleShape).background(Color.hsv(h, 0.75f, 0.95f))
-                    .clickable { band = i },
-            )
+    // the bands and their sliders scroll on a phone too short for them all
+    Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState())) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+            HSL_BANDS.forEachIndexed { i, (_, h) ->
+                Box(
+                    Modifier.size(30.dp).clip(CircleShape)
+                        .then(if (i == band) Modifier.border(2.dp, Color.White, CircleShape) else Modifier)
+                        .padding(if (i == band) 4.dp else 2.dp).clip(CircleShape).background(Color.hsv(h, 0.75f, 0.95f))
+                        .clickable { band = i },
+                )
+            }
         }
-    }
-    // each track runs through what its knob moves the band through
-    val tracks = listOf(
-        Brush.horizontalGradient(listOf(Color.hsv((hue + 330f) % 360f, 0.8f, 0.95f), Color.hsv(hue, 0.8f, 0.95f), Color.hsv((hue + 30f) % 360f, 0.8f, 0.95f))),
-        Brush.horizontalGradient(listOf(Color(0xFF9A9A9A), Color.hsv(hue, 1f, 0.95f))),
-        Brush.horizontalGradient(listOf(Color.hsv(hue, 0.8f, 0.25f), Color.hsv(hue, 0.25f, 1f))),
-    )
-    listOf("hue" to "Hue", "sat" to "Saturation", "light" to "Lightness").forEachIndexed { i, (part, label) ->
-        androidx.compose.runtime.key(key, part) {
-            var held by remember { mutableStateOf<Float?>(null) }
-            ValueSlider(
-                value = held ?: params.optDouble("${key}_$part", 0.0).toFloat(),
-                range = -100f..100f,
-                label = { "${it.roundToInt()}" },
-                onChange = { v ->
-                    held = v
-                    set(mapOf("${key}_$part" to v.roundToInt().toDouble()), "adjust-hsl-$key-$part")
-                },
-                onDone = {
-                    held = null
-                    done()
-                },
-                title = label,
-                track = tracks[i],
-            )
+        // each track runs through what its knob moves the band through
+        val tracks = listOf(
+            Brush.horizontalGradient(listOf(Color.hsv((hue + 330f) % 360f, 0.8f, 0.95f), Color.hsv(hue, 0.8f, 0.95f), Color.hsv((hue + 30f) % 360f, 0.8f, 0.95f))),
+            Brush.horizontalGradient(listOf(Color(0xFF9A9A9A), Color.hsv(hue, 1f, 0.95f))),
+            Brush.horizontalGradient(listOf(Color.hsv(hue, 0.8f, 0.25f), Color.hsv(hue, 0.25f, 1f))),
+        )
+        listOf("hue" to "Hue", "sat" to "Saturation", "light" to "Lightness").forEachIndexed { i, (part, label) ->
+            androidx.compose.runtime.key(key, part) {
+                var held by remember { mutableStateOf<Float?>(null) }
+                ValueSlider(
+                    value = held ?: params.optDouble("${key}_$part", 0.0).toFloat(),
+                    range = -100f..100f,
+                    label = { "${it.roundToInt()}" },
+                    onChange = { v ->
+                        held = v
+                        set(mapOf("${key}_$part" to v.roundToInt().toDouble()), "adjust-hsl-$key-$part")
+                    },
+                    onDone = {
+                        held = null
+                        done()
+                    },
+                    title = label,
+                    track = tracks[i],
+                )
+            }
         }
     }
 }

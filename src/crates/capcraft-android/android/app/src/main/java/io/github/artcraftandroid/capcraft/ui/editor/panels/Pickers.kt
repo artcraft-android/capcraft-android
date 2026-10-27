@@ -762,53 +762,57 @@ private fun ColumnScope.AdjustContent(vm: EditorViewModel) {
     }
 
     run {
-        // Smart and Customize: where each part of the row starts, the lit one where the row was sent
-        Row(Modifier.fillMaxWidth().padding(start = 16.dp, top = 4.dp, bottom = 2.dp), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
-            listOf("Smart", "Customize").forEachIndexed { i, name ->
-                Text(
-                    name,
-                    style = Type.Body.copy(
-                        fontSize = 15.sp,
-                        color = if (section == i) Palette.Text else Palette.TextSecondary,
-                        fontWeight = if (section == i) FontWeight.SemiBold else FontWeight.Normal,
-                    ),
-                    modifier = Modifier.clickable {
-                        section = i
-                        scope.launch { row.animateScrollToItem(if (i == 0) 0 else SMART.size + 1) }
-                    }.padding(vertical = 6.dp),
-                )
-            }
-        }
-        LazyRow(Modifier.fillMaxWidth(), state = row, contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp), verticalAlignment = Alignment.Top) {
-            items(SMART.size) { i ->
-                val tool = SMART[i]
-                AdjustTool(tool.label, which == -1 - i, changed = false, onClick = {
-                    which = -1 - i
-                    section = 0
-                    sheet = null
-                    runSmart(tool)
-                }) { tint -> Glyph(tool.icon, tint, size = 22.dp) }
-            }
-            item {
-                Box(Modifier.padding(top = 18.dp, start = 4.dp, end = 4.dp).size(1.dp, 26.dp).background(Color(0xFF474747)))
-            }
-            items(KNOBS.size) { i ->
-                val k = KNOBS[i]
-                val changed = when (k.key) {
-                    HSL -> HSL_KEYS.any { plus.optDouble(it, 0.0) != 0.0 }
-                    GRAPHS -> CURVE_KEYS.any { adjust.has(it) }
-                    WHEELS -> WHEEL_KEYS.any { adjust.optDouble(it, 0.0) != 0.0 }
-                    else -> paramsOf(k).has(k.key) && paramsOf(k).optDouble(k.key) != k.default.toDouble()
+        // an open sheet takes the place of the tools, so a phone with less height still shows all of it;
+        // its fold-away button brings them back
+        if (sheet == null) {
+            // Smart and Customize: where each part of the row starts, the lit one where the row was sent
+            Row(Modifier.fillMaxWidth().padding(start = 16.dp, top = 4.dp, bottom = 2.dp), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                listOf("Smart", "Customize").forEachIndexed { i, name ->
+                    Text(
+                        name,
+                        style = Type.Body.copy(
+                            fontSize = 15.sp,
+                            color = if (section == i) Palette.Text else Palette.TextSecondary,
+                            fontWeight = if (section == i) FontWeight.SemiBold else FontWeight.Normal,
+                        ),
+                        modifier = Modifier.clickable {
+                            section = i
+                            scope.launch { row.animateScrollToItem(if (i == 0) 0 else SMART.size + 1) }
+                        }.padding(vertical = 6.dp),
+                    )
                 }
-                AdjustTool(k.label, i == which, changed, onClick = {
-                    which = i
-                    section = 1
-                    sheet = k.key.takeIf { it == HSL || it == GRAPHS || it == WHEELS }
-                }) { tint ->
-                    if (k.key == HSL) {
-                        Text("HSL", style = Type.Small.copy(fontSize = 13.sp, color = tint))
-                    } else {
-                        Glyph(knobIcon(k.key), tint, size = 22.dp)
+            }
+            LazyRow(Modifier.fillMaxWidth(), state = row, contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp), verticalAlignment = Alignment.Top) {
+                items(SMART.size) { i ->
+                    val tool = SMART[i]
+                    AdjustTool(tool.label, which == -1 - i, changed = false, onClick = {
+                        which = -1 - i
+                        section = 0
+                        sheet = null
+                        runSmart(tool)
+                    }) { tint -> Glyph(tool.icon, tint, size = 22.dp) }
+                }
+                item {
+                    Box(Modifier.padding(top = 18.dp, start = 4.dp, end = 4.dp).size(1.dp, 26.dp).background(Color(0xFF474747)))
+                }
+                items(KNOBS.size) { i ->
+                    val k = KNOBS[i]
+                    val changed = when (k.key) {
+                        HSL -> HSL_KEYS.any { plus.optDouble(it, 0.0) != 0.0 }
+                        GRAPHS -> CURVE_KEYS.any { adjust.has(it) }
+                        WHEELS -> WHEEL_KEYS.any { adjust.optDouble(it, 0.0) != 0.0 }
+                        else -> paramsOf(k).has(k.key) && paramsOf(k).optDouble(k.key) != k.default.toDouble()
+                    }
+                    AdjustTool(k.label, i == which, changed, onClick = {
+                        which = i
+                        section = 1
+                        sheet = k.key.takeIf { it == HSL || it == GRAPHS || it == WHEELS }
+                    }) { tint ->
+                        if (k.key == HSL) {
+                            Text("HSL", style = Type.Small.copy(fontSize = 13.sp, color = tint))
+                        } else {
+                            Glyph(knobIcon(k.key), tint, size = 22.dp)
+                        }
                     }
                 }
             }
