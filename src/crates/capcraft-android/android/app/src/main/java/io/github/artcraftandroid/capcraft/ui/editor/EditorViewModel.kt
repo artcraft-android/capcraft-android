@@ -453,7 +453,7 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
         }
     }
 
-    /** Copies a picked file into the project and adds it as an overlay or as sound. */
+    /** Copies a picked file into the project and adds it as an overlay or as sound (a video's sound alone). */
     fun addFile(uri: Uri, asAudio: Boolean) {
         val s = session ?: return
         viewModelScope.launch {
@@ -461,8 +461,8 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
             val result = withContext(Threads.commands) {
                 runCatching {
                     val file = Media.importUri(getApplication(), path, uri)
-                    val media = s.import(file.absolutePath)
-                    if (asAudio) s.addAudio(media.id, playhead) else s.addOverlay(media.id, playhead)
+                    if (asAudio) s.addAudio(s.importSound(file.absolutePath).id, playhead)
+                    else s.addOverlay(s.import(file.absolutePath).id, playhead)
                 }
             }
             busy = null

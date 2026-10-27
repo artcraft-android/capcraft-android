@@ -177,6 +177,54 @@ fn a_first_clip_gives_the_project_its_frame_and_cuts_close_up() {
     delete_project(made.path).expect("deleted");
 }
 
+/// A song carries its album cover as a one-frame picture stream, and a
+/// video brought in for its sound has a picture too: both come in as sound,
+/// and land on an audio row as sound clips (issue #7).
+#[test]
+fn songs_with_covers_and_videos_taken_for_sound_are_sound() {
+    start();
+    let (Some(mp3), Some(m4a), Some(bars), Some(still)) = (
+        media("cc-r-song-cover.mp3"),
+        media("cc-s-song-cover.m4a"),
+        media("cc-a-bars-16x9.mp4"),
+        media("cc-d-still.jpg"),
+    ) else {
+        return;
+    };
+    let made = create_project("Songs".to_owned(), 1080, 1920, 30).expect("made");
+    let session = MobileSession::open(made.path.clone()).expect("opens");
+    let songs = [mp3, m4a].map(|song| session.import(song).expect("imports"));
+    let taken = session.import_sound(bars).expect("its sound imports");
+    for item in songs.iter().chain([&taken]) {
+        assert_eq!(item.kind, "audio", "{}", item.id);
+        assert_eq!((item.width, item.height), (0, 0), "{}", item.id);
+        assert!(item.has_audio, "{}", item.id);
+    }
+    assert!(
+        session.import_sound(still).is_err(),
+        "a picture has no sound to take"
+    );
+    let mut view = session.view();
+    for item in songs.iter().chain([&taken]) {
+        view = session.add_audio(item.id.clone(), 0).expect("placed");
+    }
+    let clips: Vec<_> = view
+        .rows
+        .iter()
+        .flat_map(|row| row.clips.iter().map(move |clip| (row.kind, clip)))
+        .collect();
+    assert_eq!(clips.len(), 3);
+    for (row, clip) in clips {
+        assert_eq!(
+            (row, clip.kind.as_str()),
+            (RowKind::Audio, "audio"),
+            "{}",
+            clip.name
+        );
+    }
+    delete_project(made.path).expect("deleted");
+}
+
 #[test]
 fn a_faster_clip_leaves_no_gap_on_the_main_track() {
     start();

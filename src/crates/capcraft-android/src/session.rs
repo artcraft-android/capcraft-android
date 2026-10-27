@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use concat_export::ExportClip;
 use concat_host::preview::FrameSpec;
 use concat_host::session::Session;
-use concat_project::commands::ClipPatch;
+use concat_project::commands::{ClipPatch, NewMedia};
 use concat_project::model::{ClipKind, MediaKind, Timeline, VideoSettings};
 use concat_project::{Command, DocumentSettings};
 use serde_json::{Value, json};
@@ -366,6 +366,69 @@ impl MobileSession {
             })
             .unwrap_or(STILL_SECONDS)
     }
+
+    /// Adds `item`, read from `path`, to the bin, or answers with the entry
+    /// a file already there has.
+    fn add_to_bin(&self, path: String, item: NewMedia) -> Result<MediaInfo, MobileError> {
+        let mut state = self.lock();
+        let existing = |state: &State| {
+            state
+                .session
+                .project()
+                .media
+                .iter()
+                .find(|media| media.path == path)
+                .map(|media| media.id.clone())
+        };
+        let id = match existing(&state) {
+            Some(id) => id,
+            None => {
+                state.session.apply(Command::AddMedia { item })?;
+                state.revision += 1;
+                let state = &mut *state;
+                crate::scrubs::see_to(&state.session, &mut state.scrubbed);
+                existing(state).ok_or_else(|| "the file did not land in the bin".to_owned())?
+            }
+        };
+        let media = state
+            .session
+            .project()
+            .media
+            .iter()
+            .find(|media| media.id == id)
+            .cloned()
+            .ok_or_else(|| "the bin lost the file".to_owned())?;
+        Ok(MediaInfo {
+            id,
+            kind: match media.kind {
+                MediaKind::Video => "video",
+                MediaKind::Audio => "audio",
+                MediaKind::Image => "image",
+            }
+            .to_owned(),
+            duration_us: media.duration.map(micros).unwrap_or(0),
+            width: media.width.unwrap_or(0),
+            height: media.height.unwrap_or(0),
+            has_audio: media.has_audio,
+        })
+    }
+}
+
+/// A file's bin entry as its sound alone, or an error for a file with none.
+fn sound_only(summary: &concat_host::media::MediaSummary) -> Result<NewMedia, MobileError> {
+    if summary.audio.is_none() {
+        return Err("that file has no sound".to_owned().into());
+    }
+    Ok(NewMedia {
+        kind: MediaKind::Audio,
+        width: None,
+        height: None,
+        frame_rate: None,
+        frame_rate_fraction: None,
+        video_codec: None,
+        color_space: Default::default(),
+        ..summary.to_new_media()
+    })
 }
 
 /// Parses one engine command from its JSON (`{"op": "splitClips", ...}`).
@@ -490,48 +553,15 @@ impl MobileSession {
     /// A file already in the bin is answered with its existing entry.
     pub fn import(&self, path: String) -> Result<MediaInfo, MobileError> {
         let summary = concat_host::media::probe(&path)?;
-        let item = summary.to_new_media();
-        let mut state = self.lock();
-        let existing = |state: &State| {
-            state
-                .session
-                .project()
-                .media
-                .iter()
-                .find(|media| media.path == path)
-                .map(|media| media.id.clone())
-        };
-        let id = match existing(&state) {
-            Some(id) => id,
-            None => {
-                state.session.apply(Command::AddMedia { item })?;
-                state.revision += 1;
-                let state = &mut *state;
-                crate::scrubs::see_to(&state.session, &mut state.scrubbed);
-                existing(state).ok_or_else(|| "the file did not land in the bin".to_owned())?
-            }
-        };
-        let media = state
-            .session
-            .project()
-            .media
-            .iter()
-            .find(|media| media.id == id)
-            .cloned()
-            .ok_or_else(|| "the bin lost the file".to_owned())?;
-        Ok(MediaInfo {
-            id,
-            kind: match media.kind {
-                MediaKind::Video => "video",
-                MediaKind::Audio => "audio",
-                MediaKind::Image => "image",
-            }
-            .to_owned(),
-            duration_us: media.duration.map(micros).unwrap_or(0),
-            width: media.width.unwrap_or(0),
-            height: media.height.unwrap_or(0),
-            has_audio: media.has_audio,
-        })
+        self.add_to_bin(path, summary.to_new_media())
+    }
+
+    /// Reads a file and adds only its sound to the bin: a video brought in
+    /// for its sound comes in as sound, so a clip of it is a sound clip, not
+    /// a video on an audio row. A file with no sound is refused.
+    pub fn import_sound(&self, path: String) -> Result<MediaInfo, MobileError> {
+        let item = sound_only(&concat_host::media::probe(&path)?)?;
+        self.add_to_bin(path, item)
     }
 
     /// Puts bin items on the main track, one after another, at the clip
@@ -1654,13 +1684,26 @@ impl MobileSession {
     }
 
     /// Points a clip at another file (the user's replacement), keeping its
-    /// length, place and look.
+    /// length, place and look; a sound clip takes only the file's sound.
     pub fn replace_media(
         &self,
         clip_id: String,
         path: String,
     ) -> Result<TimelineView, MobileError> {
-        let item = concat_host::media::probe(&path)?.to_new_media();
+        let summary = concat_host::media::probe(&path)?;
+        let sound = self
+            .lock()
+            .session
+            .project()
+            .active()
+            .clips
+            .iter()
+            .any(|clip| clip.id == clip_id && clip.kind == ClipKind::Audio);
+        let item = if sound {
+            sound_only(&summary)?
+        } else {
+            summary.to_new_media()
+        };
         self.run(vec![Command::ReplaceClipMedia {
             clip_id,
             item,

@@ -612,12 +612,9 @@ impl Decoder {
 
         let path = path.as_ref();
         let input = ffmpeg::format::input(path).map_err(|error| ffi::fail("open", path, error))?;
-        let stream = input
-            .streams()
-            .best(ffmpeg::media::Type::Video)
-            .ok_or_else(|| Error::NoVideoStream {
-                path: path.to_path_buf(),
-            })?;
+        let stream = crate::probe::picture_stream(&input).ok_or_else(|| Error::NoVideoStream {
+            path: path.to_path_buf(),
+        })?;
         let stream_index = stream.index();
         let time_base = stream.time_base();
         let start = ffi::start_of(&stream);

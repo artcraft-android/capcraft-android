@@ -69,7 +69,8 @@ pub struct MediaInfo {
     pub path: PathBuf,
     /// Container duration, when the container bothers to state one.
     pub duration: Option<Rational>,
-    /// First video stream, if any.
+    /// The video stream, if any: libavformat's best moving picture (see
+    /// [`picture_stream`]), never a song's cover art.
     pub video: Option<VideoStream>,
     /// The first audio stream in file order, if any: the default.
     pub audio: Option<AudioStream>,
@@ -96,7 +97,7 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
     let duration =
         (duration > 0).then(|| Rational::new(duration, i64::from(ffmpeg::sys::AV_TIME_BASE)));
 
-    let video = match input.streams().best(ffmpeg::media::Type::Video) {
+    let video = match picture_stream(&input) {
         Some(stream) => Some(video_stream(&stream, path)?),
         None => None,
     };
@@ -137,6 +138,26 @@ pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
 
 fn is_audio(stream: &ffmpeg::format::stream::Stream<'_>) -> bool {
     stream.parameters().medium() == ffmpeg::media::Type::Audio
+}
+
+/// The video stream the editor reads: libavformat's best, unless that is
+/// an attached picture, the one-frame stream a music file carries its
+/// album cover in. Taken for footage, a song came into the editor as a
+/// video of its cover; a file whose only pictures are covers has no video.
+pub(crate) fn picture_stream(
+    input: &ffmpeg::format::context::Input,
+) -> Option<ffmpeg::format::stream::Stream<'_>> {
+    let cover = |stream: &ffmpeg::format::stream::Stream<'_>| {
+        stream
+            .disposition()
+            .contains(ffmpeg::format::stream::Disposition::ATTACHED_PIC)
+    };
+    match input.streams().best(ffmpeg::media::Type::Video) {
+        Some(best) if cover(&best) => input.streams().find(|stream| {
+            stream.parameters().medium() == ffmpeg::media::Type::Video && !cover(stream)
+        }),
+        best => best,
+    }
 }
 
 /// The audio stream a caller means: `wanted`, when it names an audio stream
