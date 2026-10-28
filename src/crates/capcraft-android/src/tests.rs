@@ -177,6 +177,80 @@ fn a_first_clip_gives_the_project_its_frame_and_cuts_close_up() {
     delete_project(made.path).expect("deleted");
 }
 
+/// The mean over every pixel's colour channels of `channel(a, b)`.
+fn mean_channels(a: &crate::Picture, b: &crate::Picture, channel: impl Fn(u8, u8) -> i32) -> f64 {
+    let pixels = a.rgba.chunks_exact(4).zip(b.rgba.chunks_exact(4));
+    let total: i64 = pixels
+        .map(|(a, b)| (0..3).map(|c| i64::from(channel(a[c], b[c]))).sum::<i64>())
+        .sum();
+    total as f64 / (a.rgba.len() / 4 * 3) as f64
+}
+
+/// A `.cube` table from the phone becomes a filter like the built-ins
+/// (issue #11): listed under "Imported" by its file's name and drawn over
+/// the picture; a file that is not a table is refused; and once removed it
+/// is unlisted, and the picture draws without it.
+#[test]
+fn an_imported_cube_is_a_filter_until_it_is_removed() {
+    start();
+    let Some(bars) = media("cc-a-bars-16x9.mp4") else {
+        return;
+    };
+    let made = create_project("Looks".to_owned(), 1920, 1080, 30).expect("made");
+    let session = MobileSession::open(made.path.clone()).expect("opens");
+    let item = session.import(bars).expect("imports");
+    session.add_to_main(vec![item.id], 0).expect("placed");
+    let dir = std::env::temp_dir().join(format!("capcraft-looks-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a scratch folder");
+    // every channel turned over: red changes fastest, then green, then blue
+    let mut table = String::from("TITLE \"Negative\"\nLUT_3D_SIZE 2\n");
+    for index in 0..8 {
+        let [r, g, b] = [index & 1, (index >> 1) & 1, (index >> 2) & 1].map(|bit| 1 - bit);
+        table.push_str(&format!("{r} {g} {b}\n"));
+    }
+    let path = dir.join("Negative Film.cube");
+    std::fs::write(&path, table).expect("the table");
+    let id = crate::looks::import_look(path.to_string_lossy().into_owned()).expect("imported");
+    assert_eq!(id, "user.negative-film");
+    let listed = crate::frames::packages("filter".to_owned());
+    let look = listed.iter().find(|p| p.id == id).expect("listed");
+    assert_eq!(
+        (look.name.as_str(), look.category.as_str()),
+        ("Negative Film", "Imported")
+    );
+    let at = 1_000_000;
+    let plain = session
+        .frame(at, 64, 36, crate::session::Motion::Still)
+        .expect("a frame");
+    let graded = session
+        .frame_with(at, id.clone(), 64, 36)
+        .expect("a frame with the look");
+    let changed = mean_channels(&plain, &graded, |a, b| (i32::from(a) - i32::from(b)).abs());
+    let turned = mean_channels(&plain, &graded, |a, b| {
+        (i32::from(a) + i32::from(b) - 255).abs()
+    });
+    assert!(changed > 40.0, "the look changed the picture: {changed}");
+    assert!(turned < 8.0, "every channel turned over: {turned}");
+
+    let junk = dir.join("notes.cube");
+    std::fs::write(&junk, "not a table").expect("a file");
+    assert!(crate::looks::import_look(junk.to_string_lossy().into_owned()).is_err());
+    let listed = crate::frames::packages("filter".to_owned());
+    assert!(!listed.iter().any(|p| p.id == "user.notes"));
+
+    crate::looks::remove_look(id.clone()).expect("removed");
+    let listed = crate::frames::packages("filter".to_owned());
+    assert!(!listed.iter().any(|p| p.id == id));
+    let without = session
+        .frame_with(at, id.clone(), 64, 36)
+        .expect("a frame without the look");
+    let left = mean_channels(&plain, &without, |a, b| (i32::from(a) - i32::from(b)).abs());
+    assert!(left < 2.0, "the picture draws without it: {left}");
+    assert!(crate::looks::remove_look("concat.noir".to_owned()).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+    delete_project(made.path).expect("deleted");
+}
+
 /// A song carries its album cover as a one-frame picture stream, and a
 /// video brought in for its sound has a picture too: both come in as sound,
 /// and land on an audio row as sound clips (issue #7).

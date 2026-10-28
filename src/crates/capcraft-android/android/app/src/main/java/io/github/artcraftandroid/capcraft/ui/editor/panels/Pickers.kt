@@ -1,5 +1,7 @@
 package io.github.artcraftandroid.capcraft.ui.editor.panels
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -55,6 +57,7 @@ import io.github.artcraftandroid.capcraft.ui.Glyph
 import io.github.artcraftandroid.capcraft.ui.LucideIcons
 import io.github.artcraftandroid.capcraft.ui.Palette
 import io.github.artcraftandroid.capcraft.ui.Type
+import io.github.artcraftandroid.capcraft.ui.common.ConfirmDialog
 import io.github.artcraftandroid.capcraft.ui.editor.EditorViewModel
 import io.github.artcraftandroid.capcraft.ui.editor.Panel
 import kotlin.math.abs
@@ -67,7 +70,7 @@ import org.json.JSONObject
 /** The engine's packages of [kind], loaded once. */
 @Composable
 fun rememberPackages(kind: String): List<PackageInfo> {
-    val list by produceState(PackageCache.get(kind) ?: emptyList(), kind) {
+    val list by produceState(PackageCache.get(kind) ?: emptyList(), kind, PackageCache.version.intValue) {
         value = PackageCache.get(kind) ?: withContext(Threads.thumbnails) { packages(kind) }.also { PackageCache.put(kind, it) }
     }
     return list
@@ -75,8 +78,14 @@ fun rememberPackages(kind: String): List<PackageInfo> {
 
 private object PackageCache {
     private val map = HashMap<String, List<PackageInfo>>()
+    /** Bumped when a kind's packages change (a look imported or removed), so its lists read them again. */
+    val version = mutableIntStateOf(0)
     @Synchronized fun get(kind: String) = map[kind]
     @Synchronized fun put(kind: String, list: List<PackageInfo>) { map[kind] = list }
+    fun changed(kind: String) {
+        synchronized(this) { map.remove(kind) }
+        version.intValue++
+    }
 }
 
 /** A tile colour for a package, its own for each id. */
@@ -185,6 +194,12 @@ private fun ColumnScope.PackagesContent(vm: EditorViewModel, kind: String, targe
         }
     }
     var intensity by remember(clip?.id) { mutableFloatStateOf(100f) }
+    // a look of the user's own: a .cube table from the phone, then shown under Imported and put on
+    var importedLook by remember { mutableStateOf<String?>(null) }
+    val importLook = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) vm.importLook(uri) { id -> PackageCache.changed(kind); importedLook = id }
+    }
+    var removing by remember { mutableStateOf<PackageInfo?>(null) }
     // the chosen effect's own settings, opened by tapping its tile again
     var adjusting by remember(clip?.id) { mutableStateOf(false) }
 
@@ -212,6 +227,35 @@ private fun ColumnScope.PackagesContent(vm: EditorViewModel, kind: String, targe
         }
     }
 
+    LaunchedEffect(all, importedLook) {
+        val look = all.firstOrNull { it.id == importedLook } ?: return@LaunchedEffect
+        importedLook = null
+        ownQuery = ""
+        searching = false
+        keptTab = false
+        category = categories.indexOf(look.category).coerceAtLeast(0)
+        apply(look)
+    }
+    removing?.let { look ->
+        ConfirmDialog(
+            "Remove “${look.name}”?",
+            "Remove",
+            destructive = true,
+            onDismiss = { removing = null },
+            content = {
+                Text(
+                    "Clips that use it go back to their own colours.",
+                    style = Type.Small.copy(textAlign = androidx.compose.ui.text.style.TextAlign.Center),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+        ) {
+            removing = null
+            if (current == look.id) apply(null)
+            vm.removeLook(look.id) { PackageCache.changed(kind) }
+        }
+    }
+
     run {
         val chosen = all.firstOrNull { it.id == current }
         if (adjusting && onClip && clip != null && chosen != null && kind == "effect") {
@@ -232,6 +276,12 @@ private fun ColumnScope.PackagesContent(vm: EditorViewModel, kind: String, targe
                         Modifier.padding(start = 12.dp).size(32.dp).clip(CircleShape).background(Color(0xFF3A3A3A)).clickable { searching = true },
                         contentAlignment = Alignment.Center,
                     ) { Glyph(LucideIcons.Search, Palette.DockText, size = 16.dp, description = "Search filters") }
+                    // a .cube table from the phone, made a filter of the user's own
+                    Box(
+                        Modifier.padding(start = 8.dp).size(32.dp).clip(CircleShape).background(Color(0xFF3A3A3A))
+                            .clickable { importLook.launch(arrayOf("*/*")) },
+                        contentAlignment = Alignment.Center,
+                    ) { Glyph(LucideIcons.Upload, Palette.DockText, size = 16.dp, description = "Import a .cube look") }
                     KeptTab(keptTab) { keptTab = true }
                     Box(Modifier.weight(1f)) { Tabs(categories, if (keptTab) -1 else category) { category = it; keptTab = false } }
                 }
@@ -267,7 +317,8 @@ private fun ColumnScope.PackagesContent(vm: EditorViewModel, kind: String, targe
             } else if (kind == "filter") {
                 val p = shown[i - none]
                 val picture = rememberPreview(vm, p.id)
-                FilterTile(p.name, current == p.id, onClick = { apply(p) }, band = remember(picture) { picture?.let(::bandColour) }, onLongClick = { keep(p) }) {
+                val onLongClick = if (p.id.startsWith("user.")) ({ removing = p }) else ({ keep(p) })
+                FilterTile(p.name, current == p.id, onClick = { apply(p) }, band = remember(picture) { picture?.let(::bandColour) }, onLongClick = onLongClick) {
                     PreviewPicture(picture, p.id)
                     if (p.id in kept) KeptMark()
                 }

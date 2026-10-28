@@ -46,6 +46,7 @@ pub mod history;
 pub mod lanes;
 pub mod library;
 pub mod linkage;
+pub mod looks;
 pub mod loudness;
 pub mod motionblur;
 pub mod pauses;
@@ -152,6 +153,8 @@ pub fn init(files_dir: String, cache_dir: String) -> Result<(), MobileError> {
                 }
             }
         });
+    // the looks imported before, beside the built-in filters
+    looks::install(&dirs);
     let titles = Titles::new(&dirs);
     let _ = CONTEXT.set(Context {
         dirs,

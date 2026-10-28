@@ -373,6 +373,39 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
         }
     }
 
+    /** A `.cube` table picked on the phone made a filter of the user's own, named after the file; [then] gets its id. */
+    fun importLook(uri: Uri, then: (String) -> Unit) {
+        viewModelScope.launch {
+            busy = "Importing"
+            val result = withContext(Threads.commands) {
+                runCatching {
+                    val app = getApplication<Application>()
+                    val name = Media.displayName(app.contentResolver, uri)
+                    if (!name.endsWith(".cube", ignoreCase = true)) throw IllegalArgumentException("Choose a .cube file")
+                    // copied under its own name, which the look takes; the engine keeps its own copy
+                    val file = java.io.File(java.io.File(app.cacheDir, "looks").apply { mkdirs() }, Media.safeName(name))
+                    app.contentResolver.openInputStream(uri)?.use { input -> file.outputStream().use { input.copyTo(it) } }
+                        ?: throw IllegalStateException("Could not read the file.")
+                    try {
+                        io.github.artcraftandroid.capcraft.core.importLook(file.absolutePath)
+                    } finally {
+                        file.delete()
+                    }
+                }
+            }
+            busy = null
+            result.onSuccess(then).onFailure { fail(it) }
+        }
+    }
+
+    /** Removes the imported look [id]; clips that use it draw without it. */
+    fun removeLook(id: String, then: () -> Unit) {
+        viewModelScope.launch {
+            val result = withContext(Threads.commands) { runCatching { io.github.artcraftandroid.capcraft.core.removeLook(id) } }
+            result.onSuccess { then() }.onFailure { fail(it) }
+        }
+    }
+
     /** Copies a font file into the project and adds the families it carries; [then] gets the first. */
     fun importFont(uri: Uri, then: (String) -> Unit) {
         val s = session ?: return
