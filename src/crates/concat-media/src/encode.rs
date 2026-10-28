@@ -48,7 +48,7 @@ pub enum VideoCodec {
     /// software and not every old device plays it.
     Av1,
     /// Apple ProRes 4444 in a `.mov`, with its alpha: the file other
-    /// editors - Premiere, Resolve, Final Cut and the rest on a desktop - take
+    /// editors - Premiere, Resolve, Final Cut, CapCut on a desktop - take
     /// a transparent overlay in. Ten bits, its quality set by the profile
     /// rather than a CRF, and very large: about forty times H.264.
     ProRes4444,
