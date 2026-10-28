@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Exporting a project end to end, the way the window does it: media
 //! imported by probing, every edit applied as a command through a session,
@@ -94,6 +94,7 @@ fn picture(path: &Path, rate: FrameRate, seconds: u32, codec: VideoCodec) {
         color_range: concat_media::ColorRange::Limited,
         hardware: false,
         threads: 0,
+        software_only: false,
     };
     let mut encoder =
         Encoder::create(path, WIDTH, HEIGHT, rate, &options).expect("the linked FFmpeg encodes");
@@ -126,6 +127,7 @@ fn quadrants(path: &Path) {
         color_range: concat_media::ColorRange::Limited,
         hardware: false,
         threads: 0,
+        software_only: false,
     };
     let mut encoder = Encoder::create(path, WIDTH, HEIGHT, FrameRate::THIRTY, &options)
         .expect("the linked FFmpeg encodes");
@@ -474,6 +476,7 @@ impl Studio {
             video.height,
             video.rate_num,
             video.rate_den,
+            [0, 0, 0, 255],
         )
         .expect("creates the project");
         let session = Session::open_info(&info).expect("opens the project");
@@ -650,6 +653,7 @@ fn effect(id: &str) -> AppliedFilter {
 
 fn video(width: u32, height: u32, rate_num: i64, rate_den: i64) -> VideoSettings {
     VideoSettings {
+        canvas: [0, 0, 0, 255],
         width,
         height,
         rate_num,
@@ -860,6 +864,157 @@ fn crop_and_flips_reach_the_picture() {
         );
 }
 
+/// A background fills the bars of a wide picture in a tall frame - a
+/// colour, or the picture itself enlarged and blurred - and the monitor
+/// shows what the export writes: the paused monitor's frame, drawn from the
+/// same flattened clips, agrees with the file at every point checked. A
+/// fill then takes the bars away altogether.
+#[test]
+fn a_background_fills_the_bars_in_the_export_and_the_monitor() {
+    use concat_project::model::{Background, Framing};
+    let scratch = Scratch::new("background");
+    let path = scratch.path().join("quadrants.mp4");
+    quadrants(&path);
+    let [red, green, blue, yellow] = QUADRANTS;
+    let black = [0, 0, 0];
+    let (width, height) = (90, 160);
+
+    let mut studio = Studio::new(scratch.path(), "Background", video(width, height, 30, 1));
+    let media = studio.import(&path);
+    let clip = studio
+        .apply(Command::AddClipAtFirstFree {
+            media_id: media,
+            start: 0.0,
+        })
+        .expect("the clip has an id");
+    let timeline_id = studio.project().active_timeline_id.clone();
+    // The picture is 90x51 across the middle of the frame: its quadrants
+    // either side of (0.5, 0.5), the bars above 0.34 and below 0.66.
+    let picture = [
+        ((0.25, 0.42), red),
+        ((0.75, 0.42), green),
+        ((0.25, 0.58), blue),
+        ((0.75, 0.58), yellow),
+    ];
+    let monitor = |studio: &Studio| {
+        let request = concat_export::PreviewFrameRequest {
+            canvas: [0, 0, 0, 255],
+            time: 1.0,
+            width,
+            height,
+            rate_num: 30,
+            rate_den: 1,
+            clips: studio.session.flattened_clips(),
+            color_space: Default::default(),
+        };
+        let pixels =
+            concat_export::preview_frame(&concat_media::ReaderPool::with_defaults(), &request)
+                .expect("the monitor draws the frame");
+        Frame::from_rgba(width, height, pixels).expect("a whole frame")
+    };
+    let agree = |label: &str, exported: &Exported, shown: &Frame| {
+        for y in [0.1, 0.25, 0.42, 0.58, 0.75, 0.9] {
+            for x in [0.1, 0.25, 0.4, 0.6, 0.75, 0.9] {
+                let file = exported.colour_at_point(1.0, x, y);
+                let [r, g, b, _] = shown
+                    .pixel(
+                        (f64::from(width) * x) as u32,
+                        (f64::from(height) * y) as u32,
+                    )
+                    .expect("inside the frame");
+                assert!(
+                    file.iter()
+                        .zip([r, g, b])
+                        .all(|(file, shown)| file.abs_diff(shown) <= 24),
+                    "{label}: at ({x}, {y}) the file is {file:?} and the monitor {:?}",
+                    [r, g, b]
+                );
+            }
+        }
+    };
+
+    let plain = studio.export("no background");
+    plain.expect_colours(1.0, &picture);
+    plain.expect_colours(1.0, &[((0.5, 0.1), black), ((0.5, 0.9), black)]);
+    agree("no background", &plain, &monitor(&studio));
+
+    let set = |studio: &mut Studio, background: Background| {
+        studio.apply(Command::SetTimelineBackground {
+            timeline_id: timeline_id.clone(),
+            background,
+        });
+    };
+    let teal = [30, 160, 140];
+    set(
+        &mut studio,
+        Background::Color {
+            color: "#1ea08c".to_owned(),
+        },
+    );
+    let coloured = studio.export("a colour background");
+    coloured.expect_colours(1.0, &picture);
+    coloured.expect_colours(1.0, &[((0.5, 0.1), teal), ((0.5, 0.9), teal)]);
+    agree("a colour background", &coloured, &monitor(&studio));
+
+    // The rest is over the timeline's blur, a wide Gaussian, and on
+    // Windows' software adapter (WARP) its first frame outran the device
+    // wait and the test's five minutes; there, as for the glow, it is left
+    // out unless CONCAT_REQUIRE_GPU is set. Linux's lavapipe and every real
+    // GPU still draw it.
+    let software = export::WgpuCompositor::new().is_some_and(|gpu| gpu.on_software_adapter());
+    if software && std::env::var_os("CONCAT_REQUIRE_GPU").is_none() {
+        eprintln!("a software adapter only, and CONCAT_REQUIRE_GPU is not set; no blur");
+        return;
+    }
+
+    // Enlarged to cover the frame, the picture's middle third fills it:
+    // the left quadrants on the left, the right ones on the right, red and
+    // green above, blue and yellow below, a little softened.
+    set(&mut studio, Background::Blur { amount: 0.3 });
+    let blurred = studio.export("a blurred background");
+    blurred.expect_colours(1.0, &picture);
+    blurred.expect_colours(
+        1.0,
+        &[
+            ((0.15, 0.1), red),
+            ((0.85, 0.1), green),
+            ((0.15, 0.9), blue),
+            ((0.85, 0.9), yellow),
+        ],
+    );
+    agree("a blurred background", &blurred, &monitor(&studio));
+
+    // The clip's own black over the timeline's blur.
+    studio.apply(Command::UpdateClip {
+        clip_id: clip.clone(),
+        patch: ClipPatch {
+            background: Some(Some(Background::None)),
+            ..ClipPatch::default()
+        },
+    });
+    studio
+        .export("the clip's own black")
+        .expect_colours(1.0, &[((0.5, 0.1), black), ((0.5, 0.9), black)]);
+
+    // Filled, the picture is the frame: no bars to fill.
+    studio.apply(Command::FrameClip {
+        clip_id: clip,
+        framing: Framing::Fill,
+        at: 0.0,
+    });
+    let filled = studio.export("filled");
+    filled.expect_colours(
+        1.0,
+        &[
+            ((0.4, 0.1), red),
+            ((0.6, 0.1), green),
+            ((0.4, 0.9), blue),
+            ((0.6, 0.9), yellow),
+        ],
+    );
+    agree("filled", &filled, &monitor(&studio));
+}
+
 /// Three seconds of one flat colour, silent.
 fn solid(path: &Path, colour: [u8; 3]) {
     let options = EncodeOptions {
@@ -872,6 +1027,7 @@ fn solid(path: &Path, colour: [u8; 3]) {
         color_range: concat_media::ColorRange::Limited,
         hardware: false,
         threads: 0,
+        software_only: false,
     };
     let mut encoder = Encoder::create(path, WIDTH, HEIGHT, FrameRate::THIRTY, &options)
         .expect("the linked FFmpeg encodes");
@@ -945,6 +1101,7 @@ fn fades_and_wipes_reach_the_picture() {
                 transition_in: Some(Some(Transition {
                     id: kind.to_owned(),
                     duration: 1.0,
+                    params: Default::default(),
                 })),
                 ..ClipPatch::default()
             },
@@ -952,13 +1109,13 @@ fn fades_and_wipes_reach_the_picture() {
         studio.export(&format!("transition {kind}"))
     };
 
-    // The wipes overlap the blue clip onto the red one's last second.
+    // The wipes overlap the two clips for the second centred on the cut.
     let wiped = with(&mut studio, "wipe-left");
     wiped.expect_colours(0.5, &[((0.5, 0.5), red)]);
-    wiped.expect_colours(1.5, &[((0.2, 0.5), red), ((0.8, 0.5), blue)]);
-    wiped.expect_colours(2.5, &[((0.5, 0.5), blue)]);
+    wiped.expect_colours(2.0, &[((0.2, 0.5), red), ((0.8, 0.5), blue)]);
+    wiped.expect_colours(2.9, &[((0.5, 0.5), blue)]);
     let wiped = with(&mut studio, "wipe-right");
-    wiped.expect_colours(1.5, &[((0.2, 0.5), blue), ((0.8, 0.5), red)]);
+    wiped.expect_colours(2.0, &[((0.2, 0.5), blue), ((0.8, 0.5), red)]);
 
     // The fades split the second across the cut, and do not overlap.
     for (kind, colour) in [("fade-black", [0, 0, 0]), ("fade-white", [255, 255, 255])] {
@@ -1001,6 +1158,7 @@ fn an_hlg_clip_exports_through_the_gpu_conversion() {
             color_range: concat_media::ColorRange::Limited,
             hardware: false,
             threads: 0,
+            software_only: false,
         };
         let mut encoder = Encoder::create_mislabelled_hdr(
             &path,
@@ -1060,6 +1218,7 @@ fn an_hlg_timeline_exports_as_hdr_or_sdr() {
         color_range: concat_media::ColorRange::Limited,
         hardware: false,
         threads: 0,
+        software_only: false,
     };
     {
         let mut encoder = Encoder::create_hdr(
@@ -1312,6 +1471,7 @@ fn every_edit_still_exports() {
     // on a curve, then undone back to half speed.
     studio.apply(Command::SetClipSpeed {
         clip_id: tail.clone(),
+        ripple: false,
         speed: 2.0,
     });
     let exported = studio.export("double speed");
@@ -1332,6 +1492,7 @@ fn every_edit_still_exports() {
     });
     studio.apply(Command::SetClipSpeed {
         clip_id: tail.clone(),
+        ripple: false,
         speed: 0.5,
     });
     let exported = studio.export("half speed");
@@ -1341,14 +1502,17 @@ fn every_edit_still_exports() {
 
     studio.apply(Command::SetClipSpeedCurve {
         clip_id: tail.clone(),
+        ripple: false,
         curve: Some(vec![
             SpeedPoint {
                 at: 0.0,
                 speed: 0.5,
+                slope: None,
             },
             SpeedPoint {
                 at: 1.0,
                 speed: 2.0,
+                slope: None,
             },
         ]),
     });
@@ -1432,6 +1596,7 @@ fn every_edit_still_exports() {
                 transition_in: Some(Some(Transition {
                     id: kind.to_owned(),
                     duration: 0.5,
+                    params: Default::default(),
                 })),
                 ..ClipPatch::default()
             },
@@ -1563,6 +1728,7 @@ fn every_edit_still_exports() {
             duration: Some(3.0),
             effect_id: "concat.glow".to_owned(),
             name: "Glow".to_owned(),
+            sound: false,
         });
         let exported = studio.export("layer");
         exported.expect_length(end);
@@ -1779,6 +1945,7 @@ fn the_edges_export_too() {
     });
     studio.apply(Command::SetClipSpeed {
         clip_id: clip.clone(),
+        ripple: false,
         speed: 0.125,
     });
     let start = studio.clip(&clip).start;
@@ -1878,6 +2045,7 @@ fn an_export_decodes_on_the_hardware_when_preferred() {
     // as it does the CPU.
     studio.apply(Command::SetClipSpeed {
         clip_id: clip.clone(),
+        ripple: false,
         speed: 2.0,
     });
     let start = studio.clip(&clip).start;
@@ -1898,6 +2066,96 @@ fn an_export_decodes_on_the_hardware_when_preferred() {
         exported.expect_tone(5.5);
         exported.expect_quiet(4.5);
     }
+}
+
+/// A sound layer over two seconds of the clock changes the export's sound
+/// there and nowhere else. Two clips sound under it, the clock and a
+/// second copy of it a lane up, so what it treats is their sum. The tone
+/// of the clock's third second, inside the layer, comes out of the
+/// low-pass changed; its first and fifth, either side, are what an export
+/// without the layer has, give or take what the encoder does near the
+/// layer's edges. Muting the layer's lane takes it off.
+#[test]
+fn a_sound_layer_treats_the_mix_for_its_span_alone() {
+    let scratch = Scratch::new("sound-layer");
+    let wav = scratch.path().join("clock.wav");
+    clock_wav(&wav, 6);
+    let mut studio = Studio::new(scratch.path(), "Sound layer", video(WIDTH, HEIGHT, 30, 1));
+    let clock = studio.import(&wav);
+    let lanes: Vec<String> = studio
+        .project()
+        .active()
+        .tracks
+        .iter()
+        .map(|track| track.id.clone())
+        .collect();
+    for lane in &lanes[..2] {
+        studio.apply(Command::AddClip {
+            media_id: clock.clone(),
+            track_id: lane.clone(),
+            start: 0.0,
+            ripple: false,
+        });
+    }
+    let plain = studio.export("no layer");
+    plain.expect_sound(6.0);
+
+    let layer = studio
+        .apply(Command::AddLayerClip {
+            track_id: None,
+            start: 2.0,
+            duration: Some(2.0),
+            effect_id: "concat.underwater".to_owned(),
+            name: "Underwater".to_owned(),
+            sound: true,
+        })
+        .expect("a layer has an id");
+    let treated = studio.export("sound layer");
+    treated.expect_length(6.0);
+    treated.expect_sound(6.0);
+
+    // How far apart two exports' sound is over `[from, to)`, as the root
+    // mean square of their difference.
+    let apart = |a: &Exported, b: &Exported, from: f64, to: f64| {
+        let (a, b) = (
+            a.audio.as_ref().expect("sound"),
+            b.audio.as_ref().expect("sound"),
+        );
+        let at = |seconds: f64| (seconds * f64::from(RATE)) as usize * 2;
+        let range = at(from)..at(to).min(a.len()).min(b.len());
+        let count = range.len().max(1) as f64;
+        let sum: f64 = range
+            .map(|index| (f64::from(a[index]) - f64::from(b[index])).powi(2))
+            .sum();
+        (sum / count).sqrt()
+    };
+    let inside = apart(&plain, &treated, 3.1, 3.9);
+    let before = apart(&plain, &treated, 1.1, 1.9);
+    let after = apart(&plain, &treated, 5.1, 5.9);
+    eprintln!("sound layer: {inside:.4} inside, {before:.4} before, {after:.4} after");
+    assert!(
+        inside > 0.1,
+        "the layer's span is {inside:.4} from the plain mix"
+    );
+    assert!(
+        before < 0.01,
+        "before the layer the mix moved by {before:.4}"
+    );
+    assert!(after < 0.01, "after the layer the mix moved by {after:.4}");
+    // The tone is still there to treat: a filter, not a mute.
+    treated.expect_tone(1.5);
+    treated.expect_tone(5.5);
+
+    // A muted lane silences the layer as it silences a clip.
+    let lane = studio.clip(&layer).track_id.clone();
+    studio.apply(Command::SetTrackFlag {
+        track_id: lane,
+        flag: TrackFlag::Muted,
+        value: true,
+    });
+    let muted = studio.export("sound layer muted");
+    let off = apart(&plain, &muted, 3.1, 3.9);
+    assert!(off < 0.01, "a muted layer still moved the mix by {off:.4}");
 }
 
 /// A reversed copy of a span plays its seconds backwards, picture and
@@ -1996,4 +2254,297 @@ fn a_reversed_span_plays_its_seconds_backwards() {
     heard.expect_quiet(0.5);
     heard.expect_tone(1.5);
     heard.expect_quiet(2.5);
+}
+
+/// The selection after deleting pauses is a new source, not a longer
+/// window on the old recording. Rendering the replacement must never bring
+/// the deleted seconds back, and its sound must make the same cuts.
+#[test]
+fn consolidation_after_pause_removal_preserves_picture_sound_and_undo() {
+    use concat_host::consolidate::Consolidation;
+
+    let scratch = Scratch::new("consolidation");
+    let sources = Sources::make(scratch.path());
+    let mut studio = Studio::new(scratch.path(), "Merged", video(WIDTH, HEIGHT, 30, 1));
+    let media_id = studio.import(&sources.peek);
+    studio.apply(Command::AddClipAtFirstFree {
+        media_id,
+        start: 0.0,
+    });
+    for time in [1.0, 2.0, 3.0, 5.0] {
+        studio.apply(Command::SplitClips {
+            clip_ids: studio.clip_ids(),
+            time,
+        });
+    }
+    let removed = studio
+        .project()
+        .active()
+        .clips
+        .iter()
+        .filter(|clip| clip.source_start == 1.0 || clip.source_start == 3.0)
+        .map(|clip| clip.id.clone())
+        .collect();
+    studio.apply(Command::RemoveClips {
+        clip_ids: removed,
+        ripple: true,
+    });
+    let ids = studio.clip_ids();
+    assert_eq!(ids.len(), 3);
+    for id in &ids {
+        studio.apply(Command::UpdateClip {
+            clip_id: id.clone(),
+            patch: ClipPatch {
+                volume: Some(0.6),
+                ..Default::default()
+            },
+        });
+    }
+    let before = studio.project().clone();
+    let plan = Consolidation::new(studio.project(), &ids).expect("valid selection");
+    let folder = Path::new(studio.session.path()).join("media");
+    std::fs::create_dir_all(&folder).unwrap();
+    let output = folder.join("merged.mp4");
+    let request = plan.request(studio.project(), Path::new(studio.session.path()), &output);
+    export::run(&request, &AtomicBool::new(false), |_| {}).expect("renders merged media");
+    let exported = Exported::read("merged media", &output, (30, 1));
+    exported.expect_length(3.0);
+    exported.expect_sound(3.0);
+    for (at, second) in [(0.5, 0), (1.5, 2), (2.5, 5)] {
+        exported.expect_second(at, second);
+    }
+    exported.expect_quiet(0.5);
+    exported.expect_quiet(1.5);
+    exported.expect_tone(2.5);
+
+    let item = media::probe(output.to_str().unwrap())
+        .unwrap()
+        .to_new_media();
+    let command = plan
+        .replacement(studio.project(), item)
+        .expect("inputs unchanged");
+    studio.apply(command);
+    assert_eq!(studio.clip_ids().len(), 1);
+    let merged = &studio.project().active().clips[0];
+    assert_eq!(
+        (merged.volume, merged.speed, merged.source_start),
+        (1.0, 1.0, 0.0)
+    );
+    // The usual export also saves/reopens the project, exercising persistence.
+    let final_export = studio.export("one merged clip");
+    final_export.expect_length(3.0);
+    final_export.expect_sound(3.0);
+    final_export.expect_second(1.5, 2);
+    final_export.expect_second(2.5, 5);
+    final_export.expect_tone(2.5);
+    studio.session.undo();
+    assert_eq!(studio.project(), &before);
+    studio.session.redo();
+    assert_eq!(studio.clip_ids().len(), 1);
+
+    let cancelled = AtomicBool::new(true);
+    let cancelled_path = folder.join("cancelled.mp4");
+    let request = plan.request(&before, Path::new(studio.session.path()), &cancelled_path);
+    assert!(export::run(&request, &cancelled, |_| {}).is_err());
+    assert!(
+        !cancelled_path.exists(),
+        "a cancelled render is never a completed source"
+    );
+}
+
+#[test]
+fn consolidation_of_silent_fractional_frames_covers_the_original_span() {
+    use concat_host::consolidate::Consolidation;
+
+    let scratch = Scratch::new("consolidation-fractional");
+    let source = scratch.path().join("silent.mp4");
+    picture(&source, FrameRate::THIRTY, 3, VideoCodec::H264);
+    let mut studio = Studio::new(scratch.path(), "Fractional", video(WIDTH, HEIGHT, 30, 1));
+    let media_id = studio.import(&source);
+    let id = studio
+        .apply(Command::AddClipAtFirstFree {
+            media_id,
+            start: 0.0,
+        })
+        .unwrap();
+    studio.apply(Command::TrimClip {
+        clip_id: id,
+        edge: TrimEdge::End,
+        delta: -1.92,
+        ripple: false,
+    });
+    studio.apply(Command::SplitClips {
+        clip_ids: studio.clip_ids(),
+        time: 0.54,
+    });
+    let plan = Consolidation::new(studio.project(), &studio.clip_ids()).unwrap();
+    let output = scratch.path().join("merged.mp4");
+    let request = plan.request(studio.project(), Path::new(studio.session.path()), &output);
+    export::run(&request, &AtomicBool::new(false), |_| {}).unwrap();
+    let exported = Exported::read("fractional source", &output, (30, 1));
+    exported.expect_length(1.1); // 33 frames cover the original 1.08 seconds.
+    exported.expect_no_sound();
+    let item = media::probe(output.to_str().unwrap())
+        .unwrap()
+        .to_new_media();
+    studio.apply(plan.replacement(studio.project(), item).unwrap());
+    assert!((studio.project().active().clips[0].duration - 1.08).abs() < 1e-9);
+}
+
+#[test]
+fn consolidation_preserves_the_timeline_clock_of_animated_effects() {
+    use concat_host::consolidate::Consolidation;
+
+    // Bloom is a wide blur rendered twice over, and on Windows' software
+    // adapter (WARP) that ran past the test's five-minute limit; there, as
+    // for the glow above, it is left out unless CONCAT_REQUIRE_GPU is set.
+    let software = export::WgpuCompositor::new().is_some_and(|gpu| gpu.on_software_adapter());
+    if software && std::env::var_os("CONCAT_REQUIRE_GPU").is_none() {
+        eprintln!("a software adapter only, and CONCAT_REQUIRE_GPU is not set; skipping");
+        return;
+    }
+
+    let scratch = Scratch::new("consolidation-clock");
+    let source = scratch.path().join("bright.mp4");
+    let mut encoder = Encoder::create(
+        &source,
+        WIDTH,
+        HEIGHT,
+        FrameRate::THIRTY,
+        &EncodeOptions {
+            preset: "ultrafast".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut frame = Frame::black(WIDTH, HEIGHT);
+    frame.fill([220, 220, 220, 255]);
+    for _ in 0..60 {
+        encoder.write_frame(&frame).unwrap();
+    }
+    encoder.finish().unwrap();
+    let mut studio = Studio::new(scratch.path(), "Clock", video(WIDTH, HEIGHT, 30, 1));
+    let media_id = studio.import(&source);
+    let id = studio
+        .apply(Command::AddClipAtFirstFree {
+            media_id,
+            start: 5.0,
+        })
+        .unwrap();
+    studio.apply(Command::UpdateClip {
+        clip_id: id,
+        patch: ClipPatch {
+            video_effects: Some(vec![AppliedFilter {
+                id: "concat.bloom-pulse".into(),
+                params: [("amount".into(), 100.0), ("speed".into(), 2.0)]
+                    .into_iter()
+                    .collect(),
+                enabled: true,
+                keys: Default::default(),
+            }]),
+            ..Default::default()
+        },
+    });
+    studio.apply(Command::SplitClips {
+        clip_ids: studio.clip_ids(),
+        time: 6.0,
+    });
+    let baseline = studio.export("before consolidation");
+    let plan = Consolidation::new(studio.project(), &studio.clip_ids()).unwrap();
+    let output = scratch.path().join("merged.mp4");
+    let request = plan.request(studio.project(), Path::new(studio.session.path()), &output);
+    assert_eq!(request.effect_time_offset, 5.0);
+    export::run(&request, &AtomicBool::new(false), |_| {}).unwrap();
+    let baked = Exported::read("baked effect", &output, (30, 1));
+    for at in [0.2, 0.5, 0.8, 1.2, 1.5] {
+        let expected = baseline.colour_at(5.0 + at);
+        let got = baked.colour_at(at);
+        assert!(
+            got.iter()
+                .zip(expected)
+                .all(|(got, expected)| got.abs_diff(expected) <= 3),
+            "effect phase changed at {at}s: expected {expected:?}, got {got:?}"
+        );
+    }
+}
+
+#[test]
+fn consolidation_keeps_the_global_frame_grid_at_fractional_starts() {
+    use concat_host::consolidate::Consolidation;
+
+    let scratch = Scratch::new("consolidation-frame-grid");
+    let source = scratch.path().join("source.mp4");
+    picture(&source, FrameRate::THIRTY, 3, VideoCodec::H264);
+    let mut studio = Studio::new(scratch.path(), "Grid", video(WIDTH, HEIGHT, 30, 1));
+    let media_id = studio.import(&source);
+    let id = studio
+        .apply(Command::AddClipAtFirstFree {
+            media_id,
+            start: 5.01,
+        })
+        .unwrap();
+    studio.apply(Command::TrimClip {
+        clip_id: id,
+        edge: TrimEdge::End,
+        delta: -0.98,
+        ripple: false,
+    });
+    studio.apply(Command::SplitClips {
+        clip_ids: studio.clip_ids(),
+        time: 5.05,
+    });
+    // JSON parsing can normalize a raw subframe float by one ULP. Compare
+    // actual persisted renders here, not the generic helper's exact f64
+    // equality assertion; the boundary being tested is the video frame grid.
+    let draw = |studio: &mut Studio, label: &str| {
+        studio.session.save(None).unwrap();
+        let reopened = Session::open(studio.session.path(), studio.session.settings()).unwrap();
+        let output = studio.exports.join(format!("{label}.mp4"));
+        let request = export::request(
+            &reopened,
+            &ExportSpec {
+                output: output.to_string_lossy().into_owned(),
+                crf: 16,
+                preset: "fast".into(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        export::run(&request, &AtomicBool::new(false), |_| {}).unwrap();
+        Exported::read(label, &output, (30, 1))
+    };
+    let baseline = draw(&mut studio, "original-frame-grid");
+    let plan = Consolidation::new(studio.project(), &studio.clip_ids()).unwrap();
+    let output = scratch.path().join("merged.mp4");
+    let request = plan.request(studio.project(), Path::new(studio.session.path()), &output);
+    export::run(&request, &AtomicBool::new(false), |_| {}).unwrap();
+    let baked = Exported::read("rebased grid", &output, (30, 1));
+    let item = media::probe(output.to_str().unwrap())
+        .unwrap()
+        .to_new_media();
+    studio.apply(plan.replacement(studio.project(), item).unwrap());
+    let final_export = draw(&mut studio, "adopted-frame-grid");
+    assert_eq!(final_export.frames.len(), baseline.frames.len());
+    for frame in [0, 1, 2, 3, 4, 30, 60] {
+        let expected = baseline.frames[150 + frame]
+            .pixel(WIDTH / 2, HEIGHT / 2)
+            .unwrap();
+        let got = baked.frames[frame].pixel(WIDTH / 2, HEIGHT / 2).unwrap();
+        let adopted = final_export.frames[150 + frame]
+            .pixel(WIDTH / 2, HEIGHT / 2)
+            .unwrap();
+        assert!(
+            adopted
+                .iter()
+                .zip(expected)
+                .all(|(got, expected)| got.abs_diff(expected) <= 3),
+            "adopted frame {frame}: expected {expected:?}, got {adopted:?}"
+        );
+        assert!(
+            got.iter()
+                .zip(expected)
+                .all(|(got, expected)| got.abs_diff(expected) <= 3),
+            "frame {frame}: expected {expected:?}, got {got:?}"
+        );
+    }
 }

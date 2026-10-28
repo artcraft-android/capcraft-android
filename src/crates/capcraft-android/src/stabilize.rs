@@ -110,6 +110,7 @@ impl MobileSession {
                 item,
                 source_start: None,
                 enhanced: false,
+                offset: 0.0,
             }])?;
             listener.on_done(Some(view));
             return Ok(());
@@ -146,6 +147,7 @@ impl MobileSession {
                                 item: info.to_new_media(),
                                 source_start: None,
                                 enhanced: false,
+                                offset: 0.0,
                             },
                             Command::SetTimelineExtra {
                                 key: STABILIZED.to_owned(),
@@ -512,6 +514,7 @@ impl CopyWriter {
                 color_range: concat_media::ColorRange::Limited,
                 hardware: true,
                 threads: 2,
+                software_only: false,
             },
         )
         .map_err(|error| error.to_string())?;

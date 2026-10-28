@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! What the engine sees in a picture.
 //!
@@ -28,7 +28,12 @@
 //! object model are downloaded on first use ([`models`] says where from);
 //! a small person model is compiled in so a cutout works with nothing
 //! downloaded at all. The renderer reads masks and never infers; the
-//! host infers and writes them.
+//! host infers and writes them. [`onnx`] says whether this machine can run
+//! the runtime at all, which an Intel Mac older than its runtime cannot.
+//!
+//! Stabilization is [`stabilize`]: the camera's movement measured by
+//! tracking corners from frame to frame, cached beside the masks, and the
+//! correction worked out from it live. Plain arithmetic, no model.
 //!
 //! A mask is whatever shape its model answers in - square for the object
 //! model, the picture's own aspect for the person model - and every
@@ -42,13 +47,16 @@
 pub mod apply;
 #[cfg(feature = "infer")]
 pub mod brush;
+pub mod compact;
 pub mod enhance;
 pub mod mask;
 pub mod models;
+pub mod onnx;
 #[cfg(feature = "infer")]
 pub mod runtime;
 #[cfg(feature = "infer")]
 pub mod segment;
+pub mod stabilize;
 pub mod store;
 pub mod strokes;
 

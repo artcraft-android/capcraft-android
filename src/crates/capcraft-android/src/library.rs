@@ -82,6 +82,7 @@ pub fn create_project(
         height: even(height),
         rate_num: i64::from(fps.max(1)),
         rate_den: 1,
+        canvas: [0, 0, 0, 255],
     };
     let mut session = Session::open(&folder.to_string_lossy(), settings)?;
     session.save(None)?;

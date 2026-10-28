@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Timelines: the tabs a project holds, their frames, names, order and which one is showing.
 //!
@@ -36,12 +36,19 @@ pub(super) fn apply(
             // likeliest second timeline is another cut of the same picture,
             // and the one that is not is a sheet away from being told so.
             let video = project.active().video;
+            // And with its background, for the same reason: a second cut of
+            // a vertical edit wants the same bars filled the same way.
+            let background = project.active().background.clone();
+            // And with the linkage it was set to: it is how the cut edits.
+            let linkage = project.active().linkage;
             project.timelines.push(Arc::new(Timeline {
                 id: id.clone(),
                 name,
                 video,
+                background,
                 tracks,
                 clips: Vec::new(),
+                linkage,
                 extra: Default::default(),
             }));
             project.active_timeline_id = id.clone();
@@ -72,6 +79,35 @@ pub(super) fn apply(
                 Some(value) => timeline.extra.insert(key, value.clone()).as_ref() != Some(&value),
                 None => timeline.extra.remove(&key).is_some(),
             };
+            Ok(Outcome {
+                created_id: None,
+                applied,
+            })
+        }
+
+        Command::SetTimelineBackground {
+            timeline_id,
+            background,
+        } => {
+            let applied = project
+                .timelines
+                .iter_mut()
+                .find(|timeline| timeline.id == timeline_id)
+                .is_some_and(|timeline| {
+                    assign(&mut Arc::make_mut(timeline).background, background.tidy())
+                });
+            Ok(Outcome {
+                created_id: None,
+                applied,
+            })
+        }
+
+        Command::SetTimelineLinkage { timeline_id, on } => {
+            let applied = project
+                .timelines
+                .iter_mut()
+                .find(|timeline| timeline.id == timeline_id)
+                .is_some_and(|timeline| assign(&mut Arc::make_mut(timeline).linkage, on));
             Ok(Outcome {
                 created_id: None,
                 applied,

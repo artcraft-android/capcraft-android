@@ -3,10 +3,10 @@ resolver = "3"
 members = ["crates/*", "crates/capcraft-android/bindgen"]
 
 [workspace.package]
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 rust-version = "1.93"
-license = "AGPL-3.0-or-later"  # + plugin exception, see LICENSE-EXCEPTIONS.md
+license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 concat-core = { path = "crates/concat-core" }
@@ -15,6 +15,7 @@ concat-project = { path = "crates/concat-project" }
 concat-render = { path = "crates/concat-render" }
 concat-export = { path = "crates/concat-export" }
 concat-host = { path = "crates/concat-host" }
+concat-mcp = { path = "crates/concat-mcp" }
 concat-speech = { path = "crates/concat-speech" }
 concat-effects = { path = "crates/concat-effects" }
 concat-text = { path = "crates/concat-text" }
@@ -23,6 +24,10 @@ concat-vision = { path = "crates/concat-vision" }
 serde_json = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
+# JSON Schemas for the API's request types, behind the `schema` features of
+# concat-project and concat-api: what concat-mcp hands an agent as each
+# tool's input schema, generated from the types so it cannot drift.
+schemars = "1"
 
 # The GPU compositor, behind concat-render's `gpu` feature. A heavy tree, which
 # is exactly why it is optional: engine-only work never pays for it. Pinned to
@@ -35,7 +40,12 @@ pollster = "0.4"
 # ONNX Runtime, for the cutout models. The binaries come prebuilt for every
 # target the app ships on, with the platform's own accelerator behind them:
 # CoreML on macOS and iOS, DirectML on Windows, NNAPI on Android.
-ort = "=2.0.0-rc.13"
+#
+# ort's default features less the API version, which is not one for every
+# target: the ONNX Runtime an Intel Mac gets is older than the others, and
+# a feature cannot be taken away per target, only added. concat-vision's
+# manifest adds it, and says why.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "tls-native", "copy-dylibs"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"

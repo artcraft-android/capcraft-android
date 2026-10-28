@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Finding the masks a cutout is made of.
 //!
@@ -24,7 +24,7 @@
 //! on first use and stays loaded.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use concat_core::time::{FrameRate, Rational};
@@ -33,7 +33,7 @@ use concat_project::model::{MediaKind, Project, Subject};
 use concat_vision::segment::Kind;
 use concat_vision::{MASK_RATE, MaskStore, ModelId, Segmenter, mask_dir, models};
 
-use crate::jobs::SingleFlight;
+use crate::jobs::{SingleFlight, Tripwire};
 
 /// What one analysis covers.
 #[derive(Clone, Debug)]
@@ -198,6 +198,17 @@ impl Cutouts {
         wanted
     }
 
+    /// Where `request`'s masks are kept.
+    fn dir(request: &AnalyseRequest) -> PathBuf {
+        mask_dir(&request.project, &request.media_path, request.subject)
+    }
+
+    /// Whether the app died analysing `request` last time, so it is not to
+    /// be analysed again by itself. See [`Tripwire`].
+    pub fn tripped(request: &AnalyseRequest) -> bool {
+        Tripwire::tripped(&Self::dir(request))
+    }
+
     /// How many instants `request` still needs, without doing anything.
     /// A store made by a model the subject would not pick now needs all
     /// of them again.
@@ -240,6 +251,7 @@ impl Cutouts {
         if Self::outstanding(request) == usize::MAX {
             store.clear();
         }
+        let _wire = Tripwire::arm(&Self::dir(request));
 
         // The model the subject names, or for automatic the one the
         // store already records; the first frame decides otherwise.
@@ -374,12 +386,16 @@ impl Cutouts {
 /// [`crate::models`]. Whichever answers, the bytes are checked against the
 /// digest the table carries before anything is renamed into place, so a
 /// truncated or substituted file never becomes an installed model.
+///
+/// Nothing is fetched for a runtime that cannot run it: an Intel Mac older
+/// than its ONNX Runtime is told so here, before the download.
 pub(crate) fn fetch(
     id: ModelId,
     file: &Path,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<(), String> {
+    concat_vision::runtime::ready()?;
     let spec = id.spec();
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)
@@ -391,51 +407,22 @@ pub(crate) fn fetch(
         total: spec.bytes,
     });
 
-    let mut last: String = String::new();
-    for url in crate::models::sources(spec.file, spec.upstream) {
-        match stream(&url, &partial, spec.bytes, cancel, progress) {
-            Ok(()) => {
-                if let Err(error) = crate::models::verify(&partial, spec.sha256) {
-                    let _ = std::fs::remove_file(&partial);
-                    // A mirror that serves the wrong bytes is not something
-                    // upstream can fix, and trying it next would only hide
-                    // which of the two is wrong.
-                    return Err(error);
-                }
-                return std::fs::rename(&partial, file)
-                    .map_err(|error| format!("could not finish {}: {error}", file.display()));
-            }
-            // The partial stays for the next source, or the next time:
-            // whichever answers takes up where this one stopped.
-            Err(error) => {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(error);
-                }
-                last = error;
-            }
-        }
-    }
-    Err(format!("could not fetch the {} model: {last}", spec.file))
-}
-
-/// One attempt at one URL, through the shared downloader: into `partial`,
-/// taking up from whatever of it is already there.
-fn stream(
-    url: &str,
-    partial: &Path,
-    estimate: u64,
-    cancel: &AtomicBool,
-    progress: &mut dyn FnMut(Progress),
-) -> Result<(), String> {
-    crate::models::download(
-        url,
-        partial,
-        estimate,
+    // A mirror that serves the wrong bytes is refused there and not tried
+    // past: upstream cannot fix it, and trying it next would only hide
+    // which of the two is wrong. A partial left by a source that stopped
+    // is where the next one, or the next time, takes up.
+    crate::models::fetch(
+        spec.file,
+        spec.upstream,
+        &partial,
+        spec.bytes,
+        spec.sha256,
         cancel,
         "cutout analysis cancelled",
         &mut |received, total| progress(Progress::Fetching { received, total }),
-    )
-    .map(|_| ())
+    )?;
+    std::fs::rename(&partial, file)
+        .map_err(|error| format!("could not finish {}: {error}", file.display()))
 }
 
 /// Every instant the ranges need that the store lacks, ascending, once.

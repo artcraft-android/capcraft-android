@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! What a placed clip looks and sounds like: its patchable fields, speed, transform, keys and cutout.
 //!
@@ -62,6 +62,9 @@ pub(super) fn apply(
                 let crop = crop.map(Crop::tidy).filter(|crop| !crop.is_none());
                 applied |= assign(&mut clip.crop, crop);
             }
+            if let Some(mask) = patch.mask {
+                applied |= assign(&mut clip.mask, mask.map(ClipMask::tidy));
+            }
             if let Some(filters) = patch.filters {
                 applied |= assign(&mut clip.filters, filters);
             }
@@ -86,13 +89,68 @@ pub(super) fn apply(
             {
                 applied |= assign(&mut clip.shape, Some(style));
             }
+            if let Some(background) = patch.background {
+                applied |= assign(&mut clip.background, background.map(Background::tidy));
+            }
             Ok(Outcome {
                 created_id: None,
                 applied,
             })
         }
 
-        Command::SetClipSpeed { clip_id, speed } => {
+        Command::StyleTextRange {
+            clip_id,
+            start,
+            end,
+            patch,
+        } => {
+            let Some(clip) = project.active_mut().clip_mut(&clip_id) else {
+                return Ok(Outcome::default());
+            };
+            if clip.kind != ClipKind::Text {
+                return Ok(Outcome::default());
+            }
+            let Some(text) = clip.text.as_mut() else {
+                return Ok(Outcome::default());
+            };
+            let before = text.runs.clone();
+            text.style_range(start, end, &patch);
+            Ok(Outcome {
+                created_id: None,
+                applied: text.runs != before,
+            })
+        }
+
+        Command::ClearTextStyles {
+            clip_id,
+            start,
+            end,
+        } => {
+            let Some(clip) = project.active_mut().clip_mut(&clip_id) else {
+                return Ok(Outcome::default());
+            };
+            if clip.kind != ClipKind::Text {
+                return Ok(Outcome::default());
+            }
+            let Some(text) = clip.text.as_mut() else {
+                return Ok(Outcome::default());
+            };
+            let before = text.runs.clone();
+            match (start, end) {
+                (Some(start), Some(end)) => text.clear_range(start, end),
+                _ => text.runs.clear(),
+            }
+            Ok(Outcome {
+                created_id: None,
+                applied: text.runs != before,
+            })
+        }
+
+        Command::SetClipSpeed {
+            clip_id,
+            speed,
+            ripple,
+        } => {
             let timeline = project.active_mut();
             let Some(clip) = timeline.clip_mut(&clip_id) else {
                 return Ok(Outcome::default());
@@ -110,20 +168,7 @@ pub(super) fn apply(
                     (source_covered / next).max(MIN_CLIP_DURATION),
                 )
                 | assign(&mut clip.speed_curve, None);
-            // Slowed down, the clip grows into what follows it: the rest of
-            // the lane moves along by the growth, as a freeze frame's does,
-            // rather than being covered.
-            let (track_id, start, duration) = (clip.track_id.clone(), clip.start, clip.duration);
-            let grow = start + duration - old_end;
-            if grow > 0.0 && !timeline.is_free(&track_id, start, duration, &[&clip_id]) {
-                for other in timeline.clips_where(|other| {
-                    other.id != clip_id
-                        && other.track_id == track_id
-                        && other.start >= old_end - crate::placement::TOUCH
-                }) {
-                    other.start += grow;
-                }
-            }
+            make_room(timeline, &clip_id, old_end, ripple);
             Ok(Outcome {
                 created_id: None,
                 applied,
@@ -136,6 +181,23 @@ pub(super) fn apply(
                 return Ok(Outcome::default());
             };
             let applied = assign(&mut clip.cutout, cutout.map(Cutout::tidy));
+            Ok(Outcome {
+                created_id: None,
+                applied,
+            })
+        }
+
+        Command::SetClipStabilize { clip_id, stabilize } => {
+            let timeline = project.active_mut();
+            let Some(clip) = timeline.clip_mut(&clip_id) else {
+                return Ok(Outcome::default());
+            };
+            // Only footage has a camera that moved: a still, a title, a
+            // shape or a layer has nothing to steady.
+            if clip.kind != ClipKind::Video && stabilize.is_some() {
+                return Ok(Outcome::default());
+            }
+            let applied = assign(&mut clip.stabilize, stabilize.map(Stabilize::tidy));
             Ok(Outcome {
                 created_id: None,
                 applied,
@@ -185,6 +247,7 @@ pub(super) fn apply(
                 // same value at a different instant.
                 KeyProperty::Volume => value.max(0.0),
                 KeyProperty::OffsetX | KeyProperty::OffsetY | KeyProperty::Rotation => value,
+                mask => ClipMask::clamp(mask, value),
             };
             let before = clip.keys.clone();
             clip.set_key(property, at, value, ease);
@@ -287,13 +350,18 @@ pub(super) fn apply(
             })
         }
 
-        Command::SetClipSpeedCurve { clip_id, curve } => {
+        Command::SetClipSpeedCurve {
+            clip_id,
+            curve,
+            ripple,
+        } => {
             let timeline = project.active_mut();
             let Some(clip) = timeline.clip_mut(&clip_id) else {
                 return Ok(Outcome::default());
             };
             let curve = curve.filter(|points| crate::speed::curve_of(points).is_some());
             let source_covered = clip.duration * clip.speed;
+            let old_end = clip.start + clip.duration;
             let mean = curve
                 .as_ref()
                 .map(|points| crate::speed::mean_of(points))
@@ -305,12 +373,44 @@ pub(super) fn apply(
                     &mut clip.duration,
                     (source_covered / mean).max(MIN_CLIP_DURATION),
                 );
+            make_room(timeline, &clip_id, old_end, ripple);
             Ok(Outcome {
                 created_id: None,
                 applied,
             })
         }
 
+        Command::MatchClip { clip_id, like } => {
+            let timeline = project.active_mut();
+            let Some(clip) = timeline.clip_mut(&clip_id) else {
+                return Ok(Outcome::default());
+            };
+            let mut matched = *like;
+            matched.id = clip.id.clone();
+            matched.track_id = clip.track_id.clone();
+            matched.media_id = clip.media_id.clone();
+            matched.kind = clip.kind;
+            matched.start = clip.start;
+            matched.duration = clip.duration;
+            matched.source_start = clip.source_start;
+            matched.speed = clip.speed;
+            matched.speed_curve = clip.speed_curve.clone();
+            matched.detached_from = clip.detached_from.clone();
+            matched.transition_in = clip.transition_in.clone();
+            // A title's words and a shape's figure are what it is, and only
+            // a clip of the same kind can wear them.
+            if matched.text.is_some() != clip.text.is_some() {
+                matched.text = clip.text.clone();
+            }
+            if matched.shape.is_some() != clip.shape.is_some() {
+                matched.shape = clip.shape.clone();
+            }
+            let applied = assign(clip, matched);
+            Ok(Outcome {
+                created_id: None,
+                applied,
+            })
+        }
         Command::SetClipTransform {
             clip_id,
             scale,
@@ -349,6 +449,77 @@ pub(super) fn apply(
             })
         }
 
+        Command::FrameClip {
+            clip_id,
+            framing,
+            at,
+        } => {
+            let timeline = project.active();
+            let frame = (timeline.video.width, timeline.video.height);
+            let Some(media) = timeline
+                .clip(&clip_id)
+                .and_then(|clip| project.media_by_id(&clip.media_id))
+                .map(|item| (item.width, item.height))
+            else {
+                return Ok(Outcome::default());
+            };
+            let Some(clip) = project.active_mut().clip_mut(&clip_id) else {
+                return Ok(Outcome::default());
+            };
+            let at = at.clamp(0.0, 1.0);
+            let Some(scale) = clip.framing_scale(framing, media, frame, at) else {
+                return Ok(Outcome::default());
+            };
+            let before = clip.clone();
+            clip.write_at(KeyProperty::Scale, scale, at);
+            clip.write_at(KeyProperty::OffsetX, 0.0, at);
+            clip.write_at(KeyProperty::OffsetY, 0.0, at);
+            // A stretch is a picture pulled out of its shape, and neither a
+            // fit nor a fill is: both are the picture as it was shot.
+            clip.stretch_x = 1.0;
+            clip.stretch_y = 1.0;
+            Ok(Outcome {
+                created_id: None,
+                applied: *clip != before,
+            })
+        }
+
         _ => unreachable!("commands::apply routes only this module's commands here"),
+    }
+}
+
+/// What a retimed clip does to the lane behind it. One that ends later
+/// than `old_end` and would cover what follows it pushes the rest of the
+/// lane along by the growth, as a freeze frame's does. On the magnetic
+/// timeline (`ripple`) the lane follows the clip's end either way, so a
+/// clip sped up leaves no gap, as a magnetic trim leaves none. Shared by
+/// the constant rate and the curve, which both stretch a clip.
+fn make_room(timeline: &mut Timeline, clip_id: &str, old_end: f64, ripple: bool) {
+    let Some(clip) = timeline.clip(clip_id) else {
+        return;
+    };
+    let (track_id, start, duration) = (clip.track_id.clone(), clip.start, clip.duration);
+    let moved = start + duration - old_end;
+    let pushed = moved > 0.0 && !timeline.is_free(&track_id, start, duration, &[clip_id]);
+    if (ripple && moved != 0.0) || pushed {
+        let main = timeline.background_lane().map(str::to_owned);
+        for other in timeline.clips_where(|other| {
+            other.id != clip_id
+                && other.track_id == track_id
+                && other.start >= old_end - crate::placement::TOUCH
+        }) {
+            other.start = (other.start + moved).max(0.0);
+        }
+        // Linkage: sped up, the clip gave back the end of its old span;
+        // slowed down, it put more in at its old end.
+        let ripple = if moved < 0.0 {
+            clips::Ripple::Removed(vec![(old_end + moved, old_end)])
+        } else {
+            clips::Ripple::Inserted {
+                at: old_end,
+                length: moved,
+            }
+        };
+        clips::follow_main(timeline, main.as_deref(), &track_id, ripple);
     }
 }

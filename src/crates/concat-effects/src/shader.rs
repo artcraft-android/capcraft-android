@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! A package's shader: what it declares, checked and laid out at load.
 //!
@@ -54,8 +54,11 @@ use crate::manifest::{MAX_CURVE_POINTS, MAX_SHRINK, Manifest, Param, ParamType, 
 /// and a title's reveal map at group 3.
 const EFFECT_HEAD: &str = r#"// ── the host's half of the contract; see concat-effects/src/shader.rs ──
 struct Frame {
-    /// The layer's size in pixels.
-    size: vec2<f32>,
+    /// The layer's size in pixels. Aligned to 16 so the block is 32 bytes:
+    /// OpenGL ES binds uniforms in whole 16s, and wgpu refuses a pipeline
+    /// whose uniform is not, so every effect failed on a phone with no
+    /// Vulkan. The offsets are unchanged.
+    @align(16) size: vec2<f32>,
     /// Seconds into the timeline.
     time: f32,
     /// How much of the effect to keep over the untouched layer.
@@ -97,13 +100,21 @@ fn reveal_order(uv: vec2<f32>) -> f32 {
 "#;
 
 /// An effect's `sample` under the scene-linear contract.
+///
+/// Every `sample` here, and a transition's `from_at` and `to_at`, reads
+/// at level 0 rather than with `textureSample`'s implicit derivatives.
+/// The pictures have one level, so the pixels are the same, but a package
+/// is free to sample in a loop that runs as long as a knob says - a blur's
+/// taps - and Direct3D's FXC refuses a derivative in such a loop
+/// (X3570). Refused, the shader never built on Windows, and the card
+/// cache's trial of it lost the device (#548).
 const EFFECT_SAMPLE_LINEAR: &str = r#"
 /// The layer's colour at `uv`, straight alpha, in the working space as it
 /// is: linear light on Rec. 709 primaries, extended - negative in a channel
 /// outside Rec. 709's gamut, above 1.0 in a highlight - with 1.0 the white
 /// of an SDR picture (203 nits).
 fn sample(uv: vec2<f32>) -> vec4<f32> {
-    return into_space(textureSample(source, source_sampler, uv));
+    return into_space(textureSampleLevel(source, source_sampler, uv, 0.0));
 }
 
 /// A colour of the layer as the texture holds it, in the space `sample`
@@ -120,7 +131,7 @@ const EFFECT_SAMPLE_DISPLAY: &str = r#"
 /// (see `to_display`): the picture a look drawn by eye on an SDR display
 /// reads, not clipped at white.
 fn sample(uv: vec2<f32>) -> vec4<f32> {
-    return into_space(textureSample(source, source_sampler, uv));
+    return into_space(textureSampleLevel(source, source_sampler, uv, 0.0));
 }
 
 /// A colour of the layer as the texture holds it, in the space `sample`
@@ -136,7 +147,7 @@ const EFFECT_SAMPLE_LOG: &str = r#"
 /// space a table made for ACEScct reads, and where every level of light,
 /// far past white, has a place between 0 and 1.
 fn sample(uv: vec2<f32>) -> vec4<f32> {
-    return into_space(textureSample(source, source_sampler, uv));
+    return into_space(textureSampleLevel(source, source_sampler, uv, 0.0));
 }
 
 /// A colour of the layer as the texture holds it, in the space `sample`
@@ -212,12 +223,12 @@ const TRANSITION_SAMPLE_LINEAR: &str = r#"
 /// The outgoing picture's colour at `uv`, straight alpha, in the working
 /// space as it is (see an effect's `sample`).
 fn from_at(uv: vec2<f32>) -> vec4<f32> {
-    return textureSample(from_texture, from_sampler, uv);
+    return textureSampleLevel(from_texture, from_sampler, uv, 0.0);
 }
 
 /// The incoming picture's colour at `uv`, likewise.
 fn to_at(uv: vec2<f32>) -> vec4<f32> {
-    return textureSample(to_texture, to_sampler, uv);
+    return textureSampleLevel(to_texture, to_sampler, uv, 0.0);
 }
 "#;
 
@@ -1444,6 +1455,36 @@ impl Entry {
     }
 }
 
+/// Aligns `struct Params`' first field to 16, which makes the struct a
+/// whole number of 16 bytes without moving a field: OpenGL ES binds
+/// uniforms in whole 16s, and wgpu refused a one-knob effect's 4-byte
+/// `Params` there, so every effect and transition failed on a phone with
+/// no Vulkan. The buffer behind it is already padded to 16 (`stitch`'s
+/// span). A field the package aligned itself is left as it is.
+fn align_params(source: &mut String) {
+    let Some(open) = source.match_indices("struct").find_map(|(at, _)| {
+        // A declaration starts its line; a comment that names it does not.
+        let line = &source[source[..at].rfind('\n').map_or(0, |n| n + 1)..at];
+        if !line.trim().is_empty() {
+            return None;
+        }
+        let rest = &source[at + "struct".len()..];
+        let name = rest.trim_start();
+        let after = name.strip_prefix("Params")?;
+        if !after.starts_with(|c: char| c.is_whitespace() || c == '{') {
+            return None;
+        }
+        Some(source.len() - after.len() + after.find('{')?)
+    }) else {
+        return;
+    };
+    let first = &source[open + 1..];
+    let field = &first[..first.find(':').unwrap_or(first.len())];
+    if !field.contains("@align") {
+        source.insert_str(open + 1, " @align(16)");
+    }
+}
+
 /// Stitches a package `body` into the host's contract for `entry`, in the
 /// edition its manifest's format asks for, parses and validates the result
 /// with naga, and reads its `Params` struct for where each declared
@@ -1492,6 +1533,7 @@ fn stitch(
     source.push_str(body);
     source.push('\n');
     source.push_str(&host);
+    align_params(&mut source);
 
     let module =
         naga::front::wgsl::parse_str(&source).map_err(|error| error.emit_to_string(&source))?;

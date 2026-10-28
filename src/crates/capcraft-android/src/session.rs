@@ -451,6 +451,7 @@ impl MobileSession {
                 rate_num: 30,
                 rate_den: 1,
                 opened_at: 0,
+                canvas: [0, 0, 0, 255],
             });
         let session = Session::open_info(&info)?;
         let names = crate::history::Names::new(&session);
@@ -789,6 +790,7 @@ impl MobileSession {
             duration: Some(duration),
             effect_id,
             name,
+            sound: false,
         })
     }
 
@@ -1073,6 +1075,7 @@ impl MobileSession {
                     .map(|link| link.id.clone())
                     .unwrap_or_default(),
                 name: clip.name.clone(),
+                sound: false,
             },
             _ => Command::AddClip {
                 media_id: clip.media_id.clone(),
@@ -1158,6 +1161,7 @@ impl MobileSession {
             proxy: false,
             scrub: motion == Motion::Scrubbing,
             color_space,
+            canvas: settings.canvas,
         };
         let rgba = context
             .monitor
@@ -1372,6 +1376,7 @@ impl MobileSession {
             proxy: false,
             scrub: false,
             color_space,
+            canvas: settings.canvas,
         };
         let rgba = context
             .monitor
@@ -1709,6 +1714,7 @@ impl MobileSession {
             item,
             source_start: Some(0.0),
             enhanced: false,
+            offset: 0.0,
         }])
     }
 
@@ -1841,6 +1847,7 @@ impl MobileSession {
             item,
             source_start: Some(0.0),
             enhanced: false,
+            offset: 0.0,
         }])
     }
 }
@@ -1973,11 +1980,13 @@ pub(crate) fn copy_look(
         commands.push(Command::SetClipSpeedCurve {
             clip_id: to.to_owned(),
             curve: Some(curve.clone()),
+            ripple: false,
         });
     } else if (from.speed - 1.0).abs() > f64::EPSILON {
         commands.push(Command::SetClipSpeed {
             clip_id: to.to_owned(),
             speed: from.speed,
+            ripple: false,
         });
     }
     let mut value = serde_json::to_value(from).unwrap_or(Value::Null);
@@ -2035,6 +2044,7 @@ pub(crate) fn copy_look(
             item: info.to_new_media(),
             source_start: Some(from.source_start),
             enhanced: false,
+            offset: 0.0,
         });
     }
     for key in &from.keys {

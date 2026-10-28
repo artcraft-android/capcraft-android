@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Placing, moving and cutting clips: the edits that change what is on the timeline and when.
 //!
@@ -61,6 +61,60 @@ pub(super) fn apply(
                 .push(Arc::new(default_clip(id.clone(), track_id, &media, start)));
             Ok(Outcome {
                 created_id: Some(id),
+                applied: true,
+            })
+        }
+
+        Command::AddClipsInSequence {
+            media_ids,
+            track_id,
+            start,
+            ripple,
+        } => {
+            let items = media_ids
+                .iter()
+                .map(|id| {
+                    project
+                        .media_by_id(id)
+                        .cloned()
+                        .ok_or(CommandError::MediaGone)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if items.is_empty() {
+                return Ok(Outcome {
+                    created_id: None,
+                    applied: false,
+                });
+            }
+            let start = start.max(0.0);
+            let total: f64 = items.iter().map(clip_length).sum();
+            let timeline = project.active_mut();
+            let track_id = match track_id {
+                Some(id) if timeline.track(&id).is_none() => return Err(CommandError::TrackGone),
+                Some(id) => id,
+                None => first_free_track(timeline, start, total)
+                    .unwrap_or_else(|| fresh_track(timeline, mint)),
+            };
+            let mut at = start;
+            let mut first = None;
+            for media in &items {
+                let place = if ripple {
+                    ripple_room_for(timeline, &track_id, at, media)
+                } else {
+                    timeline.nearest_free_start(&track_id, at, clip_length(media), &[])
+                };
+                let id = mint.next("c");
+                timeline.clips.push(Arc::new(default_clip(
+                    id.clone(),
+                    track_id.clone(),
+                    media,
+                    place,
+                )));
+                first.get_or_insert(id);
+                at = place + clip_length(media);
+            }
+            Ok(Outcome {
+                created_id: first,
                 applied: true,
             })
         }
@@ -151,6 +205,7 @@ pub(super) fn apply(
             duration,
             effect_id,
             name,
+            sound,
         } => {
             let duration = duration
                 .unwrap_or(DEFAULT_LAYER_DURATION)
@@ -159,7 +214,13 @@ pub(super) fn apply(
             let track_id = match track_id {
                 Some(id) if timeline.track(&id).is_some() => id,
                 Some(_) => return Err(CommandError::TrackGone),
-                None => first_free_track(timeline, start, duration)
+                // Over the picture, as a title is: a layer treats what is
+                // beneath it, and the bottom-first walk put one under the
+                // footage whenever a lower lane was free, where it treated
+                // nothing. A sound layer treats every lane alike, and goes
+                // over the picture too, where it reads as a treatment and
+                // not as one more sound.
+                None => first_free_track_above(timeline, start, duration)
                     .unwrap_or_else(|| fresh_track(timeline, mint)),
             };
             let start = timeline.nearest_free_start(&track_id, start, duration, &[]);
@@ -169,9 +230,17 @@ pub(super) fn apply(
             } else {
                 name
             };
-            let mut clip =
-                Clip::blank(id.clone(), track_id, ClipKind::Layer, name, start, duration);
-            clip.video_effects = vec![AppliedFilter::new(effect_id)];
+            let kind = if sound {
+                ClipKind::SoundLayer
+            } else {
+                ClipKind::Layer
+            };
+            let mut clip = Clip::blank(id.clone(), track_id, kind, name, start, duration);
+            if sound {
+                clip.filters = vec![AppliedFilter::new(effect_id)];
+            } else {
+                clip.video_effects = vec![AppliedFilter::new(effect_id)];
+            }
             timeline.clips.push(Arc::new(clip));
             Ok(Outcome {
                 created_id: Some(id),
@@ -207,6 +276,7 @@ pub(super) fn apply(
             ripple,
         } => {
             let timeline = project.active_mut();
+            let main = timeline.background_lane().map(str::to_owned);
             let Some(clip) = timeline.clip_mut(&clip_id) else {
                 return Ok(Outcome::default());
             };
@@ -238,6 +308,7 @@ pub(super) fn apply(
                     let applied = assign(&mut clip.duration, duration);
                     if applied {
                         clip.rewindow_keys(old, 0.0, duration);
+                        crate::speed::rewindow_clip(clip, old, 0.0, duration);
                     }
                     (applied, duration - old, old_end - JOIN_EPSILON)
                 }
@@ -245,9 +316,15 @@ pub(super) fn apply(
                     // Dragging the head moves the in-point too, so the pixels
                     // under the remaining part of the clip do not slide. The
                     // head cannot reach before the source begins.
+                    // Under a curve the head extends at the speed it starts at.
+                    let lead = clip
+                        .speed_curve
+                        .as_deref()
+                        .and_then(crate::speed::curve_of)
+                        .map_or(clip.speed, |curve| curve.speed_at(0.0));
                     let shift = delta
                         .min(clip.duration - MIN_CLIP_DURATION)
-                        .max(-clip.source_start / clip.speed);
+                        .max(-clip.source_start / lead);
                     // A magnetic head trim never moves the clip, so the
                     // timeline's own start is no limit to it; a plain one
                     // stops at zero.
@@ -258,14 +335,22 @@ pub(super) fn apply(
                     };
                     let moved = start - clip.start;
                     let duration = clip.duration - moved;
-                    let source_start = (clip.source_start + moved * clip.speed).max(0.0);
                     let old = clip.duration;
+                    // The source the head took with it: a constant rate's
+                    // share, or under a curve the curve's own. Worked on a
+                    // copy, so a trim that changes nothing changes nothing.
+                    let mut retimed = Clip::clone(clip);
+                    let consumed = crate::speed::rewindow_clip(&mut retimed, old, moved, old)
+                        .unwrap_or(moved * clip.speed);
+                    let source_start = (clip.source_start + consumed).max(0.0);
                     // Bitwise so no assignment is short-circuited away.
                     let applied = assign(&mut clip.start, start)
                         | assign(&mut clip.duration, duration)
                         | assign(&mut clip.source_start, source_start);
                     if applied {
                         clip.rewindow_keys(old, moved, old);
+                        clip.speed = retimed.speed;
+                        clip.speed_curve = retimed.speed_curve;
                     }
                     if ripple {
                         // The in-point moved; the clip stays put, and the
@@ -281,6 +366,23 @@ pub(super) fn apply(
                 }) {
                     other.start = (other.start + by).max(0.0);
                 }
+                // In the lane's old time the edit is at the tail's old end
+                // or the clip's start, whichever edge moved: what came off
+                // went from there, what was restored went in there.
+                let at = match edge {
+                    TrimEdge::End => old_end,
+                    TrimEdge::Start => anchor,
+                };
+                let ripple = if by < 0.0 {
+                    let from = match edge {
+                        TrimEdge::End => old_end + by,
+                        TrimEdge::Start => anchor,
+                    };
+                    Ripple::Removed(vec![(from, from - by)])
+                } else {
+                    Ripple::Inserted { at, length: by }
+                };
+                follow_main(timeline, main.as_deref(), &track_id, ripple);
             }
             Ok(Outcome {
                 created_id: None,
@@ -295,28 +397,21 @@ pub(super) fn apply(
                 let Some(index) = timeline.clips.iter().position(|clip| clip.id == clip_id) else {
                     continue;
                 };
-                {
-                    // A curve does not survive a cut in halves: the map from
-                    // here to the source is not affine, so both halves go to
-                    // the constant mean, which is what they averaged.
-                    let clip = timeline.clip_at_mut(index);
-                    let offset = time - clip.start;
-                    if offset > MIN_CLIP_DURATION
-                        && offset < clip.duration - MIN_CLIP_DURATION
-                        && clip.speed_curve.is_some()
-                    {
-                        clip.speed_curve = None;
-                    }
-                }
                 let clip: &Clip = &timeline.clips[index];
                 let offset = time - clip.start;
                 if offset <= MIN_CLIP_DURATION || offset >= clip.duration - MIN_CLIP_DURATION {
                     continue;
                 }
-                let (head_source, tail_source) =
+                let (head_source, mut tail_source) =
                     split_source(clip.source_start, clip.speed, offset);
                 let whole = clip.duration;
                 let mut tail = clip.clone();
+                // Under a curve each half keeps its share of it, and the
+                // tail starts where the curve had got to in the source.
+                if let Some(consumed) = crate::speed::rewindow_clip(&mut tail, whole, offset, whole)
+                {
+                    tail_source = clip.source_start + consumed;
+                }
                 tail.id = mint.next("c");
                 tail.start = clip.start + offset;
                 tail.duration = clip.duration - offset;
@@ -330,6 +425,7 @@ pub(super) fn apply(
                 tail.rewindow_keys(whole, offset, whole);
                 created = Some(tail.id.clone());
                 let head = timeline.clip_at_mut(index);
+                crate::speed::rewindow_clip(head, whole, 0.0, offset);
                 head.duration = offset;
                 head.source_start = head_source;
                 head.fade_out = 0.0;
@@ -350,6 +446,7 @@ pub(super) fn apply(
             item,
             source_start,
             enhanced,
+            offset,
         } => {
             if project.active().clip(&clip_id).is_none() {
                 return Ok(Outcome::default());
@@ -400,6 +497,7 @@ pub(super) fn apply(
                     original,
                     copy: media_id.clone(),
                     on: true,
+                    offset,
                 })
             } else {
                 None
@@ -431,7 +529,15 @@ pub(super) fn apply(
             } else {
                 link.original.clone()
             };
+            // The in-point moves with the media, from one's seconds to the
+            // other's, so the frame on screen is the same frame.
+            let start = match (link.on, on) {
+                (false, true) => (clip.source_start - link.offset).max(0.0),
+                (true, false) => clip.source_start + link.offset,
+                _ => clip.source_start,
+            };
             let applied = assign(&mut clip.media_id, media)
+                | assign(&mut clip.source_start, start)
                 | assign(&mut clip.enhanced, Some(Enhanced { on, ..link }));
             Ok(Outcome {
                 created_id: None,
@@ -509,17 +615,20 @@ pub(super) fn apply(
             };
 
             let timeline = project.active_mut();
+            let main = timeline.background_lane().map(str::to_owned);
             let Some(index) = timeline.clips.iter().position(|clip| clip.id == clip_id) else {
                 return Ok(Outcome::default());
             };
             // The cut is a split's, so it leaves the pieces as a split does:
-            // under a curve the map is not affine, and the in-point below
-            // assumes it is, so both pieces go to the constant mean they
-            // averaged.
-            timeline.clip_at_mut(index).speed_curve = None;
+            // under a curve each keeps its share of it.
             let offset = time - start;
-            let (head_source, tail_source) = split_source(source_start, speed, offset);
+            let (head_source, mut tail_source) = split_source(source_start, speed, offset);
             let mut tail = Clip::clone(&timeline.clips[index]);
+            if let Some(consumed) =
+                crate::speed::rewindow_clip(&mut tail, clip_duration, offset, clip_duration)
+            {
+                tail_source = source_start + consumed;
+            }
             tail.id = mint.next("c");
             tail.start = time;
             tail.duration = clip_duration - offset;
@@ -528,6 +637,7 @@ pub(super) fn apply(
             tail.fade_in = 0.0;
             tail.rewindow_keys(clip_duration, offset, clip_duration);
             let head = timeline.clip_at_mut(index);
+            crate::speed::rewindow_clip(head, clip_duration, 0.0, offset);
             head.duration = offset;
             head.source_start = head_source;
             head.fade_out = 0.0;
@@ -540,6 +650,15 @@ pub(super) fn apply(
             {
                 clip.start += hold;
             }
+            follow_main(
+                timeline,
+                main.as_deref(),
+                &track_id,
+                Ripple::Inserted {
+                    at: time,
+                    length: hold,
+                },
+            );
 
             // The still is the source clip turned into a picture: cloning it
             // first carries every look field - transform, effects, crop,
@@ -609,6 +728,42 @@ pub(super) fn apply(
             })
         }
 
+        Command::ConsolidateClips { clip_ids, item } => {
+            let clips = consolidation_clips(project.active(), &clip_ids)?;
+            let first = &clips[0];
+            let end = clips
+                .iter()
+                .map(|clip| clip.start + clip.duration)
+                .fold(0.0, f64::max);
+            let duration = end - first.start;
+            if item.kind != MediaKind::Video
+                || item.path.is_empty()
+                || item.duration.is_none_or(|length| length + 1e-6 < duration)
+            {
+                return Err(CommandError::CannotMerge {
+                    reason: "The merged video does not cover the selected clips.".into(),
+                });
+            }
+            let path = item.path.clone();
+            super::media::apply(project, mint, Command::AddMedia { item })?;
+            let media = project
+                .media
+                .iter()
+                .find(|media| super::media::same_path(&media.path, &path))
+                .expect("imported above");
+            let mut merged =
+                default_clip(first.id.clone(), first.track_id.clone(), media, first.start);
+            merged.duration = duration;
+            let timeline = project.active_mut();
+            let selected: HashSet<_> = clip_ids.iter().collect();
+            timeline.clips.retain(|clip| !selected.contains(&clip.id));
+            timeline.clips.push(Arc::new(merged));
+            Ok(Outcome {
+                created_id: Some(first.id.clone()),
+                applied: true,
+            })
+        }
+
         Command::RemoveClips { clip_ids, ripple } => {
             let timeline = project.active_mut();
             let doomed: HashSet<&str> = clip_ids.iter().map(String::as_str).collect();
@@ -626,6 +781,9 @@ pub(super) fn apply(
                     )
                 })
                 .collect();
+            // The main lane before it loses anything: deleting its last
+            // picture is still an edit of it.
+            let main = timeline.background_lane().map(str::to_owned);
             let clip_count = timeline.clips.len();
             timeline
                 .clips
@@ -633,6 +791,14 @@ pub(super) fn apply(
             let applied = timeline.clips.len() != clip_count;
             if ripple && applied {
                 close_gaps(timeline, &removed);
+                if let Some(main) = main.as_deref() {
+                    let spans = removed
+                        .iter()
+                        .filter(|(track, _, _)| track == main)
+                        .map(|(_, start, end)| (*start, *end))
+                        .collect();
+                    follow_main(timeline, Some(main), main, Ripple::Removed(spans));
+                }
             }
             Ok(Outcome {
                 created_id: None,
@@ -662,28 +828,94 @@ fn close_gaps(timeline: &mut Timeline, removed: &[(String, f64, f64)]) {
             .any(|(track, start, _)| *track == clip.track_id && *start < clip.start)
     };
     for clip in timeline.clips_where(behind_a_span) {
-        let mut spans: Vec<(f64, f64)> = removed
+        let spans: Vec<(f64, f64)> = removed
             .iter()
-            .filter(|(track, start, _)| *track == clip.track_id && *start < clip.start)
-            .map(|(_, start, end)| (*start, end.min(clip.start)))
+            .filter(|(track, _, _)| *track == clip.track_id)
+            .map(|(_, start, end)| (*start, *end))
             .collect();
-        if spans.is_empty() {
-            continue;
+        clip.start = (clip.start - removed_before(&spans, clip.start)).max(0.0);
+    }
+}
+
+/// How much of `spans` lies before `at`, counting what they share once: a
+/// span reaching past `at` counts only up to it.
+fn removed_before(spans: &[(f64, f64)], at: f64) -> f64 {
+    let mut before: Vec<(f64, f64)> = spans
+        .iter()
+        .filter(|(start, _)| *start < at)
+        .map(|&(start, end)| (start, end.min(at)))
+        .collect();
+    if before.is_empty() {
+        return 0.0;
+    }
+    before.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut gap = 0.0;
+    let (mut from, mut to) = before[0];
+    for (start, end) in before.into_iter().skip(1) {
+        if start <= to {
+            to = to.max(end);
+        } else {
+            gap += to - from;
+            from = start;
+            to = end;
         }
-        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut gap = 0.0;
-        let (mut from, mut to) = spans[0];
-        for (start, end) in spans.into_iter().skip(1) {
-            if start <= to {
-                to = to.max(end);
-            } else {
-                gap += to - from;
-                from = start;
-                to = end;
+    }
+    gap + (to - from)
+}
+
+/// What an edit did to the main lane's time, counted in the lane as it was
+/// before: spans taken out of it, or a length put in at a time.
+pub(crate) enum Ripple {
+    Removed(Vec<(f64, f64)>),
+    Inserted { at: f64, length: f64 },
+}
+
+/// Linkage: the rest of the timeline follows a ripple on its main lane, so
+/// what was placed against the footage stays on the frames it was placed
+/// against. A clip on another lane that starts at or after an insertion
+/// moves along by its length, and one after a removal moves back by what
+/// was taken out before it - landing where the cut is when it started
+/// inside what went. A clip that runs across the edit stays: a music bed
+/// is not cut up or dragged. Words wholly inside footage that went - a
+/// caption, a title - go with it, as they would have been spoken over
+/// nothing. `main` is the timeline's main lane as it stood before the
+/// edit; a ripple on any other lane, or with linkage off, moves only its
+/// own lane, as it always did.
+pub(crate) fn follow_main(timeline: &mut Timeline, main: Option<&str>, lane: &str, ripple: Ripple) {
+    if !timeline.linkage || main != Some(lane) {
+        return;
+    }
+    match ripple {
+        Ripple::Inserted { at, length } => {
+            if length <= 0.0 {
+                return;
+            }
+            for clip in timeline
+                .clips_where(|clip| clip.track_id != lane && clip.start >= at - JOIN_EPSILON)
+            {
+                clip.start += length;
             }
         }
-        gap += to - from;
-        clip.start = (clip.start - gap).max(0.0);
+        Ripple::Removed(spans) => {
+            let spans: Vec<(f64, f64)> = spans.into_iter().filter(|(s, e)| e > s).collect();
+            if spans.is_empty() {
+                return;
+            }
+            let spoken_over_nothing = |clip: &Clip| {
+                clip.track_id != lane
+                    && clip.kind == ClipKind::Text
+                    && spans.iter().any(|&(start, end)| {
+                        clip.start >= start - JOIN_EPSILON
+                            && clip.start + clip.duration <= end + JOIN_EPSILON
+                    })
+            };
+            timeline.clips.retain(|clip| !spoken_over_nothing(clip));
+            for clip in timeline.clips_where(|clip| {
+                clip.track_id != lane && spans.iter().any(|&(start, _)| start < clip.start)
+            }) {
+                clip.start = (clip.start - removed_before(&spans, clip.start)).max(0.0);
+            }
+        }
     }
 }
 
@@ -728,9 +960,19 @@ fn ripple_room_for(timeline: &mut Timeline, track_id: &str, start: f64, media: &
     if !overlaps {
         return start;
     }
+    let main = timeline.background_lane().map(str::to_owned);
     for clip in timeline.clips_where(|clip| clip.track_id == track_id && clip.start >= start) {
         clip.start += duration;
     }
+    follow_main(
+        timeline,
+        main.as_deref(),
+        track_id,
+        Ripple::Inserted {
+            at: start,
+            length: duration,
+        },
+    );
     start
 }
 
@@ -796,6 +1038,63 @@ fn first_free_track_above(timeline: &Timeline, start: f64, duration: f64) -> Opt
         .map(|track| track.id.clone())
 }
 
+/// Which side of the playhead [`delete_to_playhead`] takes away.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlayheadSide {
+    /// From the clip's start up to the playhead: CapCut's Delete Left (Q).
+    Left,
+    /// From the playhead to the clip's end: CapCut's Delete Right (W).
+    Right,
+}
+
+/// Delete Left / Delete Right: each named clip that `at` runs through loses
+/// what lies on `side` of it, as trims of the edge on that side brought to
+/// `at` - so a head cut keeps the frames after the playhead where they
+/// were in the source. More than one clip is one [`Command::Batch`], one
+/// undo step. `ripple` closes each lane behind the cut, as a trim on the
+/// magnetic timeline does.
+///
+/// A clip the instant misses, or grazes within [`MIN_CLIP_DURATION`] of an
+/// end, is skipped, the way [`Command::SplitClips`] skips it: there is
+/// nothing to take. So is a second clip on a lane that already has one:
+/// a magnetic cut moves what comes after it, and the second clip's cut
+/// was measured before that move. None when nothing is left to cut.
+pub fn delete_to_playhead(
+    timeline: &Timeline,
+    clip_ids: &[String],
+    at: f64,
+    side: PlayheadSide,
+    ripple: bool,
+) -> Option<Command> {
+    let mut lanes = HashSet::new();
+    let mut trims: Vec<Command> = clip_ids
+        .iter()
+        .filter_map(|id| timeline.clip(id))
+        .filter(|clip| {
+            clip.start + MIN_CLIP_DURATION < at
+                && at < clip.start + clip.duration - MIN_CLIP_DURATION
+        })
+        .filter(|clip| lanes.insert(clip.track_id.clone()))
+        .map(|clip| {
+            let (edge, delta) = match side {
+                PlayheadSide::Left => (TrimEdge::Start, at - clip.start),
+                PlayheadSide::Right => (TrimEdge::End, at - (clip.start + clip.duration)),
+            };
+            Command::TrimClip {
+                clip_id: clip.id.clone(),
+                edge,
+                delta,
+                ripple,
+            }
+        })
+        .collect();
+    match trims.len() {
+        0 => None,
+        1 => trims.pop(),
+        _ => Some(Command::Batch { commands: trims }),
+    }
+}
+
 /// Where each piece of a clip cut at `offset` begins in the source: the
 /// head keeps its in-point and the tail starts `offset × speed` later, so
 /// the two pieces together show exactly what the whole did.
@@ -850,4 +1149,119 @@ pub fn why_not_merge(timeline: &Timeline, clip_ids: &[String]) -> Option<String>
         }
     }
     None
+}
+
+/// Validates a selection for rendering into one clip, in timeline order.
+/// Gaps remain in the render. Unselected clips in its span are refused so
+/// the replacement cannot cover them. Source order and file need not match.
+pub fn consolidation_clips(
+    timeline: &Timeline,
+    clip_ids: &[String],
+) -> Result<Vec<Clip>, CommandError> {
+    let refuse = |reason: &str| CommandError::CannotMerge {
+        reason: reason.into(),
+    };
+    let selected: HashSet<_> = clip_ids.iter().collect();
+    if selected.len() < 2 || selected.len() != clip_ids.len() {
+        return Err(refuse("Select two or more distinct video clips to merge."));
+    }
+    let mut clips: Vec<Clip> = clip_ids
+        .iter()
+        .map(|id| {
+            timeline
+                .clip(id)
+                .cloned()
+                .ok_or_else(|| refuse("A selected clip no longer exists."))
+        })
+        .collect::<Result<_, _>>()?;
+    clips.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let first = &clips[0];
+    if clips
+        .iter()
+        .any(|clip| clip.kind != ClipKind::Video || clip.track_id != first.track_id)
+    {
+        return Err(refuse("Select video clips on the same track to merge."));
+    }
+    if timeline.track(&first.track_id).is_none() {
+        return Err(CommandError::TrackGone);
+    }
+    if clips
+        .windows(2)
+        .any(|pair| pair[1].start < pair[0].start + pair[0].duration - 1e-6)
+    {
+        return Err(refuse("Overlapping clips cannot be merged."));
+    }
+    if timeline.clips.iter().any(|clip| {
+        clip.detached_from
+            .as_ref()
+            .is_some_and(|id| selected.contains(id))
+    }) {
+        return Err(refuse(
+            "Reattach detached audio before merging its video clips.",
+        ));
+    }
+    let end = clips
+        .iter()
+        .map(|clip| clip.start + clip.duration)
+        .fold(0.0, f64::max);
+    if timeline.clips.iter().any(|clip| {
+        clip.track_id == first.track_id
+            && !selected.contains(&clip.id)
+            && clip.start < end - 1e-6
+            && clip.start + clip.duration > first.start + 1e-6
+    }) {
+        return Err(refuse("Select every clip inside the span to merge."));
+    }
+    // Rounding several subframe spans is not always equivalent to rounding
+    // their union. Refuse a span that one ordinary clip could truncate, or
+    // whose pieces overlap after quantisation, instead of losing a frame.
+    let fps = timeline.video.rate();
+    let frame = |seconds: f64| (seconds * fps).round();
+    let rendered_end = clips
+        .iter()
+        .map(|clip| frame(clip.start) + frame(clip.duration))
+        .fold(0.0, f64::max);
+    if rendered_end != frame(first.start) + frame(end - first.start)
+        || clips
+            .windows(2)
+            .any(|pair| frame(pair[1].start) < frame(pair[0].start) + frame(pair[0].duration))
+    {
+        return Err(refuse(
+            "Align clip boundaries to the timeline frame grid before merging.",
+        ));
+    }
+    // MP4 bakes against black and cannot carry the selection's alpha.
+    // Refuse a bake that would cover an existing lower-track composite.
+    let lane = timeline
+        .tracks
+        .iter()
+        .position(|track| track.id == first.track_id)
+        .expect("checked above");
+    if timeline.clips.iter().any(|clip| {
+        clip.kind != ClipKind::Audio
+            && clip.start < end
+            && clip.start + clip.duration > first.start
+            && timeline
+                .tracks
+                .iter()
+                .take(lane)
+                .any(|track| track.id == clip.track_id && track.visible)
+    }) {
+        return Err(refuse(
+            "Clips above other visible content cannot be merged into an opaque video.",
+        ));
+    }
+    // An edge transition needs footage outside the selected span. Internal
+    // transitions are rendered normally; never silently bake only half one.
+    if first.transition_in.is_some()
+        || timeline.clips.iter().any(|clip| {
+            clip.track_id == first.track_id
+                && !selected.contains(&clip.id)
+                && (clip.start - end).abs() < 1e-6
+                && clip.transition_in.is_some()
+        })
+    {
+        return Err(refuse("Include both sides of a transition in the merge."));
+    }
+    Ok(clips)
 }

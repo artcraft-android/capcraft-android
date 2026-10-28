@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The edit itself: a project, its tracks, and the clips on them.
 //!
@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::animate::Animation;
 use crate::arena::{Arena, Id};
+use crate::mask::ShapeMask;
 use crate::retime::SpeedCurve;
 use crate::time::{FrameRate, Rational, TimeRange};
 
@@ -100,6 +101,15 @@ pub struct Clip {
     /// first frame shown for the length of the dissolve, where other
     /// editors show "repeated frames".
     pub hold: bool,
+    /// The shape that keeps part of the picture, when one does; its
+    /// numbers ride the animation's mask tracks.
+    pub mask: Option<ShapeMask>,
+    /// How many times the frame the picture is drawn for, along the axis
+    /// it is most: one - every picture but a title whose ink runs past the
+    /// frame's edges, painted on a canvas grown to hold it. A picture past
+    /// one is drawn at one of its pixels to one of the frame's, centred on
+    /// the clip's centre, where any other is fitted inside the frame.
+    pub overscan: f64,
 }
 
 /// How a layer's colour meets what is beneath it.
@@ -278,6 +288,8 @@ impl Clip {
             animation: None,
             blend: Blend::Normal,
             hold: false,
+            mask: None,
+            overscan: 1.0,
         }
     }
 
@@ -297,6 +309,16 @@ impl Clip {
             Some(animation) => animation.transform_at(self.transform, self.fraction_at(time)),
             None => self.transform,
         }
+    }
+
+    /// The mask at `time`: the clip's own, its keyed numbers at their
+    /// ride's values. None for a clip with no mask.
+    pub fn mask_at(&self, time: Rational) -> Option<ShapeMask> {
+        let mask = self.mask?;
+        Some(match &self.animation {
+            Some(animation) => animation.mask.mask_at(mask, self.fraction_at(time)),
+            None => mask,
+        })
     }
 
     /// The opacity at `time`, before the fade ramps: the clip's own, scaled
@@ -421,6 +443,11 @@ pub struct Timeline {
     pub width: u32,
     /// Output height in pixels.
     pub height: u32,
+    /// What shows where no picture covers the frame, as eight-bit straight
+    /// `[r, g, b, a]`: the project's canvas colour, opaque black unless it
+    /// was given another, and clear for an overlay. A transition to black
+    /// still goes to black.
+    pub canvas: [u8; 4],
     tracks: Arena<Track>,
     clips: Arena<Clip>,
     order: Vec<TrackId>,
@@ -433,6 +460,7 @@ impl Timeline {
             frame_rate,
             width,
             height,
+            canvas: [0, 0, 0, 255],
             tracks: Arena::new(),
             clips: Arena::new(),
             order: Vec::new(),

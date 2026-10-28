@@ -135,6 +135,8 @@ fn specs(session: &Session) -> Vec<ClipSpec> {
         })
         .flat_map(concat_export::audio_pieces)
         .map(|piece| ClipSpec {
+            // a file of the timeline's, not a mix under sound layers
+            bus: None,
             path: piece.path.to_string_lossy().into_owned(),
             audio_stream: piece.stream.map(|index| index as u32),
             start: piece.start,

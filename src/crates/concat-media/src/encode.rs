@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Writing RGBA frames back out to a file.
 
@@ -47,11 +47,26 @@ pub enum VideoCodec {
     /// AV1: smaller again, royalty-free, the web's; slower to encode in
     /// software and not every old device plays it.
     Av1,
+    /// Apple ProRes 4444 in a `.mov`, with its alpha: the file other
+    /// editors - Premiere, Resolve, Final Cut, CapCut on a desktop - take
+    /// a transparent overlay in. Ten bits, its quality set by the profile
+    /// rather than a CRF, and very large: about forty times H.264.
+    ProRes4444,
+    /// VP9 with an alpha layer in a `.webm`: a transparent overlay for a
+    /// web page or OBS, a small fraction of ProRes' size. Eight bits.
+    Vp9Alpha,
 }
 
 impl VideoCodec {
-    /// Every codec, in the order a menu lists them.
-    pub const ALL: [VideoCodec; 3] = [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1];
+    /// Every codec, in the order a menu lists them: the three that make an
+    /// ordinary `.mp4`, then the two that keep a transparent frame's alpha.
+    pub const ALL: [VideoCodec; 5] = [
+        VideoCodec::H264,
+        VideoCodec::Hevc,
+        VideoCodec::Av1,
+        VideoCodec::ProRes4444,
+        VideoCodec::Vp9Alpha,
+    ];
 
     /// The name a document or a request stores.
     pub fn name(self) -> &'static str {
@@ -59,15 +74,23 @@ impl VideoCodec {
             VideoCodec::H264 => "h264",
             VideoCodec::Hevc => "hevc",
             VideoCodec::Av1 => "av1",
+            VideoCodec::ProRes4444 => "prores-4444",
+            VideoCodec::Vp9Alpha => "vp9-alpha",
         }
     }
 
     /// The codec a stored name means, or `None` for one nobody stores.
+    /// Plain "vp9" is not taken for the alpha one: a VP9 file without alpha
+    /// is a different request, and this one writes a second layer.
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "h264" | "h.264" | "avc" => Some(VideoCodec::H264),
             "hevc" | "h265" | "h.265" => Some(VideoCodec::Hevc),
             "av1" => Some(VideoCodec::Av1),
+            "prores-4444" | "prores_4444" | "prores4444" | "prores 4444" | "prores" => {
+                Some(VideoCodec::ProRes4444)
+            }
+            "vp9-alpha" | "vp9_alpha" | "vp9alpha" | "vp9 alpha" => Some(VideoCodec::Vp9Alpha),
             _ => None,
         }
     }
@@ -78,7 +101,35 @@ impl VideoCodec {
             VideoCodec::H264 => "H.264",
             VideoCodec::Hevc => "HEVC",
             VideoCodec::Av1 => "AV1",
+            VideoCodec::ProRes4444 => "ProRes 4444",
+            VideoCodec::Vp9Alpha => "VP9 alpha",
         }
+    }
+
+    /// Whether a file in it keeps the frame's alpha: a transparent
+    /// background stays transparent in the file, where the other three
+    /// write every pixel opaque.
+    pub fn keeps_alpha(self) -> bool {
+        matches!(self, VideoCodec::ProRes4444 | VideoCodec::Vp9Alpha)
+    }
+
+    /// The container a file in it is written in, as the file's extension:
+    /// "mp4" for H.264, HEVC and AV1, "mov" for ProRes and "webm" for VP9
+    /// with alpha. An MP4 has no place for either alpha layer: ProRes is
+    /// QuickTime's, and VP9's alpha rides in a Matroska block addition.
+    pub fn container(self) -> &'static str {
+        match self {
+            VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Av1 => "mp4",
+            VideoCodec::ProRes4444 => "mov",
+            VideoCodec::Vp9Alpha => "webm",
+        }
+    }
+
+    /// Whether the codec is steered by a CRF or a bitrate at all. ProRes is
+    /// not: its profile is the quality, and an export's rate mode, bitrate
+    /// and CRF are left unused.
+    pub fn rate_controlled(self) -> bool {
+        self != VideoCodec::ProRes4444
     }
 
     /// The FFmpeg encoders that make this codec, best first; an export
@@ -88,6 +139,12 @@ impl VideoCodec {
     /// built LGPL with MediaCodec or VideoToolbox and none of the GPL
     /// encoders (scripts/ffmpeg-mobile.sh), and its cores are no match for
     /// its chip anyway.
+    ///
+    /// The alpha codecs have one encoder each, on the CPU everywhere:
+    /// FFmpeg's own ProRes encoder, which every build carries, a phone's
+    /// too, and libvpx for VP9, which the desktops' GPL builds and Homebrew
+    /// link and a phone's LGPL build does not. No hardware encoder here
+    /// takes an alpha layer.
     ///
     /// On a desktop the software encoders lead, and the machine's own
     /// comes after them for an FFmpeg built without them. With `hardware`,
@@ -101,6 +158,11 @@ impl VideoCodec {
     /// compatibility, not speed. Media Foundation, Windows' own, is last:
     /// it runs on whatever the machine has, and says little about how.
     pub fn encoders(self, hardware: bool) -> &'static [&'static str] {
+        match self {
+            VideoCodec::ProRes4444 => return &["prores_ks"],
+            VideoCodec::Vp9Alpha => return &["libvpx-vp9"],
+            VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Av1 => {}
+        }
         let macos = cfg!(target_os = "macos");
         let windows = cfg!(target_os = "windows");
         if cfg!(target_os = "android") {
@@ -108,13 +170,14 @@ impl VideoCodec {
                 VideoCodec::H264 => &["h264_mediacodec"],
                 VideoCodec::Hevc => &["hevc_mediacodec"],
                 VideoCodec::Av1 => &["av1_mediacodec"],
+                VideoCodec::ProRes4444 | VideoCodec::Vp9Alpha => &[],
             };
         }
         if cfg!(target_os = "ios") {
             return match self {
                 VideoCodec::H264 => &["h264_videotoolbox"],
                 VideoCodec::Hevc => &["hevc_videotoolbox"],
-                VideoCodec::Av1 => &[],
+                VideoCodec::Av1 | VideoCodec::ProRes4444 | VideoCodec::Vp9Alpha => &[],
             };
         }
         match self {
@@ -138,6 +201,7 @@ impl VideoCodec {
                 &["av1_nvenc", "av1_qsv", "av1_amf", "libsvtav1", "libaom-av1"]
             }
             VideoCodec::Av1 => &["libsvtav1", "libaom-av1", "av1_nvenc", "av1_qsv", "av1_amf"],
+            VideoCodec::ProRes4444 | VideoCodec::Vp9Alpha => &[],
         }
     }
 
@@ -169,7 +233,8 @@ impl VideoCodec {
     /// [`encodable_among`] for the rest. A hardware encoder that is asked
     /// is opened once, at 720p, and the answer kept for the process.
     pub fn encodable(self) -> bool {
-        static KNOWN: [OnceLock<bool>; 3] = [const { OnceLock::new() }; 3];
+        static KNOWN: [OnceLock<bool>; VideoCodec::ALL.len()] =
+            [const { OnceLock::new() }; VideoCodec::ALL.len()];
         let slot = VideoCodec::ALL
             .iter()
             .position(|codec| *codec == self)
@@ -181,7 +246,8 @@ impl VideoCodec {
 
     /// Whether it can be written at ten bits here: some linked encoder for
     /// it takes ten-bit pictures. Not on a phone, whose encoders FFmpeg
-    /// feeds eight bits only.
+    /// feeds eight bits only. ProRes is ten bits whether asked or not; VP9
+    /// with alpha is eight, as libvpx takes its alpha layer at eight only.
     pub fn ten_bit_available(self) -> bool {
         self.linked(true, true).next().is_some()
     }
@@ -203,12 +269,17 @@ impl VideoCodec {
     }
 
     /// Bytes per second relative to H.264 at the same quality, for a size
-    /// estimate: the rule of thumb the codecs are chosen by.
+    /// estimate: the rule of thumb the codecs are chosen by. ProRes is not
+    /// steered by a rate at all - its profile comes to about 330 Mb/s for
+    /// a 1080p30 4444, some forty times H.264 - and VP9's alpha layer adds
+    /// about a third to its picture.
     pub fn size_factor(self) -> f32 {
         match self {
             VideoCodec::H264 => 1.0,
             VideoCodec::Hevc => 0.6,
             VideoCodec::Av1 => 0.5,
+            VideoCodec::ProRes4444 => 40.0,
+            VideoCodec::Vp9Alpha => 0.8,
         }
     }
 }
@@ -227,6 +298,12 @@ pub enum RateMode {
     /// A phone's encoder is handed the target in VBR instead, as its own
     /// CBR can starve an export (see `open_video`).
     Cbr,
+    /// A file's: `bitrate_kbps` is the average the encoder aims for, and a
+    /// busy passage may reach half again as much, so the size is known
+    /// before the render and a calm passage is not padded to the target.
+    /// What every editor's bitrate setting means, and what the export
+    /// sheet asks for.
+    Average,
 }
 
 impl RateMode {
@@ -235,11 +312,12 @@ impl RateMode {
         match self {
             RateMode::Vbr => "vbr",
             RateMode::Cbr => "cbr",
+            RateMode::Average => "average",
         }
     }
 
     /// Every mode, in the order a menu lists them.
-    pub const ALL: [RateMode; 2] = [RateMode::Vbr, RateMode::Cbr];
+    pub const ALL: [RateMode; 3] = [RateMode::Vbr, RateMode::Cbr, RateMode::Average];
 }
 
 /// Encoder settings.
@@ -279,6 +357,11 @@ pub struct EncodeOptions {
     /// Zero for an export; a few for a proxy written while the editor is
     /// in use.
     pub threads: u16,
+    /// The CPU and nothing else: no hardware encoder is opened, and on a
+    /// phone its chip is passed over for Android's own software component.
+    /// For an export going again after the hardware encoder stopped taking
+    /// frames part way through (see [`Error::Stalled`]); off otherwise.
+    pub software_only: bool,
 }
 
 impl Default for EncodeOptions {
@@ -293,6 +376,7 @@ impl Default for EncodeOptions {
             color_range: ColorRange::Limited,
             hardware: true,
             threads: 0,
+            software_only: false,
         }
     }
 }
@@ -321,6 +405,28 @@ fn svt_preset(preset: &str) -> u8 {
         .map_or(6, |index| SVT[index])
 }
 
+/// libvpx's `cpu-used` for an x264 preset, at its `good` deadline: 0 is
+/// its slowest and 5 its fastest there, and x264's medium lands on 3.
+fn vpx_speed(preset: &str) -> u8 {
+    const VPX: [u8; 10] = [5, 5, 5, 4, 4, 3, 2, 1, 0, 0];
+    X264_PRESETS
+        .iter()
+        .position(|name| *name == preset)
+        .map_or(3, |index| VPX[index])
+}
+
+/// The picture an encoder of an alpha codec takes, when `encoder_name` is
+/// one: ProRes 4444's ten-bit 4:4:4 with its alpha plane, and libvpx's
+/// 4:2:0 with one, the only alpha layout it reads. swscale fills the alpha
+/// plane from the RGBA frame's own alpha on the way.
+fn alpha_pixel_format(encoder_name: &str) -> Option<Pixel> {
+    match encoder_name {
+        "prores_ks" => Some(Pixel::YUVA444P10LE),
+        "libvpx-vp9" => Some(Pixel::YUVA420P),
+        _ => None,
+    }
+}
+
 /// VideoToolbox's quality, 1 to 100 with 100 the best, for an x264 CRF:
 /// 16 lands at 65 and 26 at 43, which is where the files come out about
 /// the size x264 makes them.
@@ -332,7 +438,9 @@ fn videotoolbox_quality(crf: u8) -> u8 {
 /// in, and what it is steered by.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Family {
-    /// x264, x265, SVT-AV1, libaom: planar 4:2:0, steered by a CRF.
+    /// x264, x265, SVT-AV1, libaom: planar 4:2:0, steered by a CRF. ProRes
+    /// and libvpx too, with pictures of their own that carry the alpha
+    /// (see [`alpha_pixel_format`]).
     Software,
     /// Apple's: semi-planar 4:2:0, steered by a quality.
     VideoToolbox,
@@ -505,6 +613,7 @@ fn opens(codec: VideoCodec, encoder_name: &'static str) -> bool {
         tags,
         None,
         true,
+        Attempt::AsAsked,
     );
     if let Err(error) = &result {
         log::info!("{encoder_name} does not open here: {error}");
@@ -551,6 +660,10 @@ fn opens_here(codec: VideoCodec, encoder_name: &'static str) -> bool {
 /// and AMF make ten-bit HEVC but not ten-bit H.264, and NVENC and Quick
 /// Sync make ten-bit HEVC and AV1.
 fn takes_ten_bits(encoder_name: &str) -> bool {
+    // libvpx's alpha layer is eight bits only.
+    if encoder_name == "libvpx-vp9" {
+        return false;
+    }
     match Family::of(encoder_name) {
         Family::Software => true,
         Family::VideoToolbox | Family::Amf => encoder_name.starts_with("hevc_"),
@@ -590,6 +703,78 @@ const MEDIACODEC_QP_MAX: &str = "40";
 /// One encoder's context, set up and opened for the file: the frame's
 /// size, rate and tags, and the settings `encoder_name` is steered by.
 /// Returns the encoder and the pixel format it takes its pictures in.
+/// How an encoder is asked to open. A phone's chip turns away an export
+/// it cannot do with nothing past FFmpeg's "Generic error in an external
+/// library" (#491) - a bitrate past its ceiling, a rate it was not built
+/// for, colour keys an older component does not know - and a phone has no
+/// other encoder linked. So a MediaCodec encoder that will not open as
+/// asked is asked plainly, and then Android's own software encoder is
+/// asked by name: slow, but on every phone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Attempt {
+    /// Everything the export asked for.
+    AsAsked,
+    /// The chip's own rate control, a bitrate it can hold, a declared rate
+    /// of 30 at most and no colour keys.
+    Plain,
+    /// One of Android's own components, by name, asked plainly.
+    Component(&'static str),
+}
+
+/// The ways to ask `encoder_name`, in order.
+fn attempts(encoder_name: &str) -> &'static [Attempt] {
+    use Attempt::*;
+    match encoder_name {
+        // c2.android.* since Android 10; OMX.google.* before it.
+        "h264_mediacodec" => &[
+            AsAsked,
+            Plain,
+            Component("c2.android.avc.encoder"),
+            Component("OMX.google.h264.encoder"),
+        ],
+        "hevc_mediacodec" => &[AsAsked, Plain, Component("c2.android.hevc.encoder")],
+        "av1_mediacodec" => &[AsAsked, Plain, Component("c2.android.av1.encoder")],
+        _ => &[AsAsked],
+    }
+}
+
+impl Attempt {
+    /// Whether `encoder_name` asked this way encodes on the CPU: one of
+    /// Android's own components, or an encoder that is software already.
+    fn in_software(self, encoder_name: &str) -> bool {
+        match self {
+            Attempt::Component(_) => true,
+            Attempt::AsAsked | Attempt::Plain => !Family::of(encoder_name).hardware(),
+        }
+    }
+}
+
+/// The ways to ask `encoder_name`, in order, that `options` allows: every
+/// one, or with [`EncodeOptions::software_only`] those on the CPU alone - on
+/// a phone straight to Android's software component, past a chip that
+/// stopped part way through the last try, and on a desktop the software
+/// encoders, with NVENC, Quick Sync, AMF and the rest passed over.
+fn allowed_attempts(
+    encoder_name: &'static str,
+    options: &EncodeOptions,
+) -> impl Iterator<Item = Attempt> {
+    let software_only = options.software_only;
+    attempts(encoder_name)
+        .iter()
+        .copied()
+        .filter(move |attempt| !software_only || attempt.in_software(encoder_name))
+}
+
+/// The most a plain ask puts on a phone's chip, in kb/s: room for a clean
+/// 1080p, and twice that above it.
+fn plain_kbps(width: u32, height: u32) -> u32 {
+    if u64::from(width) * u64::from(height) <= 1920 * 1088 {
+        16_000
+    } else {
+        32_000
+    }
+}
+
 fn open_video(
     encoder_name: &'static str,
     codec: ffmpeg::Codec,
@@ -604,11 +789,17 @@ fn open_video(
     ),
     hdr: Option<Signal>,
     global_header: bool,
+    attempt: Attempt,
 ) -> Result<(encoder::video::Encoder, Pixel)> {
     let pq = hdr == Some(Signal::Pq);
     let family = Family::of(encoder_name);
-    let pixel_format = family.pixel_format(options.ten_bit);
-    let cbr = options.rate_mode == RateMode::Cbr && options.bitrate_kbps > 0;
+    let plain = attempt != Attempt::AsAsked;
+    let pixel_format =
+        alpha_pixel_format(encoder_name).unwrap_or_else(|| family.pixel_format(options.ten_bit));
+    // ProRes has no rate to steer: its profile is the quality.
+    let rated = options.codec.rate_controlled();
+    let cbr = rated && options.rate_mode == RateMode::Cbr && options.bitrate_kbps > 0;
+    let average = rated && options.rate_mode == RateMode::Average && options.bitrate_kbps > 0;
     let mut video = ffmpeg::codec::Context::new_with_codec(codec)
         .encoder()
         .video()
@@ -617,20 +808,35 @@ fn open_video(
     video.set_height(height);
     video.set_format(pixel_format);
     video.set_time_base(rate.invert());
-    video.set_frame_rate(Some(rate));
+    let fps = f64::from(rate.numerator()) / f64::from(rate.denominator().max(1));
+    // Asked plainly, a chip is told 30 at most: the rate is what it sizes
+    // its work by and may refuse past, while the frames' times come from
+    // the time base and are untouched.
+    video.set_frame_rate(Some(if plain && fps > 30.5 {
+        ffmpeg::Rational::new(30, 1)
+    } else {
+        rate
+    }));
     let (primaries, transfer, matrix) = tags;
-    video.set_colorspace(matrix);
-    // The range the frames will be converted to below, so the tag is
-    // true; VideoToolbox reads it to pick its full- or video-range
-    // pixel format, the software encoders write it into the stream.
-    video.set_color_range(options.color_range.as_ffmpeg());
+    // Asked plainly, no colour keys at all: an older codec2 component
+    // refuses some it does not know, and untagged 8-bit video is read as
+    // the limited-range Rec. 709 it is.
+    if !plain {
+        video.set_colorspace(matrix);
+        // The range the frames will be converted to below, so the tag is
+        // true; VideoToolbox reads it to pick its full- or video-range
+        // pixel format, the software encoders write it into the stream.
+        video.set_color_range(options.color_range.as_ffmpeg());
+    }
     // SAFETY: `video` owns a live AVCodecContext; primaries and
     // transfer have no setter in the bindings, and all three are plain
     // fields the encoder reads at open.
     unsafe {
         let context = video.as_mut_ptr();
-        (*context).color_primaries = primaries.into();
-        (*context).color_trc = transfer.into();
+        if !plain {
+            (*context).color_primaries = primaries.into();
+            (*context).color_trc = transfer.into();
+        }
         if options.threads > 0 {
             (*context).thread_count = i32::from(options.threads);
         }
@@ -663,20 +869,39 @@ fn open_video(
 
     // The encoders steered by a bitrate alone take one whatever the mode:
     // the target in CBR, and in VBR the rate the CRF would come to.
+    // Asked plainly, no more than a phone's chip is sure to hold.
+    let ceiling = |kbps: u32| {
+        if plain {
+            kbps.min(plain_kbps(width, height))
+        } else {
+            kbps
+        }
+    };
     if family.steered_by_bitrate() {
-        let kbps = if cbr {
+        let kbps = if cbr || average {
             options.bitrate_kbps
         } else {
             implied_kbps(options.codec, options.crf, width, height, rate)
         };
-        video.set_bit_rate(kbps as usize * 1000);
+        video.set_bit_rate(ceiling(kbps) as usize * 1000);
         // Two seconds between keyframes, where MediaCodec's own default
         // is one per second rounded from a GOP of twelve frames.
-        let fps = (f64::from(rate.numerator()) / f64::from(rate.denominator().max(1))).round();
-        video.set_gop((fps.max(1.0) * 2.0) as u32);
+        video.set_gop((fps.round().max(1.0) * 2.0) as u32);
+    }
+    // An average, on the context as well as in each encoder's own words:
+    // the AV1 encoders read the target and the ceiling from there.
+    if average {
+        let kbps = ceiling(options.bitrate_kbps);
+        video.set_bit_rate(kbps as usize * 1000);
+        video.set_max_bit_rate(kbps as usize * 1500);
     }
     let crf = options.crf.to_string();
     let bitrate = format!("{}k", options.bitrate_kbps);
+    // The average's ceiling, half again the target, and a buffer of two
+    // seconds' worth: room for a cut to a busy shot without the encoder
+    // starving the frames after it.
+    let peak = format!("{}k", options.bitrate_kbps * 3 / 2);
+    let window = format!("{}k", options.bitrate_kbps * 2);
     // One second of VBV, not two. With a looser buffer x264 can stay
     // well under b:v on calm content and never emit the padding that
     // makes a CBR a CBR; `bufsize == bitrate` is where it starts
@@ -710,9 +935,23 @@ fn open_video(
             "bufsize" => bufsize.as_str(),
             "x265-params" => "strict-cbr=1",
         },
+        "libx264" | "libx265" if average => ffmpeg::dict! {
+            "preset" => options.preset.as_str(),
+            "b" => bitrate.as_str(),
+            "maxrate" => peak.as_str(),
+            "bufsize" => window.as_str(),
+        },
         "libx264" | "libx265" => ffmpeg::dict! {
             "preset" => options.preset.as_str(),
             "crf" => crf.as_str(),
+        },
+        // The context carries the target and the ceiling (above); the
+        // encoder runs its own VBR to them.
+        "libsvtav1" if average => ffmpeg::dict! {
+            "preset" => &svt_preset(&options.preset).to_string(),
+        },
+        "libaom-av1" if average => ffmpeg::dict! {
+            "cpu-used" => "6",
         },
         "libsvtav1" => ffmpeg::dict! {
             "preset" => &svt_preset(&options.preset).to_string(),
@@ -723,6 +962,59 @@ fn open_video(
         "libaom-av1" => ffmpeg::dict! {
             "crf" => &options.crf.saturating_add(8).min(63).to_string(),
             "cpu-used" => "6",
+        },
+        // ProRes 4444 is the profile FFmpeg picks for a picture with alpha,
+        // so the profile is not named: the encoder's own `profile` shares a
+        // name with the context's, which would take the word first. The
+        // alpha at sixteen bits, the most the format keeps, and Apple's
+        // vendor code, which some of the editors that read it look for.
+        "prores_ks" => ffmpeg::dict! {
+            "alpha_bits" => "16",
+            "vendor" => "apl0",
+        },
+        // libvpx's alt-ref frames are pictures that are never shown, and
+        // its alpha layer is encoded beside the colour frame by frame, so
+        // they are off. Row threading, as every core is wanted.
+        "libvpx-vp9" if cbr => ffmpeg::dict! {
+            "deadline" => "good",
+            "cpu-used" => &vpx_speed(&options.preset).to_string(),
+            "row-mt" => "1",
+            "auto-alt-ref" => "0",
+            "b" => bitrate.as_str(),
+            "minrate" => bitrate.as_str(),
+            "maxrate" => bitrate.as_str(),
+            "bufsize" => bufsize.as_str(),
+        },
+        "libvpx-vp9" if average => ffmpeg::dict! {
+            "deadline" => "good",
+            "cpu-used" => &vpx_speed(&options.preset).to_string(),
+            "row-mt" => "1",
+            "auto-alt-ref" => "0",
+            "b" => bitrate.as_str(),
+            "maxrate" => peak.as_str(),
+            "bufsize" => window.as_str(),
+        },
+        // Constant quality: a CRF with no bitrate beside it, which libvpx
+        // otherwise reads as a ceiling. VP9's scale runs to 63 like AV1's,
+        // and about twelve on from x264's is where the pictures match -
+        // 18 lands at 30, Google's own suggestion for 1080p.
+        "libvpx-vp9" => ffmpeg::dict! {
+            "deadline" => "good",
+            "cpu-used" => &vpx_speed(&options.preset).to_string(),
+            "row-mt" => "1",
+            "auto-alt-ref" => "0",
+            "crf" => &options.crf.saturating_add(12).min(63).to_string(),
+            "b" => "0",
+        },
+        // VideoToolbox steers by the context's bitrate when it is given no
+        // quality.
+        "hevc_videotoolbox" | "h264_videotoolbox" if average => ffmpeg::dict! {
+            "profile" => match (encoder_name, options.ten_bit) {
+                ("h264_videotoolbox", _) => "high",
+                (_, true) => "main10",
+                (_, false) => "main",
+            },
+            "allow_sw" => "1",
         },
         "hevc_videotoolbox" | "h264_videotoolbox" => ffmpeg::dict! {
             "q:v" => &videotoolbox_quality(options.crf).to_string(),
@@ -735,18 +1027,25 @@ fn open_video(
             "allow_sw" => "1",
         },
         // A phone's chip. The NDK's MediaCodec, not the Java one: no
-        // JavaVM is handed to FFmpeg, and the NDK needs none. Always VBR,
-        // with CBR's target as its bitrate, as phone editors do: in CBR one
-        // phone starved an export, holding a 5.5 Mb/s target at 0.5 with
+        // JavaVM is handed to FFmpeg, and the NDK needs none. As asked, always
+        // VBR, with CBR's target as its bitrate, as phone editors do: in CBR
+        // one phone starved an export, holding a 5.5 Mb/s target at 0.5 with
         // its P frames at the coarsest quantiser, 51, and VBR is the only
         // mode Android keeps its quality floor in. The quantiser is capped
         // too, so an encoder that misjudges its budget still spends enough
         // on each picture.
-        _ if family == Family::MediaCodec => ffmpeg::dict! {
-            "bitrate_mode" => "vbr",
-            "qp_i_max" => MEDIACODEC_QP_MAX,
-            "qp_p_max" => MEDIACODEC_QP_MAX,
-            "qp_b_max" => MEDIACODEC_QP_MAX,
+        _ if family == Family::MediaCodec => match attempt {
+            Attempt::AsAsked => ffmpeg::dict! {
+                "bitrate_mode" => "vbr",
+                "qp_i_max" => MEDIACODEC_QP_MAX,
+                "qp_p_max" => MEDIACODEC_QP_MAX,
+                "qp_b_max" => MEDIACODEC_QP_MAX,
+            },
+            // The chip's own rate control, whatever it is.
+            Attempt::Plain => ffmpeg::Dictionary::new(),
+            Attempt::Component(component) => ffmpeg::dict! {
+                "codec_name" => component,
+            },
         },
         // Windows' Media Foundation, whatever the machine has behind it.
         _ if family == Family::MediaFoundation => ffmpeg::dict! {
@@ -762,6 +1061,13 @@ fn open_video(
             "maxrate" => bitrate.as_str(),
             "bufsize" => bufsize.as_str(),
         },
+        _ if family == Family::Nvenc && average => ffmpeg::dict! {
+            "preset" => "p5",
+            "rc" => "vbr",
+            "b" => bitrate.as_str(),
+            "maxrate" => peak.as_str(),
+            "bufsize" => window.as_str(),
+        },
         _ if family == Family::Nvenc => ffmpeg::dict! {
             "preset" => "p5",
             "rc" => "vbr",
@@ -775,6 +1081,12 @@ fn open_video(
             "maxrate" => bitrate.as_str(),
             "bufsize" => bufsize.as_str(),
         },
+        _ if family == Family::Qsv && average => ffmpeg::dict! {
+            "preset" => "medium",
+            "b" => bitrate.as_str(),
+            "maxrate" => peak.as_str(),
+            "bufsize" => window.as_str(),
+        },
         _ if family == Family::Qsv => ffmpeg::dict! {
             "preset" => "medium",
             "global_quality" => &options.crf.clamp(1, 51).to_string(),
@@ -783,6 +1095,12 @@ fn open_video(
             "quality" => "quality",
             "rc" => "cbr",
             "b" => bitrate.as_str(),
+        },
+        _ if family == Family::Amf && average => ffmpeg::dict! {
+            "quality" => "quality",
+            "rc" => "vbr_peak",
+            "b" => bitrate.as_str(),
+            "maxrate" => peak.as_str(),
         },
         _ if family == Family::Amf => ffmpeg::dict! {
             "quality" => "quality",
@@ -838,6 +1156,25 @@ fn open_video(
     Ok((encoder, pixel_format))
 }
 
+/// `options` as the codec can take them. ProRes is ten bits and video
+/// range whatever is asked: its pictures are ten bits or more, and its
+/// stream has no word for full range, so a full-range file would be read
+/// back as video range by everything that opens it. VP9 with alpha is
+/// eight bits, the only depth libvpx takes an alpha layer at. The other
+/// codecs' options are left exactly as they were.
+fn settled(options: &EncodeOptions) -> EncodeOptions {
+    let mut options = options.clone();
+    match options.codec {
+        VideoCodec::ProRes4444 => {
+            options.ten_bit = true;
+            options.color_range = ColorRange::Limited;
+        }
+        VideoCodec::Vp9Alpha => options.ten_bit = false,
+        VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Av1 => {}
+    }
+    options
+}
+
 /// A four-character code as the muxer stores it.
 const fn fourcc(tag: [u8; 4]) -> u32 {
     u32::from_le_bytes(tag)
@@ -859,6 +1196,10 @@ pub struct Encoder {
     finished: bool,
     /// Which FFmpeg encoder took the job.
     encoder_name: &'static str,
+    /// Whether it is the platform's hardware doing the work. Not the same
+    /// as the name's family: `h264_mediacodec` asked for Android's own
+    /// component by name encodes on the CPU.
+    hardware: bool,
     /// The range every converted frame is stamped with, matching the
     /// stream's tag and the scaler's conversion.
     color_range: ffmpeg::color::Range,
@@ -1090,6 +1431,19 @@ impl Encoder {
                 detail: "H.264 does not carry HDR here: choose HEVC or AV1".to_owned(),
             });
         }
+        // The alpha codecs are written SDR alone. ProRes can carry HDR, but
+        // nothing here tags or checks it, and VP9's alpha layer is eight
+        // bits.
+        if options.codec.keeps_alpha() {
+            return Err(Error::Ffi {
+                operation: "open an HDR encoder",
+                path: path.to_path_buf(),
+                detail: format!(
+                    "{} is written SDR here: choose HEVC or AV1 for HDR",
+                    options.codec.label()
+                ),
+            });
+        }
         let options = EncodeOptions {
             ten_bit: true,
             ..options.clone()
@@ -1122,6 +1476,7 @@ impl Encoder {
         hdr: Option<Signal>,
     ) -> Result<Self> {
         ffi::init();
+        let options = &settled(options);
         let pq = hdr == Some(Signal::Pq);
         let path = path.as_ref();
         let fps = frame_rate.fps();
@@ -1156,36 +1511,48 @@ impl Encoder {
         }
         let mut failure = None;
         let mut opened = None;
-        for (name, codec) in candidates {
-            match open_video(
-                name,
-                codec,
-                path,
-                (width, height),
-                rate,
-                options,
-                tags,
-                hdr,
-                global_header,
-            ) {
-                Ok((encoder, pixel_format)) => {
-                    // Opening proves the chip, for the export sheet's label.
-                    // A refusal is not remembered: it may be this export's
-                    // size or depth, not the machine.
-                    if Family::of(name).hardware() {
-                        remember(name, true);
+        'encoders: for (name, codec) in candidates {
+            for attempt in allowed_attempts(name, options) {
+                match open_video(
+                    name,
+                    codec,
+                    path,
+                    (width, height),
+                    rate,
+                    options,
+                    tags,
+                    hdr,
+                    global_header,
+                    attempt,
+                ) {
+                    Ok((encoder, pixel_format)) => {
+                        // Opening proves the chip, for the export sheet's
+                        // label. A refusal is not remembered: it may be
+                        // this export's size or depth, not the machine.
+                        if attempt == Attempt::AsAsked && Family::of(name).hardware() {
+                            remember(name, true);
+                        }
+                        if attempt != Attempt::AsAsked {
+                            log::warn!("{name} opened only when asked {attempt:?}");
+                        }
+                        let hardware = !attempt.in_software(name);
+                        opened = Some((name, codec, encoder, pixel_format, hardware));
+                        break 'encoders;
                     }
-                    opened = Some((name, codec, encoder, pixel_format));
-                    break;
-                }
-                Err(error) => {
-                    log::warn!("{name} would not open, trying the next encoder: {error}");
-                    failure = Some(error);
+                    Err(error) => {
+                        log::warn!("{name} would not open {attempt:?}: {error}");
+                        failure = Some(error);
+                    }
                 }
             }
         }
-        let Some((encoder_name, codec, encoder, pixel_format)) = opened else {
-            return Err(failure.expect("at least one encoder was tried"));
+        let Some((encoder_name, codec, encoder, pixel_format, hardware)) = opened else {
+            // Nothing was even tried when the CPU alone was asked for and
+            // every linked encoder is hardware.
+            return Err(failure.unwrap_or_else(|| Error::Missing {
+                what: "software encoder",
+                name: options.codec.label().to_owned(),
+            }));
         };
 
         {
@@ -1227,8 +1594,16 @@ impl Encoder {
                 }
             }
         }
+        // The index up front, so a player starts before the file is in.
+        // Not for ProRes: moving it there writes the whole file again, gigabytes
+        // a minute, for an intermediate no one streams.
+        let header = if options.codec == VideoCodec::ProRes4444 {
+            ffmpeg::Dictionary::new()
+        } else {
+            ffmpeg::dict! { "movflags" => "+faststart" }
+        };
         output
-            .write_header_with(ffmpeg::dict! { "movflags" => "+faststart" })
+            .write_header_with(header)
             .map_err(|error| ffi::fail("write header", path, error))?;
         let stream_time_base = output
             .stream(0)
@@ -1282,6 +1657,7 @@ impl Encoder {
             written: 0,
             finished: false,
             encoder_name,
+            hardware,
             color_range: options.color_range.as_ffmpeg(),
             deep,
             light: pq.then(LightLevel::new),
@@ -1291,6 +1667,13 @@ impl Encoder {
     /// Which FFmpeg encoder is doing the work, e.g. "hevc_videotoolbox".
     pub fn encoder_name(&self) -> &'static str {
         self.encoder_name
+    }
+
+    /// Whether the platform's hardware is doing the work rather than the
+    /// CPU - false for a phone's export on Android's own software
+    /// component, whatever the encoder's name.
+    pub fn on_hardware(&self) -> bool {
+        self.hardware
     }
 
     /// How many frames have been accepted so far.
@@ -1305,7 +1688,8 @@ impl Encoder {
     /// whenever their input buffers are full, which on a phone is most
     /// exports; treated as a failure, it ended every H.264 export there
     /// a fraction of a second in. An encoder that keeps saying it for
-    /// [`ENCODER_PATIENCE`] is stuck, and the export fails saying so.
+    /// [`ENCODER_PATIENCE`] is stuck, and says so as [`Error::Stalled`]:
+    /// an export whose hardware it was goes again on the CPU.
     fn send(&mut self, frame: Option<&Video>) -> Result<()> {
         let sent = patiently(
             self,
@@ -1319,20 +1703,27 @@ impl Encoder {
         )?;
         sent.map_err(|refused| match refused {
             Refused::Error(error) => ffi::fail("encode", &self.path, error),
-            Refused::Stalled => Error::Ffi {
-                operation: "encode",
-                path: self.path.clone(),
-                detail: format!(
-                    "the encoder took no {} for {} seconds",
-                    if frame.is_some() {
-                        "frame"
-                    } else {
-                        "end of the stream"
-                    },
-                    ENCODER_PATIENCE.as_secs()
-                ),
-            },
+            Refused::Stalled => self.stalled(format!(
+                "the encoder took no {} for {} seconds",
+                if frame.is_some() {
+                    "frame"
+                } else {
+                    "end of the stream"
+                },
+                ENCODER_PATIENCE.as_secs()
+            )),
         })
+    }
+
+    /// The failure of an encoder that stopped, saying `detail` and whether
+    /// it was the hardware that stopped.
+    fn stalled(&self, detail: String) -> Error {
+        Error::Stalled {
+            operation: "encode",
+            path: self.path.clone(),
+            detail,
+            hardware: self.hardware,
+        }
     }
 
     /// Reads out what the encoder still holds once it has been told the
@@ -1347,14 +1738,10 @@ impl Encoder {
         if until_ended(self, Self::read_out, ENCODER_PATIENCE)? {
             return Ok(());
         }
-        Err(Error::Ffi {
-            operation: "encode",
-            path: self.path.clone(),
-            detail: format!(
-                "the encoder held its last frames for {} seconds",
-                ENCODER_PATIENCE.as_secs()
-            ),
-        })
+        Err(self.stalled(format!(
+            "the encoder held its last frames for {} seconds",
+            ENCODER_PATIENCE.as_secs()
+        )))
     }
 
     /// Writes every packet the encoder has ready.
@@ -1816,6 +2203,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An average-bitrate export, the export sheet's: busy pictures come
+    /// out near the target, so the size the sheet promised is the size
+    /// written, and calm ones well under it, not padded up to it as CBR
+    /// pads.
+    #[test]
+    fn an_average_export_keeps_near_its_target_and_does_not_pad() {
+        let dir =
+            std::env::temp_dir().join(format!("concat-media-abr-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        const KBPS: u32 = 2_000;
+        const FRAMES: u32 = 60;
+        let seconds = f64::from(FRAMES) / 30.0;
+        for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+            let options = EncodeOptions {
+                codec,
+                preset: "ultrafast".to_owned(),
+                rate_mode: RateMode::Average,
+                bitrate_kbps: KBPS,
+                hardware: false,
+                ..EncodeOptions::default()
+            };
+            let rate_of = |noisy: bool| {
+                let path = dir.join(format!("{}-{noisy}.mp4", codec.name()));
+                let mut encoder = Encoder::create(&path, 320, 180, FrameRate::THIRTY, &options)
+                    .unwrap_or_else(|error| panic!("{codec:?} average opens: {error}"));
+                let mut frame = Frame::black(320, 180);
+                let mut state = 0x2545_F491_4F6C_DD1D_u64;
+                for _ in 0..FRAMES {
+                    if noisy {
+                        for byte in frame.pixels_mut() {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            *byte = state as u8;
+                        }
+                    }
+                    encoder.write_frame(&frame).expect("writes");
+                }
+                encoder.finish().expect("finishes");
+                std::fs::metadata(&path).expect("written").len() as f64 * 8.0 / 1000.0 / seconds
+            };
+            let busy = rate_of(true);
+            assert!(
+                (f64::from(KBPS) * 0.6..=f64::from(KBPS) * 1.6).contains(&busy),
+                "{codec:?} averaging {KBPS} kb/s came out at {busy:.0} kb/s on noise"
+            );
+            let calm = rate_of(false);
+            assert!(
+                calm < f64::from(KBPS) * 0.5,
+                "{codec:?} averaging {KBPS} kb/s padded a black picture to {calm:.0} kb/s"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every written frame decodes back, at a frame rate an even number of
     /// frames does not land on a round second at (25 fps, 6 seconds: every
     /// packet but the last infers its duration from the one after it, so a
@@ -1840,6 +2283,7 @@ mod tests {
             color_range: ColorRange::Limited,
             hardware: false,
             threads: 0,
+            software_only: false,
         };
         let rate = FrameRate::new(concat_core::time::Rational::new(25, 1));
         const FRAMES: u32 = 150;
@@ -1958,6 +2402,123 @@ mod tests {
 
     /// Each kind of encoder is handed the pictures it reads, and ten bits
     /// only where it takes them.
+    /// A phone's encoder that will not open as asked is asked plainly,
+    /// then Android's own software one is asked by name; every other
+    /// encoder is asked once, as before (#491).
+    #[test]
+    fn a_phone_encoder_is_asked_again_before_the_export_fails() {
+        assert_eq!(
+            attempts("h264_mediacodec"),
+            [
+                Attempt::AsAsked,
+                Attempt::Plain,
+                Attempt::Component("c2.android.avc.encoder"),
+                Attempt::Component("OMX.google.h264.encoder"),
+            ]
+        );
+        assert_eq!(attempts("hevc_mediacodec")[1], Attempt::Plain);
+        assert_eq!(attempts("libx264"), [Attempt::AsAsked]);
+        assert_eq!(attempts("h264_videotoolbox"), [Attempt::AsAsked]);
+        assert_eq!(plain_kbps(1920, 1080), 16_000);
+        assert_eq!(plain_kbps(1080, 1920), 16_000, "upright is the same size");
+        assert_eq!(plain_kbps(3840, 2160), 32_000);
+    }
+
+    /// An export going again on the CPU after a phone's chip stopped part
+    /// way through asks Android's own software components only, never the
+    /// chip again; on a desktop, the software encoders only (#491).
+    #[test]
+    fn a_stalled_chip_is_passed_over_for_the_cpu() {
+        let cpu = EncodeOptions {
+            software_only: true,
+            ..EncodeOptions::default()
+        };
+        let asked = |name: &'static str, options: &EncodeOptions| -> Vec<Attempt> {
+            allowed_attempts(name, options).collect()
+        };
+        assert_eq!(
+            asked("h264_mediacodec", &cpu),
+            [
+                Attempt::Component("c2.android.avc.encoder"),
+                Attempt::Component("OMX.google.h264.encoder"),
+            ]
+        );
+        assert_eq!(
+            asked("hevc_mediacodec", &cpu),
+            [Attempt::Component("c2.android.hevc.encoder")]
+        );
+        assert_eq!(asked("libx264", &cpu), [Attempt::AsAsked]);
+        assert_eq!(asked("libsvtav1", &cpu), [Attempt::AsAsked]);
+        for hardware in ["hevc_nvenc", "h264_videotoolbox", "av1_qsv", "h264_mf"] {
+            assert!(asked(hardware, &cpu).is_empty(), "{hardware} is hardware");
+        }
+        // Not asked for, every way is tried, as before.
+        let mut every = EncodeOptions::default();
+        assert_eq!(
+            asked("h264_mediacodec", &every),
+            attempts("h264_mediacodec")
+        );
+        every.hardware = false;
+        assert_eq!(asked("hevc_nvenc", &every), [Attempt::AsAsked]);
+        // What each way comes to: the chip, or the CPU.
+        assert!(!Attempt::AsAsked.in_software("h264_mediacodec"));
+        assert!(!Attempt::Plain.in_software("h264_mediacodec"));
+        assert!(Attempt::Component("c2.android.avc.encoder").in_software("h264_mediacodec"));
+        assert!(Attempt::AsAsked.in_software("libx265"));
+    }
+
+    /// Only the hardware stopping is one an export goes again for: the CPU
+    /// stopping, or anything else failing, would fail again.
+    #[test]
+    fn a_hardware_stall_is_told_apart() {
+        let stall = |hardware| Error::Stalled {
+            operation: "encode",
+            path: PathBuf::from("out.mp4"),
+            detail: "the encoder took no frame for 10 seconds".to_owned(),
+            hardware,
+        };
+        assert!(stall(true).stalled_on_hardware());
+        assert!(!stall(false).stalled_on_hardware());
+        let other = Error::Ffi {
+            operation: "encode",
+            path: PathBuf::from("out.mp4"),
+            detail: "Generic error in an external library".to_owned(),
+        };
+        assert!(!other.stalled_on_hardware());
+        // Said as every other failure to encode is, so the words a person
+        // reads are the same ones they reported.
+        assert_eq!(
+            stall(true).to_string(),
+            "encode failed for out.mp4: the encoder took no frame for 10 seconds"
+        );
+    }
+
+    /// Asked for the CPU alone, an export opens on a software encoder and
+    /// says so, and still writes a file.
+    #[test]
+    fn a_software_only_encoder_opens_on_the_cpu() {
+        let dir =
+            std::env::temp_dir().join(format!("concat-media-cpu-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("cpu.mp4");
+        let options = EncodeOptions {
+            preset: "ultrafast".to_owned(),
+            software_only: true,
+            ..EncodeOptions::default()
+        };
+        let mut encoder = Encoder::create(&path, 64, 64, FrameRate::THIRTY, &options)
+            .expect("a software H.264 encoder is linked");
+        assert!(!encoder.on_hardware(), "{}", encoder.encoder_name());
+        assert_eq!(Family::of(encoder.encoder_name()), Family::Software);
+        for _ in 0..5 {
+            encoder.write_frame(&Frame::black(64, 64)).expect("writes");
+        }
+        encoder.finish().expect("finishes");
+        assert!(std::fs::metadata(&path).expect("written").len() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn each_encoder_family_takes_its_own_pictures() {
         assert_eq!(Family::of("libx264").pixel_format(false), Pixel::YUV420P);
@@ -2001,7 +2562,15 @@ mod tests {
         for codec in VideoCodec::ALL {
             for hardware in [false, true] {
                 let names = codec.encoders(hardware);
-                if cfg!(target_os = "android") {
+                // No hardware anywhere takes an alpha layer: those are the
+                // CPU's on a phone too.
+                if codec.keeps_alpha() {
+                    assert!(
+                        names.iter().all(|name| !Family::of(name).hardware()),
+                        "{codec:?}"
+                    );
+                    assert!(!names.is_empty(), "{codec:?}");
+                } else if cfg!(target_os = "android") {
                     assert!(names.iter().all(|name| name.ends_with("_mediacodec")));
                 } else if cfg!(target_os = "ios") {
                     assert!(names.iter().all(|name| name.ends_with("_videotoolbox")));
@@ -2143,6 +2712,7 @@ mod tests {
             tags,
             None,
             true,
+            Attempt::AsAsked,
         )
         .expect("opens");
         assert_eq!(format, Pixel::NV12);
@@ -2194,7 +2764,12 @@ mod tests {
     /// the bit depth asked for, and `hvc1` on HEVC.
     #[test]
     fn every_available_codec_writes_a_tagged_file() {
-        for codec in VideoCodec::ALL {
+        // The alpha codecs have their own test below, in their own
+        // containers.
+        for codec in VideoCodec::ALL
+            .into_iter()
+            .filter(|codec| !codec.keeps_alpha())
+        {
             if !codec.available() {
                 eprintln!("{} not in the linked FFmpeg; skipped", codec.label());
                 continue;
@@ -2215,6 +2790,7 @@ mod tests {
                     color_range: ColorRange::Limited,
                     hardware: true,
                     threads: 0,
+                    software_only: false,
                 };
                 let mut encoder = Encoder::create(&path, 64, 64, FrameRate::THIRTY, &options)
                     .unwrap_or_else(|error| panic!("{} {ten_bit}: {error}", codec.label()));
@@ -2259,6 +2835,7 @@ mod tests {
             color_range: ColorRange::Limited,
             hardware: true,
             threads: 0,
+            software_only: false,
         };
         let refused = std::env::temp_dir().join("concat-encode-hdr-h264.mp4");
         assert!(
@@ -2445,5 +3022,194 @@ mod tests {
         encoder.finish().expect("finishes");
         assert!(std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 0));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The alpha codecs say what they are and where they go, and settle
+    /// what they cannot do rather than refusing it: ProRes is ten bits and
+    /// video range, VP9 with alpha eight bits.
+    #[test]
+    fn the_alpha_codecs_name_their_containers() {
+        for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
+            assert!(!codec.keeps_alpha());
+            assert_eq!(codec.container(), "mp4");
+            assert!(codec.rate_controlled());
+        }
+        assert!(VideoCodec::ProRes4444.keeps_alpha());
+        assert_eq!(VideoCodec::ProRes4444.container(), "mov");
+        assert!(!VideoCodec::ProRes4444.rate_controlled());
+        assert!(VideoCodec::Vp9Alpha.keeps_alpha());
+        assert_eq!(VideoCodec::Vp9Alpha.container(), "webm");
+        assert_eq!(
+            VideoCodec::parse("ProRes 4444"),
+            Some(VideoCodec::ProRes4444)
+        );
+        assert_eq!(VideoCodec::parse("vp9_alpha"), Some(VideoCodec::Vp9Alpha));
+        assert_eq!(VideoCodec::parse("vp9"), None, "plain VP9 is not this");
+        assert!(!VideoCodec::Vp9Alpha.ten_bit_available());
+
+        let asked = EncodeOptions {
+            ten_bit: true,
+            color_range: ColorRange::Full,
+            ..EncodeOptions::default()
+        };
+        let prores = settled(&EncodeOptions {
+            codec: VideoCodec::ProRes4444,
+            ten_bit: false,
+            ..asked.clone()
+        });
+        assert!(prores.ten_bit);
+        assert_eq!(prores.color_range, ColorRange::Limited);
+        let vp9 = settled(&EncodeOptions {
+            codec: VideoCodec::Vp9Alpha,
+            ..asked.clone()
+        });
+        assert!(!vp9.ten_bit);
+        assert_eq!(vp9.color_range, ColorRange::Full);
+        let h264 = settled(&asked);
+        assert!(h264.ten_bit, "the ordinary codecs are left as asked");
+        assert_eq!(h264.color_range, ColorRange::Full);
+    }
+
+    /// Three bands, opaque red, half-transparent green and clear, written
+    /// in each alpha codec and read back: the alpha survives, and so does
+    /// the colour where there is some to see. The decoder's side is the
+    /// import of a Concat overlay back into a project - ProRes' alpha comes
+    /// through its own decoder, VP9's through libvpx (#429). A codec whose
+    /// encoder this FFmpeg does not link is skipped.
+    #[test]
+    fn an_alpha_codec_keeps_the_frames_alpha() {
+        use crate::decode::{DecodeOptions, Decoder, FrameSource};
+        const RED: [u8; 4] = [200, 40, 40, 255];
+        const GREEN: [u8; 4] = [40, 200, 40, 128];
+        const CLEAR: [u8; 4] = [0, 0, 0, 0];
+        let mut frame = Frame::transparent(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let colour = match x {
+                    0..32 => RED,
+                    32..48 => GREEN,
+                    _ => CLEAR,
+                };
+                frame.set_pixel(x, y, colour);
+            }
+        }
+        for codec in [VideoCodec::ProRes4444, VideoCodec::Vp9Alpha] {
+            if !codec.available() {
+                eprintln!("{} not in the linked FFmpeg; skipped", codec.label());
+                continue;
+            }
+            assert!(
+                codec.encodable(),
+                "{} is linked and on the CPU",
+                codec.label()
+            );
+            let path = std::env::temp_dir().join(format!(
+                "concat-encode-alpha-{}-{}.{}",
+                codec.name(),
+                std::process::id(),
+                codec.container()
+            ));
+            let options = EncodeOptions {
+                codec,
+                preset: "ultrafast".to_owned(),
+                crf: 18,
+                // Asked for ten bits, which VP9 with alpha settles to eight
+                // rather than refusing.
+                ten_bit: true,
+                hardware: false,
+                ..EncodeOptions::default()
+            };
+            let mut encoder = Encoder::create(&path, 64, 64, FrameRate::THIRTY, &options)
+                .unwrap_or_else(|error| panic!("{}: {error}", codec.label()));
+            assert!(!encoder.on_hardware());
+            for _ in 0..6 {
+                encoder.write_frame(&frame).expect("writes");
+            }
+            encoder.finish().expect("finishes");
+
+            {
+                let input = ffmpeg::format::input(&path).expect("opens");
+                let stream = input
+                    .streams()
+                    .best(ffmpeg::media::Type::Video)
+                    .expect("video");
+                let parameters = stream.parameters();
+                // SAFETY: the parameters are live for as long as `input`
+                // is, and the profile and tag are plain fields.
+                let (profile, tag) = unsafe {
+                    (
+                        (*parameters.as_ptr()).profile,
+                        (*parameters.as_ptr()).codec_tag,
+                    )
+                };
+                match codec {
+                    VideoCodec::ProRes4444 => {
+                        assert_eq!(parameters.id(), ffmpeg::codec::Id::PRORES);
+                        assert_eq!(profile, ffmpeg::sys::AV_PROFILE_PRORES_4444, "4444");
+                        assert_eq!(tag, fourcc(*b"ap4h"), "a QuickTime ProRes 4444");
+                    }
+                    _ => {
+                        assert_eq!(parameters.id(), ffmpeg::codec::Id::VP9);
+                        assert_eq!(
+                            stream.metadata().get("alpha_mode"),
+                            Some("1"),
+                            "the track says it has an alpha layer"
+                        );
+                    }
+                }
+            }
+
+            let mut decoder =
+                Decoder::open(&path, &DecodeOptions::default().in_software()).expect("opens");
+            let mut frames = Vec::new();
+            while let Some(frame) = decoder.next_frame().expect("decodes") {
+                frames.push(frame);
+            }
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(frames.len(), 6, "{}: every frame", codec.label());
+            let back = &frames[3];
+            let near = |at: (u32, u32), want: [u8; 4], alpha: u8, colour: u8| {
+                let got = back.pixel(at.0, at.1).expect("inside");
+                assert!(
+                    got[3].abs_diff(want[3]) <= alpha,
+                    "{}: alpha {} at {at:?} came back as {}",
+                    codec.label(),
+                    want[3],
+                    got[3]
+                );
+                if want[3] > 0 {
+                    for channel in 0..3 {
+                        assert!(
+                            got[channel].abs_diff(want[channel]) <= colour,
+                            "{}: {want:?} at {at:?} came back as {got:?}",
+                            codec.label()
+                        );
+                    }
+                }
+            };
+            near((12, 32), RED, 2, 10);
+            near((40, 32), GREEN, 6, 12);
+            near((58, 32), CLEAR, 4, 0);
+        }
+    }
+
+    /// HDR is refused in an alpha codec, which is written SDR alone.
+    #[test]
+    fn an_alpha_codec_is_not_written_hdr() {
+        for codec in [VideoCodec::ProRes4444, VideoCodec::Vp9Alpha] {
+            let path = std::env::temp_dir().join(format!(
+                "concat-encode-alpha-hdr-{}.{}",
+                codec.name(),
+                codec.container()
+            ));
+            let options = EncodeOptions {
+                codec,
+                ..EncodeOptions::default()
+            };
+            let result =
+                Encoder::create_hdr(&path, 64, 64, FrameRate::THIRTY, &options, Signal::Pq);
+            assert!(result.is_err(), "{}", codec.label());
+            assert!(!path.exists());
+        }
     }
 }

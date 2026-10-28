@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The reader pool and frame cache: random access to any frame of any file.
 //!
@@ -8,10 +8,14 @@
 //! interactive use, where scrubbing asks for arbitrary (media, time) pairs.
 //! This module is the answer:
 //!
-//! - **One reader per (file, level)**, kept warm between requests. A
-//!   request near the reader's current position rolls forward (cheap,
-//!   exact); a request elsewhere seeks - frame-accurately, guided by the
-//!   real timestamps the linked decoder reports.
+//! - **Up to three readers per (file, level)**, kept warm between
+//!   requests. A request goes to the reader it is just ahead of and rolls
+//!   forward (cheap, exact); a request near none of them gets a reader of
+//!   its own, or, with three open, seeks the coldest - frame-accurately,
+//!   guided by the real timestamps the linked decoder reports. Two places
+//!   in one file read in step - a transition between two cuts of the same
+//!   shot - each keep a reader, rather than seeking one back and forth a
+//!   GOP at a time.
 //! - **A byte-budgeted LRU of source frames** in front of the readers,
 //!   keyed by the file, the level it was decoded at and the frame index -
 //!   and nothing else. A source frame is the picture as the file holds
@@ -53,6 +57,11 @@ use crate::probe;
 /// decoding forward to, rather than seeking. Two seconds of 30fps material is
 /// sixty decodes - comparable to a seek, and exact.
 const ROLL_FORWARD_FRAMES: i64 = 60;
+
+/// Warm readers one file at one level may hold: enough for the two sides of
+/// a transition within a file and a scrub elsewhere in it, few enough that
+/// a 4K file does not hold a decoder per playback worker.
+const READERS_PER_KEY: usize = 3;
 
 /// What one frame request asks for; see [`ReaderPool::frame`].
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -347,6 +356,22 @@ fn plan_access(current_next: Option<i64>, target: i64) -> Access {
     }
 }
 
+/// How far a warm reader aimed at `aim` is from serving `target`, or `None`
+/// when it would have to seek. Just ahead is a roll. A few frames behind
+/// counts too: the prefetch workers decode neighbouring frames at once, so
+/// frame k often claims after k+1 has already moved the reader's aim, and
+/// treating k as a seek opened a second and a third reader for plain
+/// playback of one file.
+fn claim_cost(aim: i64, target: i64) -> Option<i64> {
+    match plan_access(Some(aim), target) {
+        Access::Roll(frames) => Some(frames),
+        Access::Seek if target < aim && aim - target <= i64::from(crate::prefetch::AHEAD) => {
+            Some(aim - target)
+        }
+        Access::Seek => None,
+    }
+}
+
 /// An even size no smaller than two on a side: what the scaler and the
 /// codecs are happiest with.
 fn even(width: u32, height: u32) -> (u32, u32) {
@@ -375,6 +400,11 @@ struct Reader {
     /// The frame index `next_frame` will produce, in the media's own rate,
     /// or `i64::MIN` right after a seek, when only the timestamps know.
     next_index: i64,
+    /// The last frame handed out since the last seek, and its index.
+    last: Option<(i64, Arc<Frame>)>,
+    /// A frame decoded past a target that had no frame of its own, and its
+    /// index: handed out next, before anything more is decoded.
+    ahead: Option<(i64, Arc<Frame>)>,
 }
 
 impl Reader {
@@ -415,10 +445,18 @@ impl Reader {
         Ok(Self {
             decoder,
             next_index: i64::MIN,
+            last: None,
+            ahead: None,
         })
     }
 
-    fn next_frame(&mut self, rate: FrameRate) -> Result<Option<(i64, Frame)>> {
+    /// The next frame and its index, and whether it was decoded just now
+    /// rather than kept from a pull that went past it.
+    fn next_frame(&mut self, rate: FrameRate) -> Result<Option<(i64, Arc<Frame>, bool)>> {
+        if let Some((index, frame)) = self.ahead.take() {
+            self.next_index = index + 1;
+            return Ok(Some((index, frame, false)));
+        }
         let Some(frame) = self.decoder.next_frame()? else {
             return Ok(None);
         };
@@ -430,13 +468,29 @@ impl Reader {
             .map(|position| rate.frame_at(position + rate.frame_duration() / Rational::from_int(2)))
             .unwrap_or(self.next_index.max(0));
         self.next_index = index + 1;
-        Ok(Some((index, frame)))
+        Ok(Some((index, Arc::new(frame), true)))
     }
 
     fn seek(&mut self, rate: FrameRate, index: i64) -> Result<()> {
         self.decoder.seek(rate.time_of_frame(index))?;
         self.next_index = i64::MIN;
+        self.last = None;
+        self.ahead = None;
         Ok(())
+    }
+
+    /// The frame on screen at `target` when no frame has that index: the
+    /// last one handed out, when it is before the target and the frame
+    /// kept after it is past the target. A variable-rate stream has no
+    /// frame for the length of a still stretch, and every index inside it
+    /// is served from here without decoding anything.
+    fn held_at(&self, target: i64) -> Option<Arc<Frame>> {
+        match (&self.last, &self.ahead) {
+            (Some((before, frame)), Some((after, _))) if *before <= target && target < *after => {
+                Some(Arc::clone(frame))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -483,18 +537,67 @@ type ReaderKey = (
     bool,
 );
 
+/// One warm reader as the pool sees it, without taking the reader's lock.
+struct Warm {
+    key: ReaderKey,
+    reader: Arc<Mutex<Reader>>,
+    /// The frame this reader was last handed out for: where it is, or will
+    /// be once the caller holding it is done. Requests are routed by this
+    /// rather than by the reader's own position, which a decode in flight
+    /// holds behind its lock - playback workers asking for neighbouring
+    /// frames then queue on the one reader already headed there, as they
+    /// always did, instead of each opening another.
+    aim: i64,
+    /// When it was last asked for; see [`ReaderPool::close_idle`].
+    touched: std::time::Instant,
+}
+
 /// The warm readers and their recency, behind one short lock. A reader is
 /// found here and then used outside this lock, under its own, so a decode
 /// on one file never waits on a decode on another.
 struct Readers {
-    warm: HashMap<ReaderKey, Arc<Mutex<Reader>>>,
-    /// Recency order for reader eviction, oldest first.
-    order: Vec<ReaderKey>,
-    /// When each warm reader was last asked for; see
-    /// [`ReaderPool::close_idle`].
-    touched: HashMap<ReaderKey, std::time::Instant>,
+    /// Every warm reader, least recently asked for first.
+    warm: Vec<Warm>,
     /// Readers kept warm before the least-recently-used is dropped.
     max: usize,
+}
+
+impl Readers {
+    /// The reader of `key` that `target` is just ahead of - the shortest
+    /// roll - or a few frames behind, or, when none is and the key already
+    /// holds [`READERS_PER_KEY`], its coldest, which will seek. Made the
+    /// most recent and aimed at `target`. `None` means open another.
+    fn claim(&mut self, key: &ReaderKey, target: i64) -> Option<Arc<Mutex<Reader>>> {
+        let mine = || {
+            self.warm
+                .iter()
+                .enumerate()
+                .filter(|(_, warm)| &warm.key == key)
+        };
+        let near = mine()
+            .filter_map(|(at, warm)| Some((claim_cost(warm.aim, target)?, at)))
+            .min()
+            .map(|(_, at)| at);
+        // At the cap the coldest seeks, as the one reader always did: a
+        // seek is an open without the open.
+        let at = near.or_else(|| {
+            (mine().count() >= READERS_PER_KEY)
+                .then(|| mine().next())?
+                .map(|(at, _)| at)
+        })?;
+        let mut warm = self.warm.remove(at);
+        // A reader claimed from just behind keeps the furthest aim it was
+        // given, so the frame racing past it still rolls there.
+        warm.aim = if near.is_some() {
+            warm.aim.max(target)
+        } else {
+            target
+        };
+        warm.touched = std::time::Instant::now();
+        let reader = Arc::clone(&warm.reader);
+        self.warm.push(warm);
+        Some(reader)
+    }
 }
 
 /// What the pool has done so far: the numbers a scrub benchmark asserts.
@@ -585,9 +688,7 @@ impl ReaderPool {
             sources: Mutex::new(FrameCache::new(cache_bytes - treated)),
             treated: Mutex::new(FrameCache::new(treated)),
             readers: Mutex::new(Readers {
-                warm: HashMap::new(),
-                order: Vec::new(),
-                touched: HashMap::new(),
+                warm: Vec::new(),
                 max: max_readers.max(1),
             }),
             facts: Mutex::new(HashMap::new()),
@@ -635,24 +736,11 @@ impl ReaderPool {
             return 0;
         };
         let now = std::time::Instant::now();
-        let doomed: Vec<ReaderKey> = readers
-            .warm
-            .iter()
-            .filter(|(key, reader)| {
-                Arc::strong_count(reader) == 1
-                    && readers
-                        .touched
-                        .get(*key)
-                        .is_none_or(|at| now.duration_since(*at) >= idle)
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in &doomed {
-            readers.warm.remove(key);
-            readers.touched.remove(key);
-            readers.order.retain(|entry| entry != key);
-        }
-        doomed.len()
+        let before = readers.warm.len();
+        readers.warm.retain(|warm| {
+            Arc::strong_count(&warm.reader) > 1 || now.duration_since(warm.touched) < idle
+        });
+        before - readers.warm.len()
     }
 
     /// Makes `frame` the still at `path`, a name no file has, until
@@ -1042,15 +1130,38 @@ impl ReaderPool {
             reader.seek(rate, target)?;
         }
 
+        if let Some(frame) = reader.held_at(target) {
+            remember(target, Arc::clone(&frame));
+            reader.next_index = target + 1;
+            return Ok(Some(frame));
+        }
+
         // Roll forward to the target, caching everything passed on the way.
         // Stops at end of stream too: a clip trimmed past its media's end,
-        // where the last real frame is the honest answer.
+        // where the last real frame is the honest answer. A frame past the
+        // target, when the one before it fell short, means no frame has the
+        // target's index - a still stretch in a variable-rate recording -
+        // and the one before is on screen there: it is the answer, and the
+        // one past is kept for the reader to hand out next. Answering with
+        // the frame past showed a recording's next movement up to the
+        // length of the pause early (#457).
         let mut latest: Option<Arc<Frame>> = None;
         let mut reached = i64::MIN;
-        while let Some((index, frame)) = reader.next_frame(rate)? {
-            Self::count(&self.counters.decoded);
-            let frame = Arc::new(frame);
-            remember(index, Arc::clone(&frame));
+        while let Some((index, frame, fresh)) = reader.next_frame(rate)? {
+            if fresh {
+                Self::count(&self.counters.decoded);
+                remember(index, Arc::clone(&frame));
+            }
+            if index > target
+                && let Some((before, held)) = reader.last.clone()
+                && before < target
+            {
+                reader.ahead = Some((index, frame));
+                reader.next_index = target + 1;
+                remember(target, Arc::clone(&held));
+                return Ok(Some(held));
+            }
+            reader.last = Some((index, Arc::clone(&frame)));
             latest = Some(frame);
             reached = index;
             if index >= target {
@@ -1078,10 +1189,10 @@ impl ReaderPool {
             for step in [30i64, 240, i64::MAX] {
                 let from = target.saturating_sub(step).max(0);
                 reader.seek(rate, from)?;
-                while let Some((index, frame)) = reader.next_frame(rate)? {
+                while let Some((index, frame, _)) = reader.next_frame(rate)? {
                     Self::count(&self.counters.decoded);
-                    let frame = Arc::new(frame);
                     remember(index, Arc::clone(&frame));
+                    reader.last = Some((index, Arc::clone(&frame)));
                     latest = Some(frame);
                     if index >= target {
                         break;
@@ -1122,10 +1233,14 @@ impl ReaderPool {
                 }
             } else {
                 let info = probe::probe(path)?;
+                // Indexed at the cadence, not the average: a variable-rate
+                // recording's frames at its average shared slots while it
+                // moved - a 60 fps screen capture that averaged 23 played
+                // at 23 - and fell between slots elsewhere.
                 let rate = info
                     .video
                     .as_ref()
-                    .map(|video| video.frame_rate)
+                    .map(|video| video.cadence)
                     .unwrap_or(FrameRate::THIRTY);
                 let size = info
                     .video
@@ -1155,9 +1270,10 @@ impl ReaderPool {
         Ok(facts)
     }
 
-    /// The warm reader for this identity, opened at `target` when there is
-    /// none, evicting the coldest reader when the pool is full. Positioning
-    /// an existing reader is the caller's job, under the reader's own lock.
+    /// The warm reader for this identity best placed for `target` - see
+    /// [`Readers::claim`] - opened at `target` when there is none, evicting
+    /// the coldest reader when the pool is full. Positioning an existing
+    /// reader is the caller's job, under the reader's own lock.
     fn reader(
         &self,
         path: &Path,
@@ -1186,13 +1302,8 @@ impl ReaderPool {
                 .map_err(|_| crate::error::Error::NoFrame {
                     path: path.to_path_buf(),
                 })?;
-            readers.order.retain(|entry| entry != &key);
-            readers.order.push(key.clone());
-            readers
-                .touched
-                .insert(key.clone(), std::time::Instant::now());
-            if let Some(reader) = readers.warm.get(&key) {
-                return Ok(Arc::clone(reader));
+            if let Some(reader) = readers.claim(&key, target) {
+                return Ok(reader);
             }
         }
 
@@ -1217,23 +1328,20 @@ impl ReaderPool {
             .map_err(|_| crate::error::Error::NoFrame {
                 path: path.to_path_buf(),
             })?;
-        if let Some(reader) = readers.warm.get(&key) {
-            // Someone else opened the same reader meanwhile; theirs wins.
-            return Ok(Arc::clone(reader));
+        if let Some(reader) = readers.claim(&key, target) {
+            // Someone else opened a reader for this ground meanwhile, or
+            // filled the key; theirs wins.
+            return Ok(reader);
         }
-        while readers.warm.len() >= readers.max && !readers.order.is_empty() {
-            let coldest = readers.order.remove(0);
-            if coldest == key {
-                readers.order.push(coldest);
-                break;
-            }
-            readers.warm.remove(&coldest);
-            readers.touched.remove(&coldest);
+        while readers.warm.len() >= readers.max {
+            readers.warm.remove(0);
         }
-        readers
-            .touched
-            .insert(key.clone(), std::time::Instant::now());
-        readers.warm.insert(key, Arc::clone(&opened));
+        readers.warm.push(Warm {
+            key,
+            reader: Arc::clone(&opened),
+            aim: target,
+            touched: std::time::Instant::now(),
+        });
         Ok(opened)
     }
 
@@ -1242,8 +1350,6 @@ impl ReaderPool {
     pub fn clear(&self) {
         if let Ok(mut readers) = self.readers.lock() {
             readers.warm.clear();
-            readers.order.clear();
-            readers.touched.clear();
         }
         if let Ok(mut facts) = self.facts.lock() {
             facts.clear();
@@ -1292,6 +1398,53 @@ pub(crate) mod tests {
             plan_access(None, 5),
             Access::Seek,
             "unknown position means seek"
+        );
+    }
+
+    /// A reader is claimed for a frame just ahead of it, or one the
+    /// prefetch race has already carried it a few frames past; anything
+    /// further behind is a seek, which another reader may serve better.
+    #[test]
+    fn a_reader_serves_a_frame_just_behind_it_as_well_as_one_ahead() {
+        assert_eq!(claim_cost(10, 12), Some(2), "just ahead rolls");
+        assert_eq!(
+            claim_cost(10, 9),
+            Some(1),
+            "one behind: its neighbour won the race"
+        );
+        let ahead = i64::from(crate::prefetch::AHEAD);
+        assert_eq!(claim_cost(10 + ahead, 10), Some(ahead));
+        assert_eq!(claim_cost(11 + ahead, 10), None, "further behind seeks");
+        assert_eq!(claim_cost(10, 10 + ROLL_FORWARD_FRAMES + 1), None);
+    }
+
+    /// Playing through a variable-rate recording's still stretch shows the
+    /// picture held there at every instant of it, and only then the next
+    /// movement - read once, not decoded again for every frame of the
+    /// pause. The fixture is white to 0.3 s at 30 fps, with no frame until
+    /// black starts at 2 s; its average rate is under 8, and indexed by it
+    /// the white frames shared slots and the black came half a pause early
+    /// (#457).
+    #[test]
+    fn playback_through_a_still_screen_holds_the_picture_until_it_moves() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/vfr-still-screen.mp4");
+        let pool = ReaderPool::new(64 << 20, 4);
+        let mut decoded_in_pause = 0;
+        for index in 0..69 {
+            let time = Rational::new(index, 30);
+            let before = pool.stats();
+            let frame = pool
+                .frame(&FrameRequest::new(path, time, 32, 32))
+                .unwrap_or_else(|error| panic!("{}: {error}", time.as_f64()));
+            if (10..59).contains(&index) {
+                decoded_in_pause += pool.stats().since(before).decoded;
+            }
+            let white = frame.pixels()[0] > 200;
+            assert_eq!(white, index < 60, "at {:.3} s", time.as_f64());
+        }
+        assert!(
+            decoded_in_pause <= 1,
+            "{decoded_in_pause} frames decoded while the screen held still"
         );
     }
 
@@ -1511,6 +1664,50 @@ pub(crate) mod tests {
         assert_eq!(warm(&pool), 0);
         pool.frame(&at(7)).expect("decodes again");
         assert_eq!(warm(&pool), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A transition between two cuts of one file reads two places in step.
+    /// Each gets a reader of its own, and once both are warm every frame
+    /// costs one decode - not a seek and a walk from the keyframe, back and
+    /// forth, as one shared reader made it.
+    #[test]
+    fn two_places_in_one_file_read_in_step_each_keep_a_reader() {
+        // Both places in the first half of the file; see
+        // `a_scrub_over_covered_ground_never_decodes_again`.
+        let path = counting_video("in-step", 64, 300);
+        let pool = ReaderPool::new(64 * 1024 * 1024, 8);
+        let rate = FrameRate::THIRTY;
+        let read = |index: i64| {
+            pool.frame_at(
+                &path,
+                rate.time_of_frame(index),
+                64,
+                64,
+                false,
+                None,
+                None,
+                None,
+                false,
+            )
+            .expect("decodes");
+        };
+        let (out, into) = (10, 100);
+        read(out);
+        read(into);
+        let warm = || pool.readers.lock().expect("lock").warm.len();
+        assert_eq!(warm(), 2, "one reader for each side");
+        let before = pool.stats();
+        for step in 1..=20 {
+            read(out + step);
+            read(into + step);
+        }
+        assert_eq!(warm(), 2);
+        assert_eq!(
+            pool.stats().since(before).decoded,
+            40,
+            "one decode per frame, no seeks"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

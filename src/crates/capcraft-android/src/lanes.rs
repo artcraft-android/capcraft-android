@@ -188,7 +188,8 @@ pub(crate) fn kind_of(clip: &Clip) -> RowKind {
     match clip.kind {
         ClipKind::Image if clip.name.starts_with(STICKER_PREFIX) => RowKind::Text,
         ClipKind::Video | ClipKind::Image => RowKind::Overlay,
-        ClipKind::Audio => RowKind::Audio,
+        // a layer over the soundtrack, as Concat's desktop editor lays them
+        ClipKind::Audio | ClipKind::SoundLayer => RowKind::Audio,
         ClipKind::Text | ClipKind::Shape => RowKind::Text,
         ClipKind::Layer => layer_kind(clip.video_effects.first().map(|link| link.id.as_str())),
     }
@@ -245,6 +246,7 @@ pub(crate) fn clip_view(project: &Project, clip: &Clip) -> ClipView {
         ClipKind::Text => "text",
         ClipKind::Shape => "shape",
         ClipKind::Layer => "layer",
+        ClipKind::SoundLayer => "soundlayer",
     };
     let audible = match clip.kind {
         ClipKind::Audio => true,

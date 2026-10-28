@@ -27,6 +27,11 @@ bzip2 = "0.6"
 # pure-Rust regex backend, so no C library rides along. Behind `chatterbox`,
 # which the desktop app turns on: a gigabyte of model is not for a phone.
 ort = { workspace = true, optional = true }
+# Where ONNX Runtime is made ready, the one place for the cutout's models
+# and these: on an Intel Mac it is loaded at first use, and not at all on a
+# macOS older than it. concat-vision's manifest also picks the runtime API
+# version ort asks for, per target.
+concat-vision = { workspace = true, optional = true, features = ["infer"] }
 tokenizers = { version = "0.23", optional = true, default-features = false, features = ["fancy-regex"] }
 
 # What a run says about itself: which model loaded, how long a read took,
@@ -35,8 +40,10 @@ tokenizers = { version = "0.23", optional = true, default-features = false, feat
 log = { version = "0.4", features = ["std"] }
 
 # Transcription: whisper.cpp in-process. Built from source by cmake at build
-# time; on macOS with Metal so the encoder runs on the GPU.
-whisper-rs = "0.16"
+# time; on macOS with Metal so the encoder runs on the GPU. `raw-api` for
+# ggml's backend registry: where whisper.cpp is a shared build, its CPU
+# kernels are loaded by hand (transcribe.rs, `cpu_backend`).
+whisper-rs = { version = "0.16", features = ["raw-api"] }
 
 # Text to speech: the official k2-fsa bindings. Linked statically on the
 # desktop Unixes, so the binary carries no extra dylibs.
@@ -80,7 +87,7 @@ ort = { workspace = true, optional = true, features = ["coreml"] }
 ort = { workspace = true, optional = true, features = ["directml"] }
 
 [features]
-chatterbox = ["dep:ort", "dep:tokenizers"]
+chatterbox = ["dep:ort", "dep:tokenizers", "dep:concat-vision"]
 
 [lints]
 workspace = true

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Text-to-speech: text in, a narration WAV in the project folder out.
 //!
@@ -120,15 +120,15 @@ const KNOWN_MODELS: &[KnownModel] = &[
         id: "kokoro-int8-multi-lang-v1_0",
         label: "Kokoro (compact)",
         blurb: "The recommended build: same voices, a third of the download.",
-        approx_bytes: 132_303_094,
-        sha256: "4c3052abaa60943a341f193888cf6abd68787dae6ab8ae5c925a706caa247e4e",
+        approx_bytes: 132_353_410,
+        sha256: "72c347230107ef8a31098ec4d468a605244beef5f1ed00db97efa13518800653",
     },
     KnownModel {
         id: "kokoro-multi-lang-v1_0",
         label: "Kokoro (full precision)",
         blurb: "Bit-perfect weights for the skeptical; rarely audibly better.",
-        approx_bytes: 349_906_910,
-        sha256: "c5f7e2d2caf082bc1d20fb70334a61d99d20b484500aad32e7cf84c128ea3298",
+        approx_bytes: 349_886_476,
+        sha256: "60703707bc05ccd48d60e1eb723f38b07d6e474795a0b6a588d7220400e0f7a4",
     },
 ];
 
@@ -339,6 +339,12 @@ pub struct VoiceInfo {
     pub name: String,
     /// The family whose models read with this voice.
     pub family: Family,
+    /// A picture of the voice, as a path to an image file, for the voice
+    /// picker's avatar: none of the stock voices has one, and the picker
+    /// draws a letter in a colour instead. For a voice someone adds later
+    /// with a picture of their own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
 }
 
 /// A recording to read in the voice of: the clip the sheet was given.
@@ -459,8 +465,6 @@ impl std::fmt::Display for ReadError {
 fn accelerator() -> &'static str {
     if cfg!(target_os = "macos") {
         "CoreML"
-    } else if cfg!(target_os = "windows") {
-        "DirectML"
     } else {
         "the accelerator"
     }
@@ -565,11 +569,13 @@ impl Speech {
                     id: *id,
                     name: (*name).to_owned(),
                     family: Family::Kokoro,
+                    avatar: None,
                 })
                 .chain(POCKET_VOICES.iter().map(|(id, name, _)| VoiceInfo {
                     id: *id,
                     name: (*name).to_owned(),
                     family: Family::Pocket,
+                    avatar: None,
                 }))
                 // Chatterbox's stock voices are Pocket's recordings, and are
                 // only offered while the bundle holding them is here.
@@ -581,6 +587,7 @@ impl Speech {
                             id: *id,
                             name: (*name).to_owned(),
                             family: Family::Chatterbox,
+                            avatar: None,
                         }),
                 )
                 .collect(),
@@ -683,6 +690,20 @@ impl Speech {
         let _ = std::fs::remove_file(&archive);
         let _ = std::fs::remove_dir_all(&staging);
         result
+    }
+
+    /// What bundle `id` is called as a file, and every address a download
+    /// of it tries, in order; see [`crate::Transcriber::model_sources`].
+    /// `None` for one Concat does not know, and for Chatterbox, which is
+    /// several files rather than one.
+    pub fn model_sources(id: &str) -> Option<(String, Vec<String>)> {
+        known(id)?;
+        if family_of(id) == Family::Chatterbox {
+            return None;
+        }
+        let file = model_archive(id);
+        let sources = concat_host::models::sources(&file, &model_upstream(id));
+        Some((file, sources))
     }
 
     /// Asks the running download to stop. Idle is a harmless no-op.
@@ -1064,9 +1085,8 @@ fn recordings_dir(dirs: &AppDirs) -> Result<PathBuf, String> {
 }
 
 /// How far ahead of Chatterbox's last report its next is taken to be: it
-/// reports every few tokens, so a short way. Unused in a build without the
-/// `chatterbox` feature (the phones').
-#[cfg_attr(not(feature = "chatterbox"), allow(dead_code))]
+/// reports every few tokens, so a short way.
+#[cfg(feature = "chatterbox")]
 const CHATTERBOX_STEP: f32 = 0.02;
 
 /// How many sentences `text` appears to have, at least one: the stretches

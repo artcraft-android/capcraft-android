@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The wgpu compositor.
 //!
@@ -33,6 +33,7 @@
 use std::collections::HashMap;
 
 use concat_core::frame::Frame;
+use concat_core::mask::MaskUniform;
 use concat_core::shader::{Lut, RevealMap, ShaderPass, TransitionPass};
 use concat_core::timeline::Blend;
 
@@ -59,6 +60,10 @@ struct Vertex {
     /// `0..1` across the picture as it is seen: what the mask is sampled
     /// at and what the wipes measure.
     pic: [f32; 2],
+    /// The layer's shape mask, packed; see `MaskUniform` and `MASK_WGSL`.
+    shape_a: [f32; 4],
+    shape_b: [f32; 4],
+    shape_c: [f32; 4],
 }
 
 /// Vertex data as raw bytes. `Vertex` is `repr(C)` and all `f32`, so its byte
@@ -74,6 +79,95 @@ fn as_bytes(vertices: &[Vertex]) -> &[u8] {
     }
 }
 
+/// A layer's shape mask, per fragment: `concat_core::mask::coverage` line
+/// for line, which the CPU reference calls and the tests hold this to.
+/// `a` is the shape's code, the invert, the feather band and the corner
+/// radius; `b` the centre and the half box; `c` the turn's cosine and sine
+/// and the picture's sides over its shorter one.
+const MASK_WGSL: &str = r#"
+fn mask_sign(value: f32) -> f32 {
+    return select(select(0.0, -1.0, value < 0.0), 1.0, value > 0.0);
+}
+
+fn mask_ellipse(p: vec2<f32>, r: vec2<f32>) -> f32 {
+    let k0 = length(p / r);
+    let k1 = length(p / (r * r));
+    if (k1 <= 1e-9) {
+        return -min(r.x, r.y);
+    }
+    return k0 * (k0 - 1.0) / k1;
+}
+
+fn mask_box(p: vec2<f32>, half: vec2<f32>, radius: f32) -> f32 {
+    let q = abs(p) - half + vec2<f32>(radius, radius);
+    return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - radius;
+}
+
+fn mask_heart(p: vec2<f32>) -> f32 {
+    let x = abs(p.x);
+    let y = p.y;
+    if (y + x > 1.0) {
+        return length(vec2<f32>(x - 0.25, y - 0.75)) - sqrt(2.0) / 4.0;
+    }
+    let m = max(x + y, 0.0) * 0.5;
+    let a = vec2<f32>(x, y - 1.0);
+    let b = vec2<f32>(x - m, y - m);
+    return sqrt(min(dot(a, a), dot(b, b))) * mask_sign(x - y);
+}
+
+fn mask_star(x: f32, y: f32) -> f32 {
+    let k1 = vec2<f32>(0.809017, -0.58778524);
+    let k2 = vec2<f32>(-0.809017, -0.58778524);
+    let inner = 0.45;
+    var p = vec2<f32>(abs(x), y);
+    p = p - max(dot(k1, p), 0.0) * 2.0 * k1;
+    p = p - max(dot(k2, p), 0.0) * 2.0 * k2;
+    p.x = abs(p.x);
+    p.y = p.y - 1.0;
+    let ba = vec2<f32>(inner * -k1.y, inner * k1.x - 1.0);
+    let h = clamp(dot(p, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(p - ba * h) * mask_sign(p.y * ba.x - p.x * ba.y);
+}
+
+fn mask_distance(code: f32, p: vec2<f32>, half: vec2<f32>, radius: f32) -> f32 {
+    let shape = i32(round(code));
+    if (shape == 1) {
+        return p.y;
+    }
+    if (shape == 2) {
+        return abs(p.y) - half.y;
+    }
+    if (shape == 3) {
+        return mask_ellipse(p, half);
+    }
+    if (shape == 4) {
+        return mask_box(p, half, radius);
+    }
+    if (shape == 5) {
+        let side = 0.6035534;
+        let mid = 0.5517767;
+        let q = vec2<f32>(p.x / half.x * side, mid - p.y / half.y * mid);
+        return mask_heart(q) * min(half.x / side, half.y / mid);
+    }
+    if (shape == 6) {
+        return mask_star(p.x / half.x, -p.y / half.y) * min(half.x, half.y);
+    }
+    return -1.0;
+}
+
+fn mask_coverage(a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, pic: vec2<f32>) -> f32 {
+    if (a.x < 0.5) {
+        return 1.0;
+    }
+    let dx = (pic.x - 0.5 - b.x) * c.z;
+    let dy = (pic.y - 0.5 - b.y) * c.w;
+    let p = vec2<f32>(dx * c.x + dy * c.y, -dx * c.y + dy * c.x);
+    let d = mask_distance(a.x, p, b.zw, a.w);
+    let kept = 1.0 - smoothstep(-a.z * 0.5, a.z * 0.5, d);
+    return select(kept, 1.0 - kept, a.y > 0.5);
+}
+"#;
+
 const SHADER: &str = r#"
 struct VsIn {
     @location(0) position: vec2<f32>,
@@ -83,6 +177,9 @@ struct VsIn {
     @location(4) offset: vec3<f32>,
     @location(5) edges: vec2<f32>,
     @location(6) pic: vec2<f32>,
+    @location(7) shape_a: vec4<f32>,
+    @location(8) shape_b: vec4<f32>,
+    @location(9) shape_c: vec4<f32>,
 }
 
 struct VsOut {
@@ -93,6 +190,9 @@ struct VsOut {
     @location(3) offset: vec3<f32>,
     @location(4) edges: vec2<f32>,
     @location(5) pic: vec2<f32>,
+    @location(6) @interpolate(flat) shape_a: vec4<f32>,
+    @location(7) @interpolate(flat) shape_b: vec4<f32>,
+    @location(8) @interpolate(flat) shape_c: vec4<f32>,
 }
 
 @vertex
@@ -105,6 +205,9 @@ fn vs_main(in: VsIn) -> VsOut {
     out.offset = in.offset;
     out.edges = in.edges;
     out.pic = in.pic;
+    out.shape_a = in.shape_a;
+    out.shape_b = in.shape_b;
+    out.shape_c = in.shape_c;
     return out;
 }
 
@@ -124,7 +227,9 @@ fn shade(in: VsOut) -> vec4<f32> {
     let mask = textureSample(mask_texture, mask_sampler, in.pic);
     // The wipes: a pixel past the moving edge is not drawn at all.
     let kept = select(0.0, 1.0, in.pic.x < in.edges.x && in.pic.x >= in.edges.y);
-    let alpha = colour.a * in.opacity * mask.a * kept;
+    // The shape mask, multiplied in with the matte, the wipes and the rest.
+    let shaped = mask_coverage(in.shape_a, in.shape_b, in.shape_c, in.pic);
+    let alpha = colour.a * in.opacity * mask.a * kept * shaped;
     // The fades: the colour scaled and offset.
     let shaded = colour.rgb * in.scale + in.offset;
     return vec4<f32>(shaded, alpha);
@@ -330,6 +435,32 @@ fn fs_resolve_pq(@builtin(position) at: vec4<f32>) -> @location(0) vec4<u32> {
 @fragment
 fn fs_resolve_tone_mapped(@builtin(position) at: vec4<f32>) -> @location(0) vec4<f32> {
     let colour = textureLoad(picture, vec2<i32>(at.xy), 0);
+    let light = to_sdr(colour.rgb * 203.0) / 203.0;
+    let clipped = clamp(light, vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(pow(clipped, vec3<f32>(1.0 / 2.4)), colour.a);
+}
+
+// A frame on a canvas that lets something show through (#456): the working
+// space holds it premultiplied, and a file that keeps alpha takes it
+// straight, so the light is divided out of its coverage before the gamma.
+// Nothing covers a texel of alpha zero, which comes out clear black.
+fn unpremultiplied(colour: vec4<f32>) -> vec4<f32> {
+    if (colour.a <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(colour.rgb / colour.a, min(colour.a, 1.0));
+}
+
+@fragment
+fn fs_resolve_straight(@builtin(position) at: vec4<f32>) -> @location(0) vec4<f32> {
+    let colour = unpremultiplied(textureLoad(picture, vec2<i32>(at.xy), 0));
+    let clipped = clamp(colour.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(pow(clipped, vec3<f32>(1.0 / 2.4)), colour.a);
+}
+
+@fragment
+fn fs_resolve_tone_mapped_straight(@builtin(position) at: vec4<f32>) -> @location(0) vec4<f32> {
+    let colour = unpremultiplied(textureLoad(picture, vec2<i32>(at.xy), 0));
     let light = to_sdr(colour.rgb * 203.0) / 203.0;
     let clipped = clamp(light, vec3<f32>(0.0), vec3<f32>(1.0));
     return vec4<f32>(pow(clipped, vec3<f32>(1.0 / 2.4)), colour.a);
@@ -638,6 +769,13 @@ pub struct WgpuCompositor {
     /// screen.
     resolve_pipeline: wgpu::RenderPipeline,
     tone_mapped_pipeline: wgpu::RenderPipeline,
+    /// The same two for a see-through canvas: the frame handed back with
+    /// straight alpha rather than opaque.
+    straight_pipelines: [wgpu::RenderPipeline; 2],
+    /// Whether the plan being drawn has a canvas that lets something show
+    /// through (`FramePlan::canvas`), so its frame keeps its alpha: taken
+    /// up by `prepare`, as `output` is.
+    see_through: bool,
     /// What the plan being drawn is output in (`FramePlan::output`): taken
     /// up by `prepare`, and read by the uploads and the resolve after it.
     output: concat_core::frame::Signal,
@@ -772,7 +910,20 @@ impl WgpuCompositor {
     /// then every API wgpu was built with. `software_only` leaves the
     /// hardware adapters out.
     fn own_api_first(software_only: bool) -> Option<Self> {
-        let own = if cfg!(target_vendor = "apple") {
+        // CONCAT_GPU=software - set by hand, or by a safe start after a
+        // launch the GPU's driver killed - keeps the compositor off the GPU
+        // too, so an export or a card does not meet that driver either.
+        // Not on Android, where a safe start means OpenGL ES rather than
+        // Vulkan (#507): a phone has no software adapter, and reading it as
+        // "software alone" left the monitor and every export with nothing
+        // to draw on for the rest of the build. There it asks for GL first.
+        let safe = std::env::var("CONCAT_GPU")
+            .is_ok_and(|value| value.trim().eq_ignore_ascii_case("software"));
+        let android = cfg!(target_os = "android");
+        let software_only = software_only || (safe && !android);
+        let own = if android && safe {
+            wgpu::Backends::GL
+        } else if cfg!(target_vendor = "apple") {
             wgpu::Backends::METAL
         } else if cfg!(windows) {
             wgpu::Backends::DX12
@@ -788,10 +939,20 @@ impl WgpuCompositor {
     /// software - or software alone - or `None` when none of them opens a
     /// device.
     fn on_backends(backends: wgpu::Backends, software_only: bool) -> Option<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let mut descriptor = wgpu::InstanceDescriptor {
             backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
+        };
+        // FXC, never wgpu's default `Auto`: Concat ships no dxcompiler.dll,
+        // so `Auto` loads whichever one Windows finds on PATH - Obsidian's or
+        // another Electron app's - and a build that does not match wgpu, or
+        // needs instructions the CPU lacks, kills the process at the first
+        // shader (0xc000001d). FXC is in System32 and is what every machine
+        // without a stray DXC already compiles with (#418). WGPU_DX12_COMPILER
+        // still picks another, for trying DXC on a real GPU (#297).
+        descriptor.backend_options.dx12.shader_compiler =
+            wgpu::Dx12Compiler::from_env().unwrap_or(wgpu::Dx12Compiler::Fxc);
+        let instance = wgpu::Instance::new(descriptor);
         let choices: &[bool] = if software_only {
             &[true]
         } else {
@@ -915,7 +1076,7 @@ impl WgpuCompositor {
         let budget = pool_budget_for(device.adapter_info().device_type);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("concat compositor"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(format!("{MASK_WGSL}{SHADER}").into()),
         });
 
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1029,7 +1190,8 @@ impl WgpuCompositor {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![
                 0 => Float32x2, 1 => Float32x2, 2 => Float32, 3 => Float32,
-                4 => Float32x3, 5 => Float32x2, 6 => Float32x2
+                4 => Float32x3, 5 => Float32x2, 6 => Float32x2,
+                7 => Float32x4, 8 => Float32x4, 9 => Float32x4
             ],
         };
 
@@ -1211,6 +1373,8 @@ impl WgpuCompositor {
         let resolve_pipeline = copy_into(wgpu::TextureFormat::Rgba8Unorm, "fs_resolve");
         let tone_mapped_pipeline =
             copy_into(wgpu::TextureFormat::Rgba8Unorm, "fs_resolve_tone_mapped");
+        let straight_pipelines = ["fs_resolve_straight", "fs_resolve_tone_mapped_straight"]
+            .map(|entry| copy_into(wgpu::TextureFormat::Rgba8Unorm, entry));
         let hdr_pipelines = ["fs_resolve_hlg", "fs_resolve_pq"]
             .map(|entry| copy_into(wgpu::TextureFormat::Rgba16Uint, entry));
 
@@ -1314,6 +1478,8 @@ impl WgpuCompositor {
             upload_pipeline,
             resolve_pipeline,
             tone_mapped_pipeline,
+            straight_pipelines,
+            see_through: false,
             output: concat_core::frame::Signal::Sdr,
             hdr_pipelines,
             deliver_hdr: false,
@@ -1442,6 +1608,7 @@ impl WgpuCompositor {
     /// final render, into whichever target the caller wants.
     fn prepare(&mut self, plan: &FramePlan) -> (Vec<Draw>, Vec<Vertex>) {
         self.output = plan.output;
+        self.see_through = plan.see_through();
         self.used.values_mut().for_each(|used| *used = 0);
         self.composites += 1;
         let (width, height) = (plan.width, plan.height);
@@ -1460,7 +1627,7 @@ impl WgpuCompositor {
                 self.push_layer(&mut draws, &mut vertices, plan, &plan.layers[next]);
                 next += 1;
             }
-            let below = self.render_pooled(width, height, &draws, &vertices, wgpu::Color::BLACK);
+            let below = self.render_pooled(width, height, &draws, &vertices, clear_of(plan.canvas));
             let strength = treatment.strength.clamp(0.0, 1.0);
             if strength <= 0.0 || treatment.effects.is_empty() {
                 ground = Some(below);
@@ -1485,7 +1652,7 @@ impl WgpuCompositor {
                 let mut vertices = Vec::new();
                 self.push_pooled(&mut draws, &mut vertices, width, height, below, 1.0);
                 self.push_pooled(&mut draws, &mut vertices, width, height, treated, strength);
-                self.render_pooled(width, height, &draws, &vertices, wgpu::Color::BLACK)
+                self.render_pooled(width, height, &draws, &vertices, clear_of(plan.canvas))
             });
         }
         let mut draws = Vec::new();
@@ -1585,6 +1752,7 @@ impl WgpuCompositor {
             flips,
             opacity,
             layer.shading(),
+            layer.shape_uniform(&geometry),
             plan.width,
             plan.height,
         ));
@@ -1633,6 +1801,9 @@ impl WgpuCompositor {
                 offset: [0.0; 3],
                 edges: [2.0, -1.0],
                 pic: [u, v],
+                shape_a: MaskUniform::NONE.a,
+                shape_b: MaskUniform::NONE.b,
+                shape_c: MaskUniform::NONE.c,
             }
         };
         let vertices = [
@@ -1673,6 +1844,9 @@ impl WgpuCompositor {
             offset: [0.0; 3],
             edges: [2.0, -1.0],
             pic: [u, v],
+            shape_a: MaskUniform::NONE.a,
+            shape_b: MaskUniform::NONE.b,
+            shape_c: MaskUniform::NONE.c,
         };
         vertices.extend_from_slice(&[
             corner(-1.0, 1.0, 0.0, 0.0),
@@ -1738,7 +1912,7 @@ impl WgpuCompositor {
         let (canvas, canvas_texture, canvas_view) = self.canvas(plan.width, plan.height);
         let texture = self.presentable(plan.width, plan.height);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.encode(&canvas_view, &canvas_texture, &draws, wgpu::Color::BLACK);
+        let mut encoder = self.encode(&canvas_view, &canvas_texture, &draws, clear_of(plan.canvas));
         self.resolve(&mut encoder, (plan.width, plan.height), canvas, &view);
         self.queue.submit([encoder.finish()]);
         self.retire();
@@ -2367,10 +2541,14 @@ impl WgpuCompositor {
     ) {
         let pipeline = if self.delivering_hdr() {
             &self.hdr_pipelines[usize::from(self.output == concat_core::frame::Signal::Pq)]
-        } else if self.output == concat_core::frame::Signal::Sdr {
-            &self.resolve_pipeline
         } else {
-            &self.tone_mapped_pipeline
+            let sdr = self.output == concat_core::frame::Signal::Sdr;
+            match (self.see_through, sdr) {
+                (false, true) => &self.resolve_pipeline,
+                (false, false) => &self.tone_mapped_pipeline,
+                (true, true) => &self.straight_pipelines[0],
+                (true, false) => &self.straight_pipelines[1],
+            }
         };
         Self::copy(
             encoder,
@@ -2646,8 +2824,9 @@ impl WgpuCompositor {
         let frame = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("concat pass frame"),
             // size(vec2), time, intensity, clip_time, padded to Frame's own
-            // 8-byte alignment (from its vec2 member): 20 bytes rounds to 24.
-            size: 24,
+            // 16-byte alignment (OpenGL ES's, see concat-effects' Frame):
+            // 20 bytes rounds to 32.
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2912,7 +3091,7 @@ impl WgpuCompositor {
             let (draws, vertices) = self.prepare(plan);
             self.write_vertices(&vertices);
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let encoder = self.encode(&view, texture, &draws, wgpu::Color::BLACK);
+            let encoder = self.encode(&view, texture, &draws, clear_of(plan.canvas));
             self.queue.submit([encoder.finish()]);
         }
         let from_view = from_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -3352,6 +3531,7 @@ impl WgpuCompositor {
         (flip_h, flip_v): (bool, bool),
         opacity: f32,
         shading: Shading,
+        shape: MaskUniform,
         out_width: u32,
         out_height: u32,
     ) -> [Vertex; 6] {
@@ -3379,6 +3559,9 @@ impl WgpuCompositor {
                 offset: shading.offset,
                 edges: [shading.left_edge, shading.right_edge],
                 pic: [u, v],
+                shape_a: shape.a,
+                shape_b: shape.b,
+                shape_c: shape.c,
             }
         };
 
@@ -3465,14 +3648,33 @@ impl WgpuCompositor {
                 let from = &data[row * padded_row..row * padded_row + row_bytes];
                 pixels[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(from);
             }
-            // The output goes to a screen or an encoder; neither has anything
-            // to show through, and blending may have left alpha short of one.
-            for pixel in pixels.chunks_exact_mut(4) {
-                pixel[3] = 255;
+            // The output goes to a screen or an encoder, which have nothing
+            // to show through, and blending may have left alpha short of
+            // one - unless the canvas is see-through, when the alpha is
+            // the point (#456).
+            if !self.see_through {
+                for pixel in pixels.chunks_exact_mut(4) {
+                    pixel[3] = 255;
+                }
             }
         }
         target.staging.unmap();
         Some(frame)
+    }
+}
+
+/// A plan's canvas colour as the working space holds it: each eight-bit
+/// level through the 2.4 gamma every picture is uploaded through, so the
+/// canvas and a still of the same colour come out the same, 1.0 SDR white;
+/// premultiplied by its alpha, as everything drawn over it is.
+fn clear_of([r, g, b, a]: [u8; 4]) -> wgpu::Color {
+    let alpha = f64::from(a) / 255.0;
+    let light = |level: u8| (f64::from(level) / 255.0).powf(2.4) * alpha;
+    wgpu::Color {
+        r: light(r),
+        g: light(g),
+        b: light(b),
+        a: alpha,
     }
 }
 
@@ -3498,7 +3700,7 @@ impl Compositor for WgpuCompositor {
         let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let (draws, vertices) = self.prepare(plan);
         self.write_vertices(&vertices);
-        let frame = self.render_and_read(plan.width, plan.height, &draws);
+        let frame = self.render_and_read(plan.width, plan.height, &draws, clear_of(plan.canvas));
         let refused = pollster::block_on(validation.pop());
         let exhausted = pollster::block_on(memory.pop());
         let errors = [exhausted, refused].into_iter().flatten();
@@ -3608,14 +3810,20 @@ impl Compositor for WgpuCompositor {
 impl WgpuCompositor {
     /// Draws into the readback target and copies it out: one submit, one
     /// wait. `None` when the device did not deliver the pixels.
-    fn render_and_read(&mut self, width: u32, height: u32, draws: &[Draw]) -> Option<Frame> {
+    fn render_and_read(
+        &mut self,
+        width: u32,
+        height: u32,
+        draws: &[Draw],
+        clear: wgpu::Color,
+    ) -> Option<Frame> {
         let (canvas, canvas_texture, canvas_view) = self.canvas(width, height);
         self.target(width, height);
         let target = self.current_target();
         let view = target
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.encode(&canvas_view, &canvas_texture, draws, wgpu::Color::BLACK);
+        let mut encoder = self.encode(&canvas_view, &canvas_texture, draws, clear);
         self.resolve(&mut encoder, (width, height), canvas, &view);
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {

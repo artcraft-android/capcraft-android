@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! What the editor window needs that is not the edit itself.
 //!
@@ -8,7 +8,8 @@
 //! window talks to: it opens a project folder as a [`session::Session`],
 //! keeps the recents list, caches waveforms and filmstrips beside the
 //! project, composites the paused monitor's true frame, plays the audible
-//! clips, finds the masks behind cutouts, packs templates, and holds the
+//! clips, finds the masks behind cutouts, measures the camera shake stabilized
+//! clips take out, packs templates, and holds the
 //! one-at-a-time slots for long jobs.
 //!
 //! The window calls these functions in-process, and the doctrine is that
@@ -20,28 +21,35 @@
 
 pub mod brush;
 pub mod cards;
+pub mod consolidate;
 pub mod crash;
 pub mod cutout;
 pub mod dirs;
 pub mod enhance;
 pub mod export;
 pub mod jobs;
+pub mod lock;
 pub mod logs;
 pub mod machine;
 pub mod media;
 pub mod memory;
 pub mod models;
+pub mod net;
 pub mod playback;
 pub mod preview;
 pub mod projects;
 pub mod proxy;
 pub mod record;
 pub mod reverse;
+mod route;
 pub mod scrub;
 pub mod session;
+pub mod sounds;
+pub mod stabilize;
 pub mod templates;
 pub mod titles;
 pub mod updates;
+pub mod voices;
 
 pub use brush::{Brushes, RegionRequest};
 pub use cutout::{AnalyseRequest, Cutouts};
@@ -51,6 +59,7 @@ pub use jobs::{Job, SingleFlight};
 pub use projects::ProjectInfo;
 pub use reverse::{ReverseRequest, Reversers};
 pub use session::{EditorView, Session, SettingsView};
+pub use stabilize::{StabilizeRequest, Stabilizers};
 pub use titles::{TitleClip, Titles};
 
 /// The one scheduler every decode for the screen goes through: the

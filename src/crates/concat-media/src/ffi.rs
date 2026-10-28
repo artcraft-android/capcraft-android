@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The small things every linked-FFmpeg module needs: one-time
 //! initialisation, error conversion, timestamp arithmetic and the display
@@ -14,6 +14,23 @@ use ffmpeg_the_third as ffmpeg;
 use libc::{c_char, c_int, c_void};
 
 use crate::error::Error;
+
+/// Names the channels of a decoded frame whose file did not. A WAV
+/// without a channel mask decodes as "2 channels" in no order, and every
+/// filter that works on named channels - each equaliser, high-pass and
+/// low-pass - passes channels it cannot name through untouched, so a
+/// telephone or an underwater on such a file did nothing at all. FFmpeg's
+/// own command line guesses the usual layout for the count; so does this.
+pub fn name_channels(frame: &mut ffmpeg::util::frame::audio::Audio) {
+    use ffmpeg::util::channel_layout::{ChannelLayout, ChannelOrder};
+    let layout = frame.ch_layout();
+    if layout.order() == ChannelOrder::Unspecified && layout.channels() > 0 {
+        let named = ChannelLayout::default_for_channels(layout.channels());
+        if named.order() != ChannelOrder::Unspecified {
+            frame.set_ch_layout(named);
+        }
+    }
+}
 
 /// Makes sure the libraries are initialised and quiet. Cheap after the
 /// first call; every entry point calls it.
@@ -156,23 +173,161 @@ pub(crate) fn seconds(ticks: i64, time_base: ffmpeg::Rational) -> Option<Rationa
     )
 }
 
-/// Where a stream's timestamps start, in seconds: what its frames are
-/// measured from. Zero for a stream that starts at zero or does not say;
-/// 1.4 s for MPEG-TS by default and the MTS files cameras write, which
-/// read as 1.4 s into the picture unless this is taken off every
-/// timestamp and put back on every seek (audit 2026-09-23, #9).
-pub(crate) fn start_of(stream: &ffmpeg::format::stream::Stream<'_>) -> Rational {
+/// Where a stream's timestamps start, in seconds, or `None` where it does
+/// not say. Zero for a stream that starts at or before zero.
+fn start_of(stream: &ffmpeg::format::stream::Stream<'_>) -> Option<Rational> {
     let ticks = stream.start_time();
-    if ticks == ffmpeg::sys::AV_NOPTS_VALUE || ticks <= 0 {
-        return Rational::from_int(0);
+    if ticks == ffmpeg::sys::AV_NOPTS_VALUE {
+        return None;
     }
-    seconds(ticks, stream.time_base()).unwrap_or_else(|| Rational::from_int(0))
+    if ticks <= 0 {
+        return Some(Rational::ZERO);
+    }
+    seconds(ticks, stream.time_base())
+}
+
+/// Where a file's picture and sound are measured from, in seconds: where
+/// its picture starts, or for a file with none, its sound. Taken off every
+/// timestamp read and put back on every seek, by every reader of the file.
+///
+/// 1.4 s for MPEG-TS by default and the MTS files cameras write, which
+/// read as 1.4 s into the picture unless it is taken off (audit 2026-09-23,
+/// #9). One origin for the whole file, not each stream its own: the
+/// streams of a file seldom start together - a camera's MTS sound 5 ms
+/// before its picture, an FLV's 23 ms, a clip cut with `-c copy` whose
+/// picture waits half a second for its first keyframe - and measuring each
+/// from its own first frame slid the picture against the sound by exactly
+/// that gap, in the preview and the export alike (#457). The picture's
+/// start rather than the earliest: its frames then sit on the timeline's
+/// grid as they always did, and the sound carries the gap - cut where it
+/// starts first, put in after silence where it starts later. A cover
+/// picture is no part of the timeline, and a stream that does not say
+/// where it starts says nothing.
+pub(crate) fn origin(input: &ffmpeg::format::context::Input) -> Rational {
+    use ffmpeg::format::stream::Disposition;
+    let picture = input
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .filter(|stream| !stream.disposition().contains(Disposition::ATTACHED_PIC))
+        .and_then(|stream| start_of(&stream));
+    picture
+        .or_else(|| {
+            input
+                .streams()
+                .filter(|stream| stream.parameters().medium() == ffmpeg::media::Type::Audio)
+                .filter_map(|stream| start_of(&stream))
+                .min()
+        })
+        .unwrap_or(Rational::ZERO)
 }
 
 /// Seconds in `AV_TIME_BASE` units, which is what container-level seeks take.
 pub(crate) fn av_ticks(seconds: Rational) -> i64 {
     let scaled = seconds * Rational::from_int(i64::from(ffmpeg::sys::AV_TIME_BASE));
     scaled.floor()
+}
+
+/// Seeks a file's sound to `at` seconds on the file's clock: the packet of
+/// stream `stream` at or before it, on the sound's own timestamps, never
+/// one after it. The reader cuts exactly at `at`, so a landing short of it
+/// costs a little decoding and a landing past it is sound the cut can never
+/// reach.
+///
+/// The wrapper's `seek` cannot ask this. It seeks by the file's default
+/// stream - the picture, in a file with both - and for the first packet
+/// past the target; a demuxer without an index, MPEG-TS and MPEG-PS,
+/// then finds the packet on the picture's timestamps and hands the sound
+/// interleaved after it. On a Program Stream that is a frame or two of
+/// sound past the cut, which the reader padded as silence: every trimmed
+/// .mpg began its sound late (audit 2026-10-24, E-M2). Asking on the
+/// sound's own stream, and backwards, lands on the packet the cut itself
+/// will keep.
+///
+/// Matroska is the exception. Its index, the Cues, lists only the
+/// picture's keyframes in a file with both - what FFmpeg, OBS and mkvmerge
+/// all write - so a seek asked on the sound finds no index of its own and
+/// libavformat falls back to reading the file from the top until it
+/// reaches the cut: every packet of a 20-minute recording to reach minute
+/// 18, 0.19 s on a warm cache where the index takes 0.02 s, and seconds to
+/// minutes off a cold disk. A Matroska file is sought on its picture's
+/// index instead, a second short of the cut so the keyframe it lands on
+/// comes before every sample the cut keeps: the demuxer hands its blocks
+/// in time order across the streams, and its sound is never a second
+/// behind its picture. The cut decodes a keyframe interval of sound it
+/// throws away, a matter of milliseconds.
+///
+/// A file whose sound cannot be sought at all - a raw stream with no
+/// timestamps - is read from the top instead, so the cut still comes out
+/// right at the cost of decoding what comes before it; only when even the
+/// top cannot be sought does the error reach the caller.
+pub(crate) fn seek_audio(
+    input: &mut ffmpeg::format::context::Input,
+    stream: usize,
+    at: f64,
+) -> Result<(), ffmpeg::Error> {
+    let time_base = input
+        .stream(stream)
+        .map(|stream| stream.time_base())
+        .ok_or(ffmpeg::Error::StreamNotFound)?;
+    // A cover picture is one frame with no index to speak of; a file with
+    // only that is sought on its sound like any other.
+    let pictured = input.streams().any(|other| {
+        other.index() != stream
+            && other.parameters().medium() == ffmpeg::media::Type::Video
+            && !other
+                .disposition()
+                .contains(ffmpeg::format::stream::Disposition::ATTACHED_PIC)
+    });
+    if pictured && input.format().name().contains("matroska") {
+        let ticks = ((at - 1.0).max(0.0) * f64::from(ffmpeg::sys::AV_TIME_BASE)) as i64;
+        if input.seek(ticks, ..=ticks).is_ok() {
+            return Ok(());
+        }
+    }
+    // SAFETY: the input is open for the reader's lifetime, so its format
+    // pointer is valid; the stream index was found in that same input, and
+    // `AVSEEK_FLAG_BACKWARD` is a plain integer.
+    let done = unsafe {
+        ffmpeg::sys::av_seek_frame(
+            input.as_mut_ptr(),
+            stream as libc::c_int,
+            (at * f64::from(time_base.denominator()) / f64::from(time_base.numerator())) as i64,
+            ffmpeg::sys::AVSEEK_FLAG_BACKWARD,
+        )
+    };
+    if done >= 0 {
+        return Ok(());
+    }
+    // The wrapper's fallback: the top of the file, which every demuxer that
+    // can seek at all can reach, and which no index is needed to find.
+    input.seek(0, ..=0).map_err(|_| ffmpeg::Error::from(done))
+}
+
+/// Tells the demuxer that only stream `keep` will be read, so it hands no
+/// packet of any other. A sound reader reads past every packet of the
+/// picture to reach its own, and for most containers that is nearly all of
+/// the file's bytes: a demuxer told the picture is unwanted skips them -
+/// an MP4 or MOV seeks past each picture sample unread, and the rest at
+/// least never copy them into packets.
+///
+/// Called after the seek, not before it: a demuxer without an index seeks
+/// by reading packets of the stream it seeks on, and finds none of one it
+/// was told to drop.
+pub(crate) fn read_only(input: &mut ffmpeg::format::context::Input, keep: usize) {
+    // SAFETY: the input is open, so its stream array holds `nb_streams`
+    // valid stream pointers; `discard` is a plain field the demuxer reads
+    // on each packet.
+    unsafe {
+        let context = input.as_mut_ptr();
+        for index in 0..(*context).nb_streams as usize {
+            let stream = *(*context).streams.add(index);
+            (*stream).discard = if index == keep {
+                ffmpeg::Discard::Default.into()
+            } else {
+                ffmpeg::Discard::All.into()
+            };
+        }
+    }
 }
 
 /// The rotation a stream asks players to apply before showing its frames,
@@ -228,9 +383,49 @@ pub(crate) fn rotation_filters(degrees: i64) -> Option<&'static str> {
     }
 }
 
-/// The displayed size of a picture coded at `width` by `height` with the
-/// given rotation: a quarter turn swaps the two.
-pub(crate) fn displayed(width: u32, height: u32, degrees: i64) -> (u32, u32) {
+/// The shape of one coded pixel, width over height, when it is not square.
+///
+/// HDV and the 1440-wide AVCHD modes code a 1920 by 1080 picture 1440
+/// across with pixels a third wider than tall; DV codes 16:9 into 720 by
+/// 480. A player stretches the picture back; a decoder hands it over
+/// squeezed. The container's word wins over the codec's, as in
+/// `av_guess_sample_aspect_ratio`. `None` for square pixels, for a stream
+/// that says nothing, and for a shape no camera writes - past four to one
+/// either way, which is a broken tag rather than a picture.
+pub(crate) fn sample_aspect(stream: &ffmpeg::format::stream::Stream<'_>) -> Option<Rational> {
+    let usable = |aspect: ffmpeg::sys::AVRational| {
+        (aspect.num > 0 && aspect.den > 0)
+            .then(|| Rational::new(i64::from(aspect.num), i64::from(aspect.den)))
+            .filter(|aspect| (0.25..=4.0).contains(&aspect.as_f64()))
+    };
+    // SAFETY: the stream and its codec parameters are valid for the
+    // stream's lifetime; both fields are plain rationals.
+    let (container, codec) = unsafe {
+        let raw = stream.as_ptr();
+        (
+            (*raw).sample_aspect_ratio,
+            (*(*raw).codecpar).sample_aspect_ratio,
+        )
+    };
+    usable(container)
+        .or_else(|| usable(codec))
+        .filter(|aspect| (aspect.as_f64() - 1.0).abs() > 0.001)
+}
+
+/// The displayed size of a picture coded at `width` by `height` with pixels
+/// of the shape `aspect` (square for `None`) and the given rotation: the
+/// width stretched to square pixels, kept even, as players do; then a
+/// quarter turn swaps the two.
+pub(crate) fn displayed(
+    width: u32,
+    height: u32,
+    aspect: Option<Rational>,
+    degrees: i64,
+) -> (u32, u32) {
+    let width = match aspect {
+        Some(aspect) => ((f64::from(width) * aspect.as_f64() / 2.0).round() as u32 * 2).max(2),
+        None => width,
+    };
     if degrees.rem_euclid(180) == 90 {
         (height, width)
     } else {
@@ -250,10 +445,28 @@ mod tests {
 
     #[test]
     fn a_quarter_turn_swaps_the_dimensions_and_a_half_turn_does_not() {
-        assert_eq!(displayed(1920, 1080, 90), (1080, 1920));
-        assert_eq!(displayed(1920, 1080, 270), (1080, 1920));
-        assert_eq!(displayed(1920, 1080, 180), (1920, 1080));
-        assert_eq!(displayed(1920, 1080, 0), (1920, 1080));
+        assert_eq!(displayed(1920, 1080, None, 90), (1080, 1920));
+        assert_eq!(displayed(1920, 1080, None, 270), (1080, 1920));
+        assert_eq!(displayed(1920, 1080, None, 180), (1920, 1080));
+        assert_eq!(displayed(1920, 1080, None, 0), (1920, 1080));
+    }
+
+    /// Wide pixels are stretched to square ones, as a player shows them:
+    /// HDV's 1440 to 1920, widescreen DV's 720 to 854 (853.3, kept even),
+    /// and the stretch comes before a quarter turn.
+    #[test]
+    fn a_picture_of_wide_pixels_is_shown_at_its_true_width() {
+        let hdv = Some(Rational::new(4, 3));
+        assert_eq!(displayed(1440, 1080, hdv, 0), (1920, 1080));
+        assert_eq!(displayed(1440, 1080, hdv, 90), (1080, 1920));
+        assert_eq!(
+            displayed(720, 480, Some(Rational::new(32, 27)), 0),
+            (854, 480)
+        );
+        assert_eq!(
+            displayed(720, 480, Some(Rational::new(8, 9)), 0),
+            (640, 480)
+        );
     }
 
     #[test]

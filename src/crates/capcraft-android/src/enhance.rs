@@ -89,11 +89,14 @@ impl MobileSession {
             return Ok(());
         }
         let factor = concat_vision::enhance::factor_for(current.width, current.height);
+        // the whole file, kept as the model answers it
         let target = target_for(
             Path::new(&current.project),
             &current.path,
             factor,
+            1.0,
             current.still,
+            None,
         )
         .ok_or_else(|| MobileError::Failed("The clip's file cannot be read.".to_owned()))?;
         let service = enhancers()?;
@@ -104,7 +107,9 @@ impl MobileSession {
                     media_path: current.path,
                     still: current.still,
                     factor,
+                    strength: 1.0,
                     target,
+                    span: None,
                 };
                 let made = service.enhance(&request, &mut |progress| match progress {
                     Progress::Fetching { received, total } => listener
@@ -128,6 +133,7 @@ impl MobileSession {
                             item: info.to_new_media(),
                             source_start: None,
                             enhanced: true,
+                            offset: 0.0,
                         }])
                     });
                 match placed {

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The GPU compositor against the CPU reference: the same plans, and the
 //! pictures must agree. Every test skips on a machine without an adapter,
@@ -15,7 +15,7 @@ use concat_core::timeline::{Blend, Transform};
 use super::*;
 use crate::CpuCompositor;
 use crate::metrics::ssim;
-use crate::plan::{Crop, Transition, detached_clip};
+use crate::plan::{Backdrop, Crop, Transition, Warp, detached_clip};
 
 fn gpu() -> Option<WgpuCompositor> {
     let compositor = WgpuCompositor::new();
@@ -130,6 +130,60 @@ fn empty_output_is_opaque_black() {
     assert_eq!(frame.pixel(3, 3), Some([0, 0, 0, 255]));
 }
 
+/// On a see-through canvas the frame comes back with straight alpha, as
+/// the CPU reference makes it: clear where nothing covers it, opaque under
+/// an opaque picture, and half covered under a half-faded one, in that
+/// picture's own colour rather than darkened towards the clear (#456).
+#[test]
+fn a_see_through_canvas_keeps_the_alpha_of_what_covers_it() {
+    let Some(mut gpu) = gpu() else { return };
+    let square = Arc::new(solid(4, 4, [200, 40, 40, 255]));
+    let plan = FramePlan {
+        canvas: [0, 0, 0, 0],
+        layers: vec![PlannedLayer::picture(detached_clip(), square.clone())],
+        ..FramePlan::empty(8, 4)
+    };
+    let frame = gpu.render(&plan);
+    assert_eq!(frame.pixel(0, 2).map(|p| p[3]), Some(0));
+    let pixel = frame.pixel(4, 2).expect("a pixel");
+    assert!(pixel[3] == 255 && pixel[0].abs_diff(200) <= 1, "{pixel:?}");
+
+    let mut faded = PlannedLayer::picture(detached_clip(), square);
+    faded.opacity = 0.5;
+    let frame = gpu.render(&FramePlan {
+        layers: vec![faded],
+        ..plan
+    });
+    let pixel = frame.pixel(4, 2).expect("a pixel");
+    assert!(pixel[3].abs_diff(128) <= 1, "{pixel:?}");
+    assert!(pixel[0].abs_diff(200) <= 2 && pixel[1].abs_diff(40) <= 2, "{pixel:?}");
+
+    // And an opaque canvas after it is opaque again.
+    let frame = gpu.render(&FramePlan::empty(4, 4));
+    assert_eq!(frame.pixel(1, 1), Some([0, 0, 0, 255]));
+}
+
+/// The canvas colour comes back out as it went in: cleared in linear
+/// light through the upload's gamma and resolved back, within a level.
+#[test]
+fn an_empty_frame_is_the_canvas_colour() {
+    let Some(mut gpu) = gpu() else { return };
+    for canvas in [[0, 177, 64, 255], [255, 255, 255, 255], [0, 71, 187, 255], [31, 31, 31, 255]] {
+        let frame = gpu.render(&FramePlan {
+            canvas,
+            ..FramePlan::empty(4, 4)
+        });
+        let pixel = frame.pixel(2, 2).expect("a pixel");
+        for channel in 0..3 {
+            assert!(
+                pixel[channel].abs_diff(canvas[channel]) <= 1,
+                "{canvas:?} came back {pixel:?}"
+            );
+        }
+        assert_eq!(pixel[3], 255);
+    }
+}
+
 #[test]
 fn plain_layers_match_the_cpu_reference_to_the_pixel() {
     let Some(mut gpu) = gpu() else { return };
@@ -155,6 +209,114 @@ fn plain_layers_match_the_cpu_reference_to_the_pixel() {
                 "pixel {index} channel {channel}: cpu {want:?} vs gpu {got:?}"
             );
         }
+    }
+}
+
+/// A stabilized frame is its source resampled through the correction: a
+/// warp of a whole number of pixels draws each pixel from that far over,
+/// to the level, and the edge it pulls into view holds the source's last
+/// column, as the sampler reads past an edge.
+#[test]
+fn a_stabilized_frame_is_the_source_through_its_warp() {
+    let Some(mut gpu) = gpu() else { return };
+    let (w, h) = (64u32, 48u32);
+    let source = gradient(w, h);
+    let mut shifted = layer(source.clone());
+    // Each point drawn is read 6 px right of and 3 px below itself.
+    shifted.warp = Warp {
+        a: 1.0,
+        b: 0.0,
+        tx: 6.0 / h as f32,
+        ty: 3.0 / h as f32,
+    };
+    let out = gpu.render(&plan(w, h, vec![shifted]));
+    for y in 0..h {
+        for x in 0..w {
+            let want = source
+                .pixel((x + 6).min(w - 1), (y + 3).min(h - 1))
+                .expect("inside");
+            let got = out.pixel(x, y).expect("inside");
+            for channel in 0..3 {
+                let difference = (i32::from(want[channel]) - i32::from(got[channel])).abs();
+                assert!(
+                    difference <= 1,
+                    "({x}, {y}) channel {channel}: want {want:?}, got {got:?}"
+                );
+            }
+        }
+    }
+
+    // A turn and a zoom about the centre: a point of the picture reads
+    // from where the turn and the zoom send it. Probed on the smooth
+    // gradient, away from the bar, whose edge the two blend differently
+    // (the GPU in light, the reference in its stored levels).
+    let (angle, zoom) = (8f32.to_radians(), 1.0 / 1.15);
+    let mut turned = layer(source.clone());
+    turned.warp = Warp {
+        a: zoom * angle.cos(),
+        b: zoom * angle.sin(),
+        tx: 0.0,
+        ty: 0.0,
+    };
+    let out = gpu.render(&plan(w, h, vec![turned.clone()]));
+    let probe = |x: f32, y: f32| {
+        let (nx, ny) = (
+            (x - w as f32 / 2.0) / h as f32,
+            (y - h as f32 / 2.0) / h as f32,
+        );
+        let (mx, my) = (
+            turned.warp.a * nx - turned.warp.b * ny,
+            turned.warp.b * nx + turned.warp.a * ny,
+        );
+        (
+            mx * h as f32 + w as f32 / 2.0,
+            my * h as f32 + h as f32 / 2.0,
+        )
+    };
+    for (x, y) in [(52u32, 10u32), (10, 36), (48, 40), (40, 6)] {
+        let (sx, sy) = probe(x as f32 + 0.5, y as f32 + 0.5);
+        let want = crate::reference::sample_bilinear(&source, sx - 0.5, sy - 0.5);
+        let got = out.pixel(x, y).expect("inside");
+        for channel in 0..3 {
+            assert!(
+                (want[channel] - f32::from(got[channel])).abs() <= 3.0,
+                "({x}, {y}) channel {channel}: want {want:?}, got {got:?}"
+            );
+        }
+    }
+
+    // And the CPU reference agrees, alone, cropped, and made first for an
+    // effect to run over.
+    assert_parity("stabilized", &plan(w, h, vec![turned.clone()]), 0.99);
+    let mut cropped = turned.clone();
+    cropped.crop = Crop::of([0.1, 0.0, 0.2, 0.1]);
+    cropped.flip_h = true;
+    assert_parity(
+        "stabilized and cropped",
+        &plan(w, h, vec![cropped.clone()]),
+        0.99,
+    );
+    let mut prepared = cropped;
+    prepared.effects = vec![package("test.invert", INVERT, "", &[], 1.0)];
+    let geometry = prepared.geometry(&source, w, h);
+    assert!(prepared.needs_preparing(&geometry));
+    let inverted = gpu.render(&plan(w, h, vec![prepared]));
+    let mut plain = turned;
+    plain.crop = Crop::of([0.1, 0.0, 0.2, 0.1]);
+    plain.flip_h = true;
+    let straight = gpu.render(&plan(w, h, vec![plain]));
+    // The invert ran over the warped picture: inside the fitted picture,
+    // each pixel is the other's inverse.
+    let middle = (w / 2, h / 2);
+    let (a, b) = (
+        inverted.pixel(middle.0, middle.1).expect("inside"),
+        straight.pixel(middle.0, middle.1).expect("inside"),
+    );
+    for channel in 0..3 {
+        assert!(
+            (i32::from(a[channel]) + i32::from(b[channel]) - 255).abs() <= 2,
+            "{a:?} vs {b:?}"
+        );
     }
 }
 
@@ -326,6 +488,128 @@ fn every_kind_of_layer_matches_the_cpu_reference() {
         },
     ];
     assert_parity("faded and wiped", &plan(64, 48, vec![cut]), 0.99);
+}
+
+/// A feathered circle on a white picture over black, read in the working
+/// space where white is one: the light is the coverage. Whole in the
+/// middle, half on the edge, nothing past the band - and the same number
+/// the CPU's definition gives at each pixel's centre.
+#[test]
+fn a_feathered_circle_keeps_its_middle_and_fades_across_its_edge() {
+    use concat_core::mask::{MaskShape, ShapeMask};
+    let Some(mut gpu) = gpu() else { return };
+    let mut circle = layer(solid(100, 100, [255, 255, 255, 255]));
+    let shape = ShapeMask {
+        shape: MaskShape::Circle,
+        width: 0.6,
+        height: 0.6,
+        feather: 0.4,
+        ..ShapeMask::default()
+    };
+    circle.shape = Some(shape);
+    let drawn = working(&mut gpu, &plan(100, 100, vec![circle]));
+    let at = |x: usize, y: usize| drawn[y * 100 + x][0];
+    let expected = |x: usize, y: usize| {
+        shape.coverage(
+            (x as f32 + 0.5) / 100.0,
+            (y as f32 + 0.5) / 100.0,
+            100.0,
+            100.0,
+            0.01,
+        )
+    };
+    // The middle, a band inside the edge, the edge, and past the band.
+    assert!((at(50, 50) - 1.0).abs() < 0.01, "middle {}", at(50, 50));
+    assert!(
+        (at(50 + 19, 50) - 1.0).abs() < 0.01,
+        "inside {}",
+        at(69, 50)
+    );
+    assert!((at(80, 50) - 0.5).abs() < 0.06, "edge {}", at(80, 50));
+    assert!((at(50, 80) - 0.5).abs() < 0.06, "edge {}", at(50, 80));
+    assert!(at(50 + 41, 50) < 0.01, "outside {}", at(91, 50));
+    assert!(at(2, 2) < 0.001, "corner {}", at(2, 2));
+    for (x, y) in [(75, 50), (80, 50), (85, 50), (50, 72), (64, 64), (71, 71)] {
+        let (got, want) = (at(x, y), expected(x, y));
+        assert!(
+            (got - want).abs() < 0.01,
+            "({x}, {y}): gpu {got}, cpu {want}"
+        );
+    }
+}
+
+/// Every shape against the CPU reference: turned, moved, feathered and
+/// inverted, on a picture that is itself placed, cropped and carrying a
+/// cutout's matte - the masks multiply.
+#[test]
+fn shape_masks_match_the_cpu_reference() {
+    use concat_core::mask::{MaskShape, ShapeMask};
+    for shape in MaskShape::ALL {
+        for invert in [false, true] {
+            let mut masked = layer(gradient(64, 48));
+            masked.transform = Transform {
+                scale: 0.9,
+                rotation: 12.0,
+                offset_x: 0.05,
+                ..Transform::default()
+            };
+            masked.crop = Crop::of([0.1, 0.0, 0.05, 0.1]);
+            // A stabilized clip's correction: the mask is on the picture
+            // as corrected, so it holds still with it.
+            masked.warp = Warp {
+                a: 1.06,
+                b: 0.03,
+                tx: 0.02,
+                ty: -0.01,
+            };
+            masked.shape = Some(ShapeMask {
+                shape,
+                x: 0.05,
+                y: -0.04,
+                width: 0.7,
+                height: 0.5,
+                rotation: 20.0,
+                roundness: 0.5,
+                feather: 0.15,
+                invert,
+            });
+            let mut matte = Frame::transparent(16, 16);
+            for y in 0..16u32 {
+                for x in 0..16u32 {
+                    let a = if x < 3 { 0 } else { 255 };
+                    matte.set_pixel(x, y, [255, 255, 255, a]);
+                }
+            }
+            masked.mask = Some(Arc::new(matte));
+            assert_parity(
+                &format!("{shape:?} mask, inverted {invert}"),
+                &plan(64, 48, vec![layer(solid(64, 48, [0, 60, 0, 255])), masked]),
+                0.98,
+            );
+        }
+    }
+}
+
+/// A masked picture never counts as covering the frame, and its canvas
+/// background is drawn whole behind it - the mask cuts the picture, not
+/// what stands behind it.
+#[test]
+fn a_masked_pictures_background_is_whole() {
+    use concat_core::mask::ShapeMask;
+    let mut masked = layer(solid(64, 48, [200, 0, 0, 255]));
+    assert!(masked.covers(64, 48, true));
+    masked.shape = Some(ShapeMask::default());
+    assert!(!masked.covers(64, 48, true));
+    let behind = masked
+        .backdrop(&Backdrop::Colour([0, 0, 255]), 64, 48, |_| None)
+        .expect("a colour always draws");
+    assert!(behind.shape.is_none());
+    let Some(mut gpu) = gpu() else { return };
+    let frame = gpu.render(&plan(64, 48, vec![behind, masked]));
+    let corner = frame.pixel(1, 1).expect("a pixel");
+    let middle = frame.pixel(32, 24).expect("a pixel");
+    assert!(corner[2] > 200 && corner[0] < 30, "blue behind: {corner:?}");
+    assert!(middle[0] > 180 && middle[2] < 30, "red kept: {middle:?}");
 }
 
 /// What cannot be drawn is not drawn, the same way on both sides: a
@@ -597,6 +881,90 @@ fn every_packaged_transition_combines_across_its_progress_range() {
     }
 }
 
+/// Halfway through, every packaged transition but the plain dissolves draws
+/// something a dissolve does not: "all the transitions look the same, just
+/// a fade" (#448) is a shader that compiled and ran and drew the mix
+/// anyway. Over two busy pictures, so a slide or a zoom moves something.
+#[test]
+fn halfway_through_a_packaged_transition_is_not_a_dissolve() {
+    let Some(mut gpu) = gpu() else { return };
+    let (width, height) = (64, 36);
+    let from = gradient(width, height);
+    let mut to = Frame::transparent(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let on = (x / 8 + y / 8) % 2 == 0;
+            to.set_pixel(
+                x,
+                y,
+                if on {
+                    [240, 240, 40, 255]
+                } else {
+                    [20, 90, 200, 255]
+                },
+            );
+        }
+    }
+    let mix = crate::reference::mix_frames(&from, &to, 0.5);
+    let catalogue = concat_effects::Catalogue::builtin();
+    let mut report = Vec::new();
+    for package in catalogue.packages() {
+        if package.kind() != concat_effects::Kind::Transition {
+            continue;
+        }
+        let pass = catalogue
+            .transition_pass(package.id(), &Default::default(), 0.5)
+            .expect("a pass");
+        let out = gpu
+            .combine(width, height, 0.0, &from, &to, &pass)
+            .expect("combines");
+        let differs = out
+            .pixels()
+            .iter()
+            .zip(mix.pixels())
+            .map(|(a, b)| u32::from(a.abs_diff(*b)))
+            .sum::<u32>() as f64
+            / out.pixels().len() as f64;
+        report.push(format!("{} {differs:.2}", package.id()));
+        if !package.id().contains("dissolve") {
+            assert!(
+                differs > 2.0,
+                "{} is a dissolve halfway: {differs:.2}",
+                package.id()
+            );
+        }
+    }
+    eprintln!("{}", report.join("\n"));
+}
+
+/// A transition's knob, set on the cut, changes what the shader draws:
+/// Push to the right is not Push to the left.
+#[test]
+fn a_transitions_knob_changes_what_it_draws() {
+    let Some(mut gpu) = gpu() else { return };
+    let (width, height) = (64, 36);
+    let (from, to) = (
+        gradient(width, height),
+        solid(width, height, [30, 200, 60, 255]),
+    );
+    let catalogue = concat_effects::Catalogue::builtin();
+    let draw = |gpu: &mut WgpuCompositor, direction: f64| {
+        let params = BTreeMap::from([("direction".to_owned(), direction)]);
+        let pass = catalogue
+            .transition_pass("concat.push", &params, 0.5)
+            .expect("push has a pass");
+        gpu.combine(width, height, 0.0, &from, &to, &pass)
+            .expect("combines")
+    };
+    let left = draw(&mut gpu, 0.0);
+    let right = draw(&mut gpu, 1.0);
+    assert_ne!(
+        left.pixels(),
+        right.pixels(),
+        "the direction knob reached the shader"
+    );
+}
+
 /// A texture read back into a frame, for comparing a picture that stayed
 /// on the device with one that was read back on the way.
 fn read_texture(gpu: &WgpuCompositor, texture: &wgpu::Texture) -> Frame {
@@ -659,6 +1027,7 @@ fn a_transition_kept_on_the_device_matches_the_read_back_one() {
         time: concat_core::time::Rational::new(1, 2),
         width,
         height,
+        canvas: [0, 0, 0, 255],
         layers: vec![PlannedLayer::picture(
             detached_clip(),
             Arc::new(solid(width, height, colour)),
@@ -716,6 +1085,7 @@ fn a_frame_drawn_before_is_not_uploaded_again() {
             time: concat_core::time::Rational::new(0, 1),
             width: 64,
             height: 36,
+            canvas: [0, 0, 0, 255],
             layers: vec![PlannedLayer::picture(detached_clip(), Arc::clone(frame))],
             treatments: Vec::new(),
             output: concat_core::frame::Signal::Sdr,
@@ -756,6 +1126,7 @@ fn the_pool_stays_within_its_limits() {
             time: concat_core::time::Rational::new(0, 1),
             width: 4,
             height: 4,
+            canvas: [0, 0, 0, 255],
             layers: vec![PlannedLayer::picture(detached_clip(), frame)],
             treatments: Vec::new(),
             output: concat_core::frame::Signal::Sdr,
@@ -1901,5 +2272,196 @@ fn the_largest_frame_is_what_the_device_holds() {
     assert_eq!(
         gpu.max_side(),
         concat_core::frame::MAX_SIDE.min(gpu.device.limits().max_texture_dimension_2d)
+    );
+}
+
+// ── backgrounds ──
+
+/// A wide picture, red on its left half and blue on its right, the way a
+/// landscape shot sits in a vertical frame.
+fn halves(width: u32, height: u32) -> Frame {
+    let mut frame = Frame::transparent(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let colour = if x < width / 2 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
+            frame.set_pixel(x, y, colour);
+        }
+    }
+    frame
+}
+
+/// The standard normal's distribution function, by Abramowitz and
+/// Stegun's 7.1.26: to a few parts in ten million, far finer than a
+/// frame's eight bits.
+fn normal_cdf(x: f64) -> f64 {
+    let z = x.abs() / std::f64::consts::SQRT_2;
+    let t = 1.0 / (1.0 + 0.327_591_1 * z);
+    let poly = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    let erf = 1.0 - poly * (-z * z).exp();
+    if x >= 0.0 {
+        0.5 * (1.0 + erf)
+    } else {
+        0.5 * (1.0 - erf)
+    }
+}
+
+/// An output level back to light, the inverse of the resolve's 1/2.4.
+fn light(level: u8) -> f64 {
+    (f64::from(level) / 255.0).powf(2.4)
+}
+
+/// A blurred background is the picture enlarged to cover the frame and
+/// blurred by the spread asked for, beneath the picture and nowhere over
+/// it: in the bars of a wide red-and-blue picture in a tall frame, the
+/// light along a row is the step from red to blue at the frame's middle,
+/// blurred by a Gaussian of `sigma` output pixels, while the picture
+/// itself comes out exactly as it does over black.
+#[test]
+fn a_blurred_background_is_the_picture_covering_the_frame_blurred() {
+    let Some(mut gpu) = heavy_gpu() else { return };
+    let blur = concat_effects::Catalogue::builtin()
+        .get("concat.gaussian-blur")
+        .expect("a built-in");
+    let (width, height) = (90, 160);
+    let sigma = 12.0;
+    let picture = layer(halves(64, 36));
+    let backdrop = picture
+        .backdrop(&Backdrop::Blur { sigma }, width, height, |radius| {
+            blur.pass(
+                &BTreeMap::from([("radius".to_owned(), f64::from(radius))]),
+                None,
+            )
+        })
+        .expect("a picture to blur");
+    assert_eq!(backdrop.effects.len(), 1, "the blur, and only the blur");
+
+    let alone = gpu.render(&plan(width, height, vec![picture.clone()]));
+    let over = gpu.render(&plan(width, height, vec![backdrop, picture]));
+
+    // 64x36 fitted into 90 across is 90x51, from row 54: the picture.
+    for y in 58..100 {
+        for x in 0..width {
+            assert_eq!(
+                over.pixel(x, y),
+                alone.pixel(x, y),
+                "the picture at {x},{y}"
+            );
+        }
+    }
+    // Above and below it, the bars: black alone, the blurred step over it.
+    let mut worst = 0.0f64;
+    for y in [10, 30, 130, 150] {
+        assert_eq!(alone.pixel(45, y), Some([0, 0, 0, 255]), "a bar alone");
+        for x in 0..width {
+            let blue = normal_cdf((f64::from(x) + 0.5 - f64::from(width) / 2.0) / f64::from(sigma));
+            let [r, g, b, a] = over.pixel(x, y).expect("in the frame");
+            assert_eq!((g, a), (0, 255), "at {x},{y}");
+            for (got, want) in [(light(r), 1.0 - blue), (light(b), blue)] {
+                worst = worst.max((got - want).abs());
+                assert!(
+                    (got - want).abs() < 0.02,
+                    "at {x},{y}: light {got:.4} where the blurred step is {want:.4}"
+                );
+            }
+        }
+    }
+    eprintln!("blurred background: worst {worst:.4} of light off the Gaussian step");
+}
+
+/// A colour background fills the bars with the colour, exactly, and a
+/// still covers the frame in its own shape: a tall still behind a wide
+/// picture in a wide frame fills the bars from its middle band.
+#[test]
+fn a_colour_or_a_still_fills_the_bars() {
+    let Some(mut gpu) = gpu() else { return };
+    let (width, height) = (90, 160);
+    let picture = layer(halves(64, 36));
+    let none = |_| None;
+    let colour = picture
+        .backdrop(&Backdrop::Colour([10, 200, 90]), width, height, none)
+        .expect("a colour");
+    let frame = gpu.render(&plan(width, height, vec![colour, picture.clone()]));
+    for (x, y) in [(0, 0), (89, 0), (45, 20), (0, 159), (89, 159), (45, 140)] {
+        assert_eq!(frame.pixel(x, y), Some([10, 200, 90, 255]), "at {x},{y}");
+    }
+    assert_eq!(frame.pixel(20, 80), Some([255, 0, 0, 255]));
+    assert_eq!(frame.pixel(70, 80), Some([0, 0, 255, 255]));
+
+    // A still of three bands, top to bottom, twice as tall as it is wide:
+    // covering the 90x160 frame it is 90 across and 180 down, so the frame
+    // shows the middle band whole and the outer two cut short.
+    let mut still = Frame::transparent(20, 40);
+    for y in 0..40 {
+        for x in 0..20 {
+            let band = match y {
+                0..10 => [255, 255, 0, 255],
+                10..30 => [0, 255, 255, 255],
+                _ => [255, 0, 255, 255],
+            };
+            still.set_pixel(x, y, band);
+        }
+    }
+    let image = picture
+        .backdrop(&Backdrop::Image(Arc::new(still)), width, height, none)
+        .expect("a still");
+    let frame = gpu.render(&plan(width, height, vec![image, picture]));
+    assert_eq!(frame.pixel(45, 40), Some([0, 255, 255, 255]));
+    assert_eq!(frame.pixel(45, 120), Some([0, 255, 255, 255]));
+    assert_eq!(frame.pixel(45, 2), Some([255, 255, 0, 255]));
+    assert_eq!(frame.pixel(45, 157), Some([255, 0, 255, 255]));
+}
+
+/// The background goes with its picture through a wipe: halfway, the half
+/// of the frame the picture has gone from is black, bars and all, and the
+/// edge crosses the bars where it crosses the picture.
+#[test]
+fn a_background_is_wiped_with_its_picture() {
+    let Some(mut gpu) = gpu() else { return };
+    let (width, height) = (90, 160);
+    let mut picture = layer(halves(64, 36));
+    picture.transitions = vec![Transition::Wipe {
+        uncovered: 0.5,
+        from_right: false,
+    }];
+    let colour = picture
+        .backdrop(&Backdrop::Colour([0, 255, 0]), width, height, |_| None)
+        .expect("a colour");
+    let frame = gpu.render(&plan(width, height, vec![colour, picture]));
+    assert_eq!(
+        frame.pixel(20, 80),
+        Some([255, 0, 0, 255]),
+        "the picture's kept half"
+    );
+    assert_eq!(
+        frame.pixel(70, 80),
+        Some([0, 0, 0, 255]),
+        "the picture's wiped half"
+    );
+    assert_eq!(
+        frame.pixel(20, 20),
+        Some([0, 255, 0, 255]),
+        "the bar's kept half"
+    );
+    assert_eq!(
+        frame.pixel(70, 20),
+        Some([0, 0, 0, 255]),
+        "the bar's wiped half"
+    );
+    assert_eq!(
+        frame.pixel(43, 20),
+        Some([0, 255, 0, 255]),
+        "the edge is the picture's"
+    );
+    assert_eq!(
+        frame.pixel(47, 20),
+        Some([0, 0, 0, 255]),
+        "the edge is the picture's"
     );
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The document: `concat.json` in and out.
 //!
@@ -262,7 +262,9 @@ fn settle_clip(
         return None;
     }
     match clip.kind {
-        ClipKind::Text | ClipKind::Layer | ClipKind::Shape => clip.media_id.clear(),
+        ClipKind::Text | ClipKind::Layer | ClipKind::SoundLayer | ClipKind::Shape => {
+            clip.media_id.clear()
+        }
         ClipKind::Video | ClipKind::Audio | ClipKind::Image => {
             if !media.iter().any(|item| item.id == clip.media_id) {
                 return None;
@@ -297,6 +299,9 @@ pub struct DocumentSettings {
     pub rate_num: i64,
     /// Denominator of the output frame rate, e.g. 1001 for 29.97fps.
     pub rate_den: i64,
+    /// What shows where no picture covers the frame; see
+    /// `VideoSettings::canvas`.
+    pub canvas: [u8; 4],
 }
 
 impl DocumentSettings {
@@ -309,6 +314,7 @@ impl DocumentSettings {
             rate_num: self.rate_num,
             rate_den: self.rate_den,
             color_space: ColorSpace::Sdr,
+            canvas: self.canvas,
         }
     }
 }

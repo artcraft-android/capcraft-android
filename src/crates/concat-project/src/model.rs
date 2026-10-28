@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The document model: what a Concat project *is*.
 //!
@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 
 /// What a piece of media is. A still is not a video with one frame: it has no
 /// intrinsic duration, so its length on a timeline is editorial.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaKind {
@@ -34,6 +35,7 @@ pub enum MediaKind {
 /// What made a media file, when it was the editor and not the user's
 /// import. The bin shelves such a file under Generated, by origin, and
 /// keeps it out of the import shelves.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaOrigin {
@@ -62,6 +64,18 @@ pub enum ClipKind {
     /// lives in [`Clip::video_effects`], its strength in [`Clip::opacity`]
     /// and its ramps in the fades.
     Layer,
+    /// A treatment of the sound for as long as it runs: its chain, in
+    /// [`Clip::filters`], works on the mix of everything audible over its
+    /// span - a voice changer, a room or a telephone over the whole
+    /// soundtrack, not one clip of it. No media behind it; how much of the
+    /// treated sound replaces the untreated is [`Clip::opacity`], the
+    /// strength a picture layer has, and its ramps are the fades. A kind of
+    /// its own rather than a flag on [`ClipKind::Layer`], so it stays what
+    /// it is with its chain emptied, and a build that predates it leaves it
+    /// out as a clip it cannot play rather than reading it as a picture
+    /// layer that treats nothing.
+    #[serde(rename = "soundLayer")]
+    SoundLayer,
     /// A shape: a square, a circle, an arrow, drawn over the picture. No
     /// media behind it; what it is and how it is painted lives in
     /// [`Clip::shape`], and it is placed and scaled like a still.
@@ -78,6 +92,7 @@ impl ClipKind {
 /// One audio stream of a media file, as the probe reported it. A screen
 /// recording keeps the desktop's sound and the microphone as two of these;
 /// a clip names the one it plays by `index`.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioTrack {
@@ -108,6 +123,7 @@ pub struct AudioTrack {
 /// full crushes its shadows until it is read as `limited`. Set with
 /// `Command::SetMediaColorRange`; absent means the file's own tag is read.
 /// https://github.com/jub0t/Concat/issues/103
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ColorRange {
@@ -204,6 +220,10 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 /// A lane. Deliberately untyped: any media goes on any track.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -234,6 +254,7 @@ impl Default for Track {
 /// One applied audio filter or video effect: a catalogue id plus whatever
 /// parameters were set. The catalogues themselves (and the FFmpeg strings
 /// they build) live in the UI today; the model only stores the numbers.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppliedFilter {
@@ -264,6 +285,7 @@ fn yes() -> bool {
 }
 
 /// One key on one parameter of an applied effect; see `AppliedFilter::keys`.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParamKey {
@@ -414,6 +436,7 @@ impl AppliedFilter {
 /// How a picture's background is taken away when there is no key colour
 /// to remove: a person mask found by the cutout model, alone or corrected
 /// by hand.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Cutout {
@@ -431,6 +454,7 @@ pub struct Cutout {
 }
 
 /// The two ways a cutout decides what stays.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CutoutMode {
@@ -443,6 +467,7 @@ pub enum CutoutMode {
 /// What a cutout keeps: the person the matting model finds, the one
 /// thing the picture is of whatever it is, or whichever of those the
 /// analysis decides fits the footage.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Subject {
@@ -474,6 +499,7 @@ impl Subject {
 /// One brush stroke over a cutout: which tool, how wide, and where it went.
 /// Points are fractions of the source picture, `(0, 0)` its top-left, so a
 /// stroke survives a change of output size, a crop or a flip.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stroke {
@@ -491,6 +517,7 @@ pub struct Stroke {
 }
 
 /// The four brushes of a custom cutout.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum BrushTool {
@@ -566,7 +593,76 @@ impl Stroke {
     }
 }
 
+/// A clip's stabilization: the camera's shake taken out of the picture.
+///
+/// The camera's movement is measured once, frame to frame, by the host's
+/// analysis and cached in the project folder beside the masks; these are
+/// the settings the smooth path and the correction are worked out from,
+/// live, whenever they change. Off is no `Stabilize` at all.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Stabilize {
+    /// How much of the camera's movement is smoothed away, `0..=1`: low
+    /// keeps a pan or a glide and takes out the jitter, high leaves only
+    /// the slowest of moves. Measured on the timeline, so a clip sped up
+    /// is smoothed as calmly as one at its own pace.
+    pub smoothness: f64,
+    /// The most the picture may be zoomed to hide the edges the correction
+    /// moves into view, `1..=MAX_STABILIZE_ZOOM`. The zoom used is the
+    /// least the whole clip needs, up to this; past it the correction is
+    /// eased where it would show an edge.
+    pub max_zoom: f64,
+    /// Lock the frame entirely, as on a tripod, rather than follow the
+    /// camera's intended move.
+    #[serde(skip_serializing_if = "is_false")]
+    pub tripod: bool,
+    /// Leave the camera's roll as shot: only its drift and its zoom are
+    /// corrected.
+    #[serde(skip_serializing_if = "is_false")]
+    pub keep_rotation: bool,
+}
+
+/// The smoothness a stabilization starts with.
+pub const DEFAULT_STABILIZE_SMOOTHNESS: f64 = 0.5;
+/// The zoom a stabilization may use to begin with: a fifth larger.
+pub const DEFAULT_STABILIZE_ZOOM: f64 = 1.2;
+/// The most a stabilization may zoom: half again.
+pub const MAX_STABILIZE_ZOOM: f64 = 1.5;
+
+impl Default for Stabilize {
+    fn default() -> Self {
+        Stabilize {
+            smoothness: DEFAULT_STABILIZE_SMOOTHNESS,
+            max_zoom: DEFAULT_STABILIZE_ZOOM,
+            tripod: false,
+            keep_rotation: false,
+        }
+    }
+}
+
+impl Stabilize {
+    /// Every number held to its range, a number that is not one to its
+    /// default.
+    pub fn tidy(self) -> Stabilize {
+        Stabilize {
+            smoothness: if self.smoothness.is_finite() {
+                self.smoothness.clamp(0.0, 1.0)
+            } else {
+                DEFAULT_STABILIZE_SMOOTHNESS
+            },
+            max_zoom: if self.max_zoom.is_finite() {
+                self.max_zoom.clamp(1.0, MAX_STABILIZE_ZOOM)
+            } else {
+                DEFAULT_STABILIZE_ZOOM
+            },
+            ..self
+        }
+    }
+}
+
 /// A crop: what is taken off each edge, as fractions of the source.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Crop {
@@ -605,13 +701,364 @@ impl Crop {
     }
 }
 
+/// What fills the frame where the picture does not reach: the bars either
+/// side of a wide shot in a tall frame, or the margin round a picture
+/// scaled down. Nothing - black, as every project was before there was a
+/// choice - a blurred, enlarged copy of the clip's own frame, a colour, or
+/// a still from the bin.
+///
+/// A timeline carries one ([`Timeline::background`]) and a clip may carry
+/// its own over it ([`Clip::background`]); which clips have one at all is
+/// [`Timeline::background_of`]'s to say.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum Background {
+    /// Black: nothing drawn behind the picture.
+    #[default]
+    None,
+    /// The clip's own frame, enlarged to cover the whole frame and blurred.
+    Blur {
+        /// How soft, `0..=1`: a blur of a twelfth of the frame's shorter
+        /// side at one.
+        amount: f64,
+    },
+    /// One flat colour, `#rrggbb`.
+    Color {
+        /// The colour, as a title's colours are written.
+        color: String,
+    },
+    /// A still from the bin, enlarged to cover the frame.
+    Image {
+        /// The bin item. One that has gone, or none yet, draws nothing.
+        media_id: String,
+    },
+}
+
+impl Background {
+    /// How soft a blur starts: soft enough that the copy behind reads as
+    /// colour and light rather than as a second picture.
+    pub const DEFAULT_BLUR: f64 = 0.5;
+
+    /// True for black, the background that draws nothing.
+    pub fn is_none(&self) -> bool {
+        *self == Background::None
+    }
+
+    /// The amount held to `0..=1` and a colour that is not `#rrggbb` turned
+    /// to black: what the document reader and every command make of a value
+    /// before it is kept. A still naming no media stays one - the kind is
+    /// chosen and the still not yet - and draws nothing.
+    pub fn tidy(self) -> Background {
+        match self {
+            Background::Blur { amount } => Background::Blur {
+                amount: if amount.is_finite() {
+                    amount.clamp(0.0, 1.0)
+                } else {
+                    Background::DEFAULT_BLUR
+                },
+            },
+            Background::Color { color } => Background::Color {
+                color: match rgb_of(&color) {
+                    Some([r, g, b]) => format!("#{r:02x}{g:02x}{b:02x}"),
+                    None => "#000000".to_owned(),
+                },
+            },
+            other => other,
+        }
+    }
+
+    /// The colour's channels, for a colour background whose colour reads.
+    pub fn rgb(&self) -> Option<[u8; 3]> {
+        match self {
+            Background::Color { color } => rgb_of(color),
+            _ => None,
+        }
+    }
+}
+
+/// `#rrggbb` (or `#rrggbbaa`, its alpha ignored) as three channels.
+/// `#rrggbb` (opaque) or `#rrggbbaa` as four straight channels.
+fn rgba_of(hex: &str) -> Option<[u8; 4]> {
+    let [r, g, b] = rgb_of(hex)?;
+    let digits = hex.trim().strip_prefix('#')?;
+    let a = match digits.len() {
+        8 => u8::from_str_radix(&digits[6..8], 16).ok()?,
+        _ => 255,
+    };
+    Some([r, g, b, a])
+}
+
+fn rgb_of(hex: &str) -> Option<[u8; 3]> {
+    let digits = hex.trim().strip_prefix('#')?;
+    if !(digits.len() == 6 || digits.len() == 8) || !digits.is_ascii() {
+        return None;
+    }
+    let channel = |at: usize| u8::from_str_radix(&digits[at..at + 2], 16).ok();
+    Some([channel(0)?, channel(2)?, channel(4)?])
+}
+
+/// The two ways a picture can be sized to the frame in one go.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Framing {
+    /// The whole picture in the frame, as large as it goes: bars where the
+    /// shapes differ. Every picture's size before it is touched.
+    Fit,
+    /// The frame covered, the picture centred and cut at the edges that
+    /// overhang it.
+    Fill,
+}
+
+/// The scale over the fitted size at which a `picture` (its pixels, after
+/// the crop) turned by `rotation` degrees fits in or covers `frame`,
+/// centred. Scale one is contain-fitted unturned, which is what a picture
+/// is drawn at before it is scaled ([`Clip::scale`]); a turn asks more of a
+/// fill and less of a fit, since a turned rectangle's corners reach
+/// further.
+pub fn framing_scale(
+    framing: Framing,
+    picture: (f64, f64),
+    frame: (f64, f64),
+    rotation: f64,
+) -> Option<f64> {
+    let (cw, ch) = picture;
+    let (width, height) = frame;
+    if !(cw > 0.0 && ch > 0.0 && width > 0.0 && height > 0.0 && rotation.is_finite()) {
+        return None;
+    }
+    let fit = (width / cw).min(height / ch);
+    let (fw, fh) = (cw * fit, ch * fit);
+    let turn = rotation.to_radians();
+    let (cos, sin) = (turn.cos().abs(), turn.sin().abs());
+    let scale = match framing {
+        // The turned picture's bounding box inside the frame.
+        Framing::Fit => (width / (fw * cos + fh * sin)).min(height / (fw * sin + fh * cos)),
+        // The frame, turned into the picture's own axes, inside the picture.
+        Framing::Fill => ((width * cos + height * sin) / fw).max((width * sin + height * cos) / fh),
+    };
+    // Rounded to a millionth, so a fit of an unturned picture is exactly
+    // the one it has always been drawn at, not a hair under.
+    let scale = (scale * 1e6).round() / 1e6;
+    Some(scale.clamp(ranges::MIN_SCALE, ranges::MAX_SCALE))
+}
+
+/// Which shape a clip's mask keeps. The names are written into project
+/// files, so they are stable for ever.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MaskShape {
+    /// The part of the picture on one side of a line through the centre.
+    Linear,
+    /// A band along a line through the centre: the line mirrored.
+    Mirror,
+    /// An ellipse; a circle when its box is square. The default, and what
+    /// the reader falls back to.
+    #[default]
+    Circle,
+    /// A box, its corners rounded by the mask's `roundness`.
+    Rectangle,
+    /// A heart, point down.
+    Heart,
+    /// A five-pointed star, point up.
+    Star,
+}
+
+impl MaskShape {
+    /// Every shape, in the order the pickers list them.
+    pub const ALL: [MaskShape; 6] = [
+        MaskShape::Linear,
+        MaskShape::Mirror,
+        MaskShape::Circle,
+        MaskShape::Rectangle,
+        MaskShape::Heart,
+        MaskShape::Star,
+    ];
+
+    /// The engine's shape.
+    pub fn engine(self) -> concat_core::mask::MaskShape {
+        use concat_core::mask::MaskShape as Engine;
+        match self {
+            MaskShape::Linear => Engine::Linear,
+            MaskShape::Mirror => Engine::Mirror,
+            MaskShape::Circle => Engine::Circle,
+            MaskShape::Rectangle => Engine::Rectangle,
+            MaskShape::Heart => Engine::Heart,
+            MaskShape::Star => Engine::Star,
+        }
+    }
+}
+
+/// A shape that keeps part of a clip's picture: CapCut's Mask. Drawn over
+/// the picture as it is seen - after the crop and the flips, before the
+/// placement - so it moves, scales and turns with the clip, and multiplies
+/// with the cutout's matte and everything else that weighs the picture.
+///
+/// Its numbers other than the shape and the invert can be keyed, as the
+/// placement's can (`KeyProperty::MaskX` and on); a keyed number's keys
+/// replace the constant here.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ClipMask {
+    /// What it keeps.
+    #[serde(deserialize_with = "wire::mask_shape")]
+    pub shape: MaskShape,
+    /// The centre's offset from the picture's centre, as a fraction of the
+    /// picture's width; positive is right.
+    pub x: f64,
+    /// The same down the picture's height; positive is down.
+    pub y: f64,
+    /// The box's width, as a fraction of the picture's shorter side - the
+    /// unit that keeps a circle round on any aspect.
+    pub width: f64,
+    /// The box's height, on the same terms; a mirror's thickness.
+    pub height: f64,
+    /// Clockwise degrees about the mask's centre.
+    pub rotation: f64,
+    /// How round a rectangle's corners are, `0..=1`.
+    pub roundness: f64,
+    /// How soft the edge is, `0..=1`: one fades across half the picture's
+    /// shorter side.
+    pub feather: f64,
+    /// Keeps the outside of the shape instead of the inside.
+    #[serde(skip_serializing_if = "is_false")]
+    pub invert: bool,
+}
+
+impl Default for ClipMask {
+    fn default() -> Self {
+        ClipMask::of(MaskShape::Circle)
+    }
+}
+
+impl ClipMask {
+    /// The smallest a mask's box may be, each way.
+    pub const MIN_SIZE: f64 = 0.01;
+    /// The largest, each way: four times the shorter side covers the
+    /// longest side of any picture a person would mask.
+    pub const MAX_SIZE: f64 = 4.0;
+    /// How far off the picture's centre a mask may be moved, in its sides.
+    pub const MAX_OFFSET: f64 = 2.0;
+
+    /// A mask of `shape` at the size and place a new one starts from: in
+    /// the middle, two thirds of the shorter side across - a band a third
+    /// thick, a rectangle a little wider than tall.
+    pub fn of(shape: MaskShape) -> ClipMask {
+        let (width, height) = match shape {
+            MaskShape::Linear => (1.0, 1.0),
+            MaskShape::Mirror => (1.0, 0.33),
+            MaskShape::Rectangle => (0.8, 0.5),
+            MaskShape::Circle | MaskShape::Heart | MaskShape::Star => (0.66, 0.66),
+        };
+        ClipMask {
+            shape,
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+            rotation: 0.0,
+            roundness: 0.0,
+            feather: 0.0,
+            invert: false,
+        }
+    }
+
+    /// A number held to the range its field may hold; see [`Self::tidy`].
+    /// What a key on that number is held to as well.
+    pub fn clamp(property: KeyProperty, value: f64) -> f64 {
+        match property {
+            KeyProperty::MaskX | KeyProperty::MaskY => {
+                value.clamp(-Self::MAX_OFFSET, Self::MAX_OFFSET)
+            }
+            KeyProperty::MaskWidth | KeyProperty::MaskHeight => {
+                value.clamp(Self::MIN_SIZE, Self::MAX_SIZE)
+            }
+            KeyProperty::MaskRoundness | KeyProperty::MaskFeather => value.clamp(0.0, 1.0),
+            // A turn is a turn however many times round; a key past one is
+            // a spin, so neither is wrapped.
+            _ => value,
+        }
+    }
+
+    /// The number a keyable property names, or None for a property that
+    /// is not the mask's.
+    pub fn get(&self, property: KeyProperty) -> Option<f64> {
+        Some(match property {
+            KeyProperty::MaskX => self.x,
+            KeyProperty::MaskY => self.y,
+            KeyProperty::MaskWidth => self.width,
+            KeyProperty::MaskHeight => self.height,
+            KeyProperty::MaskRotation => self.rotation,
+            KeyProperty::MaskRoundness => self.roundness,
+            KeyProperty::MaskFeather => self.feather,
+            _ => return None,
+        })
+    }
+
+    /// Sets the number a keyable property names, held to its range. A
+    /// property that is not the mask's changes nothing.
+    pub fn set(&mut self, property: KeyProperty, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        let value = Self::clamp(property, value);
+        match property {
+            KeyProperty::MaskX => self.x = value,
+            KeyProperty::MaskY => self.y = value,
+            KeyProperty::MaskWidth => self.width = value,
+            KeyProperty::MaskHeight => self.height = value,
+            KeyProperty::MaskRotation => self.rotation = value,
+            KeyProperty::MaskRoundness => self.roundness = value,
+            KeyProperty::MaskFeather => self.feather = value,
+            _ => {}
+        }
+    }
+
+    /// Every number back in its range, a number that is not one replaced
+    /// by a new mask's.
+    pub fn tidy(self) -> ClipMask {
+        let fresh = ClipMask::of(self.shape);
+        let mut out = self;
+        for property in KeyProperty::MASK {
+            let value = self.get(property).filter(|value| value.is_finite());
+            let value = value.or_else(|| fresh.get(property)).unwrap_or(0.0);
+            out.set(property, value);
+        }
+        out
+    }
+
+    /// The engine's mask with these numbers.
+    pub fn engine(&self) -> concat_core::mask::ShapeMask {
+        concat_core::mask::ShapeMask {
+            shape: self.shape.engine(),
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            rotation: self.rotation,
+            roundness: self.roundness,
+            feather: self.feather,
+            invert: self.invert,
+        }
+    }
+}
+
 /// Which property a user-set key belongs to.
 ///
-/// Five of the six are the picture's; the sixth is the mix's. They are one
+/// Five of the first six are the picture's placement and the sixth is the
+/// mix's; the seven after them are the mask's numbers. They are one
 /// enum because a key is a key - the panel that sets them, the commands that
 /// carry them and the document that stores them do not care which side of
 /// the clip a value ends up on, and only the thing that finally reads them
 /// does.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum KeyProperty {
@@ -627,6 +1074,20 @@ pub enum KeyProperty {
     Opacity,
     /// `Clip::volume`.
     Volume,
+    /// `ClipMask::x`.
+    MaskX,
+    /// `ClipMask::y`.
+    MaskY,
+    /// `ClipMask::width`.
+    MaskWidth,
+    /// `ClipMask::height`.
+    MaskHeight,
+    /// `ClipMask::rotation`.
+    MaskRotation,
+    /// `ClipMask::roundness`.
+    MaskRoundness,
+    /// `ClipMask::feather`.
+    MaskFeather,
 }
 
 impl KeyProperty {
@@ -640,6 +1101,13 @@ impl KeyProperty {
             KeyProperty::Rotation => "rotation",
             KeyProperty::Opacity => "opacity",
             KeyProperty::Volume => "volume",
+            KeyProperty::MaskX => "maskX",
+            KeyProperty::MaskY => "maskY",
+            KeyProperty::MaskWidth => "maskWidth",
+            KeyProperty::MaskHeight => "maskHeight",
+            KeyProperty::MaskRotation => "maskRotation",
+            KeyProperty::MaskRoundness => "maskRoundness",
+            KeyProperty::MaskFeather => "maskFeather",
         }
     }
 
@@ -652,19 +1120,49 @@ impl KeyProperty {
             "rotation" => KeyProperty::Rotation,
             "opacity" => KeyProperty::Opacity,
             "volume" => KeyProperty::Volume,
+            "maskX" => KeyProperty::MaskX,
+            "maskY" => KeyProperty::MaskY,
+            "maskWidth" => KeyProperty::MaskWidth,
+            "maskHeight" => KeyProperty::MaskHeight,
+            "maskRotation" => KeyProperty::MaskRotation,
+            "maskRoundness" => KeyProperty::MaskRoundness,
+            "maskFeather" => KeyProperty::MaskFeather,
             _ => return None,
         })
     }
 
     /// Every property that can be keyed, in the order a panel lists them.
-    pub const ALL: [KeyProperty; 6] = [
+    pub const ALL: [KeyProperty; 13] = [
         KeyProperty::Scale,
         KeyProperty::OffsetX,
         KeyProperty::OffsetY,
         KeyProperty::Rotation,
         KeyProperty::Opacity,
         KeyProperty::Volume,
+        KeyProperty::MaskX,
+        KeyProperty::MaskY,
+        KeyProperty::MaskWidth,
+        KeyProperty::MaskHeight,
+        KeyProperty::MaskRotation,
+        KeyProperty::MaskRoundness,
+        KeyProperty::MaskFeather,
     ];
+
+    /// The mask's numbers: the properties a clip's mask carries.
+    pub const MASK: [KeyProperty; 7] = [
+        KeyProperty::MaskX,
+        KeyProperty::MaskY,
+        KeyProperty::MaskWidth,
+        KeyProperty::MaskHeight,
+        KeyProperty::MaskRotation,
+        KeyProperty::MaskRoundness,
+        KeyProperty::MaskFeather,
+    ];
+
+    /// Whether this is one of the mask's numbers.
+    pub fn is_mask(self) -> bool {
+        KeyProperty::MASK.contains(&self)
+    }
 }
 
 /// How a key is approached from the one before it: a CSS timing function's
@@ -678,6 +1176,7 @@ impl KeyProperty {
 /// Serialised as a bare array: `"ease": [0.42, 0, 0.58, 1]`. Documents
 /// written before the curve editor spell it `"linear"` / `"in"` / `"out"` /
 /// `"inOut"` instead, and `from_value` still reads those.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Debug, Serialize)]
 #[serde(transparent)]
 pub struct KeyEase(pub [f64; 4]);
@@ -804,6 +1303,7 @@ pub struct ClipKey {
 pub const KEY_EPSILON: f64 = 0.002;
 
 /// One point of a speed curve.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeedPoint {
@@ -811,6 +1311,12 @@ pub struct SpeedPoint {
     pub at: f64,
     /// Source seconds per timeline second there.
     pub speed: f64,
+    /// How fast the speed is changing there, speed per unit of `at`, for a
+    /// curve with smooth bends: present on every point of such a curve and
+    /// absent on every point of one joined by straight lines. See
+    /// `concat_core::SpeedCurve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slope: Option<f64>,
 }
 
 /// A clip's Enhance, once it has a copy: see [`Clip::enhanced`].
@@ -823,9 +1329,22 @@ pub struct Enhanced {
     pub copy: String,
     /// Whether the clip shows the copy.
     pub on: bool,
+    /// Seconds into the original the copy starts at: a copy of the span the
+    /// clip covers, rather than of the whole file, starts partway in. The
+    /// clip's in-point is in the copy's seconds while it shows the copy, so
+    /// switching between the two moves it by this much and the same moment
+    /// stays on screen. Zero, and left out of the document, for a copy of
+    /// the whole file.
+    #[serde(default, skip_serializing_if = "is_zero_seconds")]
+    pub offset: f64,
+}
+
+fn is_zero_seconds(seconds: &f64) -> bool {
+    *seconds == 0.0
 }
 
 /// A transition on the cut into a clip.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Transition {
@@ -834,6 +1353,11 @@ pub struct Transition {
     /// Seconds the transition covers.
     #[serde(default = "unity")]
     pub duration: f64,
+    /// The package's knobs as set on this cut, by key; a knob left out is
+    /// at its default. Empty for every transition saved before knobs could
+    /// be set, which play exactly as they did.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, f64>,
 }
 
 /// How a title's lines sit within their block, and which point of the block
@@ -841,6 +1365,7 @@ pub struct Transition {
 /// left-aligned one by its block's left edge and a right-aligned one by its
 /// right edge. Typing more into a left-aligned title grows it to the right
 /// and leaves its left edge where it was, as alignment means everywhere.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TextAlign {
@@ -855,6 +1380,7 @@ pub enum TextAlign {
 
 /// Which figure a shape clip draws. The names are written into project
 /// files, so they are stable for ever.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShapeKind {
@@ -924,6 +1450,7 @@ impl ShapeKind {
 /// How a shape clip is painted. Sizes are fractions of the frame's height,
 /// as a title's are, so a shape composed against 1080p is the same shape at
 /// 4K. A style arriving in a command needs only the fields it changes.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ShapeStyle {
@@ -981,11 +1508,107 @@ impl Default for ShapeStyle {
     }
 }
 
+/// Display casing, independent of the editable source text.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextCase {
+    /// Display all cased letters in uppercase.
+    Upper,
+    /// Display all cased letters in lowercase.
+    Lower,
+    /// Lowercase the text and capitalize sentence initials.
+    Sentence,
+    /// Preserve the editable source's capitalization.
+    #[default]
+    #[serde(other)]
+    Original,
+}
+
+/// What a stretch of a title's words wears over the title's own look: each
+/// field is an override, and one left out is the title's. Every word of a
+/// title is the title's style until a run says otherwise, so a title with
+/// no runs is exactly the title it always was.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RunStyle {
+    /// Fill colour as `#rrggbb`, over the title's `color`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// CSS-scale weight, 100..=900, over the title's `fontWeight`; bold is
+    /// 700, regular 400.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_weight: Option<f64>,
+    /// Italic or upright, over the title's `italic`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub italic: Option<bool>,
+    /// Underlined or not, over the title's `underline`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub underline: Option<bool>,
+    /// Struck through or not, over the title's `strikethrough`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strikethrough: Option<bool>,
+    /// Size as a multiple of the title's `fontSize`, 0.1..=10: 1.5 is half
+    /// as big again. Relative, not a size of its own, so a word made bigger
+    /// stays bigger by as much when the whole title is resized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_scale: Option<f64>,
+    /// Outline colour, over the title's `strokeColor`; shows where the
+    /// title has an outline at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stroke_color: Option<String>,
+}
+
+impl RunStyle {
+    /// No override at all: the title's own look.
+    pub fn is_empty(&self) -> bool {
+        *self == RunStyle::default()
+    }
+
+    /// `over` laid on top of this one: what it says wins, what it leaves
+    /// out stays as this one has it.
+    pub fn and(&self, over: &RunStyle) -> RunStyle {
+        RunStyle {
+            color: over.color.clone().or_else(|| self.color.clone()),
+            font_weight: over.font_weight.or(self.font_weight),
+            italic: over.italic.or(self.italic),
+            underline: over.underline.or(self.underline),
+            strikethrough: over.strikethrough.or(self.strikethrough),
+            font_scale: over.font_scale.or(self.font_scale),
+            stroke_color: over
+                .stroke_color
+                .clone()
+                .or_else(|| self.stroke_color.clone()),
+        }
+    }
+}
+
+/// A stretch of a title's words with a look of its own: some words in
+/// another colour, one in bold. `start` and `end` count characters - Unicode
+/// scalar values, what `str::chars` yields - into the title's `content`,
+/// not bytes, so a caller in any language counts them the way it counts a
+/// string; `end` is one past the last. Kept sorted, apart and non-empty;
+/// see `TextStyle::style_range` and `TextStyle::edit_content`.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextRun {
+    /// The first character the look covers.
+    pub start: usize,
+    /// One past the last.
+    pub end: usize,
+    /// The look.
+    #[serde(flatten)]
+    pub style: RunStyle,
+}
+
 /// A title's styling. Sizes are fractions of the frame, so a title composed
 /// against 1080p lands correctly exported at 4K. A style arriving in a
 /// command needs only the fields it changes; the rest are the default's, so
 /// a caller can say `{ "content": "Hello" }` and get a title that looks like
 /// one the window would place.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TextStyle {
@@ -993,7 +1616,7 @@ pub struct TextStyle {
     /// snapshotted from the first non-empty line.
     pub content: String,
     /// CSS-style family name, quotes included where the name needs them,
-    /// e.g. `"Cabinet Grotesk"`. May name a [`CustomFont`] the user added.
+    /// e.g. `"Hanken Grotesk"`. May name a [`CustomFont`] the user added.
     pub font_family: String,
     /// Cap height as a fraction of frame height.
     pub font_size: f64,
@@ -1002,9 +1625,12 @@ pub struct TextStyle {
     pub font_weight: f64,
     /// Italic when true. A style flag, not a separate face.
     pub italic: bool,
-    /// A bar under each line, in the words' colour and outlined and
-    /// shadowed with them. Off by default.
+    /// Case is applied for painting; the editable source stays intact.
+    pub text_case: TextCase,
+    /// Draw an underline using the selected face's metrics.
     pub underline: bool,
+    /// Draw a strike through the text using the selected face's metrics.
+    pub strikethrough: bool,
     /// Set top to bottom, a column per line with the first on the right,
     /// each letter on its side. The alignment then reads down the frame:
     /// left is the top, right the bottom. Off by default.
@@ -1071,9 +1697,24 @@ pub struct TextStyle {
     /// can be a band of a fixed size whatever is written on it.
     /// https://github.com/jub0t/Concat/issues/119
     pub max_height: f64,
+    /// Stretches of the words with a look of their own over the rest of
+    /// this style - a word in another colour, in bold, bigger. Empty for a
+    /// title in one look, and then not written at all, so a document
+    /// without runs is the document it always was and an older build reads
+    /// a document with them as the title in its own look.
+    #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "wire::list")]
+    pub runs: Vec<TextRun>,
 }
 
 impl TextStyle {
+    /// The words as they are painted: the content in the style's case,
+    /// leaving the content itself - what is typed, saved and exported as
+    /// subtitles - as it was written. See [`TextStyle::display`] for the
+    /// runs that go with it.
+    pub fn display_content(&self) -> String {
+        self.display().0
+    }
+
     /// Every number pulled into the range a title can be drawn at: a
     /// hand-edited zero size would render an invisible title, and lines
     /// cannot collapse onto each other.
@@ -1095,6 +1736,7 @@ impl TextStyle {
             finite(self.background_padding_x, base.background_padding_x).max(0.0);
         self.background_padding_y =
             finite(self.background_padding_y, base.background_padding_y).max(0.0);
+        self.tidy_runs();
         self
     }
 }
@@ -1103,11 +1745,16 @@ impl Default for TextStyle {
     fn default() -> Self {
         Self {
             content: "Your text".to_owned(),
-            font_family: "\"Cabinet Grotesk\"".to_owned(),
+            // The face Concat ships (`concat_text::BUNDLED_FAMILY`), so a
+            // title made without one - by the API, a template, the agent -
+            // is drawn in it everywhere rather than in a fallback.
+            font_family: "Hanken Grotesk".to_owned(),
             font_size: 0.09,
             font_weight: 700.0,
             italic: false,
+            text_case: TextCase::Original,
             underline: false,
+            strikethrough: false,
             vertical: false,
             background_shape: String::new(),
             background_outline: String::new(),
@@ -1126,6 +1773,7 @@ impl Default for TextStyle {
             tracking: 0.0,
             max_width: 0.0,
             max_height: 0.0,
+            runs: Vec::new(),
         }
     }
 }
@@ -1143,7 +1791,9 @@ pub(crate) mod wire {
     use serde::{Deserialize, Deserializer};
     use serde_json::Value;
 
-    use super::{ClipKind, ColorSpace, MediaKind, ParamKey, ShapeKind, TextAlign};
+    use super::{
+        Background, ClipKind, ColorSpace, MaskShape, MediaKind, ParamKey, ShapeKind, TextAlign,
+    };
 
     /// The entries of a list that parse, in order; not a list at all is
     /// an empty one.
@@ -1231,8 +1881,24 @@ pub(crate) mod wire {
         Ok(serde_json::from_value(value).unwrap_or(TextAlign::Center))
     }
 
+    /// A background that parses, tidied, or black for one this build does
+    /// not know - a kind from a newer build opens as no background rather
+    /// than not at all.
+    pub fn background<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Background, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Ok(serde_json::from_value::<Background>(value)
+            .map(Background::tidy)
+            .unwrap_or_default())
+    }
+
     /// A shape by name, a square for one this build does not know.
     pub fn shape_kind<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ShapeKind, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Ok(serde_json::from_value(value).unwrap_or_default())
+    }
+
+    /// A mask's shape, or a circle for one this build does not know.
+    pub fn mask_shape<'de, D: Deserializer<'de>>(deserializer: D) -> Result<MaskShape, D::Error> {
         let value = Value::deserialize(deserializer)?;
         Ok(serde_json::from_value(value).unwrap_or_default())
     }
@@ -1364,10 +2030,19 @@ pub struct Clip {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "wire::maybe")]
     pub cutout: Option<Cutout>,
+    /// The shape that keeps part of the picture; see [`ClipMask`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "wire::maybe")]
+    pub mask: Option<ClipMask>,
+    /// The camera's shake taken out; see [`Stabilize`]. None is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "wire::maybe")]
+    pub stabilize: Option<Stabilize>,
     /// Keep voices at their natural pitch when `speed` is not 1. On by
     /// default; off gives the tape-machine chipmunk/slow-motion sound.
     pub preserve_pitch: bool,
-    /// Audio filters, in order - order is audible.
+    /// Audio filters, in order - order is audible. On a sound layer, the
+    /// chain it runs over the mix.
     #[serde(default)]
     #[serde(deserialize_with = "wire::list")]
     pub filters: Vec<AppliedFilter>,
@@ -1406,6 +2081,14 @@ pub struct Clip {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "wire::maybe")]
     pub shape: Option<ShapeStyle>,
+    /// What fills the frame behind this clip's picture, over the
+    /// timeline's [`Timeline::background`]: None follows the timeline's,
+    /// and `Some(Background::None)` is black under a timeline that has one.
+    /// Only a picture on the lowest picture lane has a background at all;
+    /// see [`Timeline::background_of`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "wire::maybe")]
+    pub background: Option<Background>,
     /// Fields this build does not know, kept so a document written by a
     /// newer or a different build round-trips through this one intact.
     #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
@@ -1493,6 +2176,8 @@ impl Clip {
             blend: String::new(),
             crop: None,
             cutout: None,
+            mask: None,
+            stabilize: None,
             filters: Vec::new(),
             video_effects: Vec::new(),
             audio_stream: None,
@@ -1502,6 +2187,7 @@ impl Clip {
             enhanced: None,
             text: None,
             shape: None,
+            background: None,
             extra: Map::new(),
         }
     }
@@ -1538,6 +2224,7 @@ impl Clip {
                 .map(|point| SpeedPoint {
                     at: point.at,
                     speed: finite(point.speed, 1.0).clamp(MIN_SPEED, MAX_SPEED),
+                    slope: point.slope.filter(|slope| slope.is_finite()),
                 })
                 .collect();
             (!points.is_empty()).then_some(points)
@@ -1548,8 +2235,13 @@ impl Clip {
             .map(Crop::tidy)
             .filter(|crop| !crop.is_none());
         self.cutout = self.cutout.take().map(Cutout::tidy);
+        self.mask = self.mask.take().map(ClipMask::tidy);
+        self.stabilize = self.stabilize.take().map(Stabilize::tidy);
         if let Some(transition) = self.transition_in.as_mut() {
             transition.duration = finite(transition.duration, 1.0).max(MIN_TRANSITION);
+            // A knob that is not a number would save as null and make the
+            // project unreadable: it goes, and the knob is at its default.
+            transition.params.retain(|_, value| value.is_finite());
         }
         self.keys
             .retain(|key| (0.0..=1.0).contains(&key.at) && key.value.is_finite());
@@ -1565,6 +2257,7 @@ impl Clip {
                     key.value.clamp(-MAX_OFFSET, MAX_OFFSET)
                 }
                 KeyProperty::Rotation => key.value,
+                mask => ClipMask::clamp(mask, key.value),
             };
         }
         self.sort_keys();
@@ -1575,6 +2268,7 @@ impl Clip {
         }
         self.text = self.text.take().map(TextStyle::tidy);
         self.shape = self.shape.take().map(ShapeStyle::tidy);
+        self.background = self.background.take().map(Background::tidy);
         if self.muted == Some(false) {
             self.muted = None;
         }
@@ -1591,6 +2285,72 @@ impl Clip {
             KeyProperty::Rotation => self.rotation,
             KeyProperty::Opacity => self.opacity,
             KeyProperty::Volume => self.volume,
+            // A clip with no mask answers with a new one's numbers, so a
+            // panel opening on it shows what the first shape will start at.
+            mask => self.mask.unwrap_or_default().get(mask).unwrap_or_default(),
+        }
+    }
+
+    /// The scale at which this clip's picture, from media `width` by
+    /// `height` and through its crop, fits in or covers a `frame`, turned as
+    /// it is at `at` (`0..=1` of the clip); see [`framing_scale`]. None for a
+    /// clip that is not a picture, or a size nobody knows.
+    pub fn framing_scale(
+        &self,
+        framing: Framing,
+        media: (Option<u32>, Option<u32>),
+        frame: (u32, u32),
+        at: f64,
+    ) -> Option<f64> {
+        if !self.kind.is_visual() {
+            return None;
+        }
+        let (width, height) = (f64::from(media.0?), f64::from(media.1?));
+        let crop = self.crop.unwrap_or_default().tidy();
+        let picture = (
+            width * (1.0 - crop.left - crop.right),
+            height * (1.0 - crop.top - crop.bottom),
+        );
+        let rotation = if self.is_keyed(KeyProperty::Rotation) {
+            self.value_at(KeyProperty::Rotation, at)
+        } else {
+            self.rotation
+        };
+        framing_scale(
+            framing,
+            picture,
+            (f64::from(frame.0), f64::from(frame.1)),
+            rotation,
+        )
+    }
+
+    /// Writes a keyable property the way an edit means it: the constant
+    /// while the property has no keys, and once it rides, a key at `at`
+    /// (`0..=1` of the clip), with the ease of the key behind it. A keyed
+    /// property no longer reads its constant, so writing that would change
+    /// nothing anyone could see.
+    pub fn write_at(&mut self, property: KeyProperty, value: f64, at: f64) {
+        if self.is_keyed(property) {
+            let ease = self
+                .keys_on(property)
+                .rfind(|key| key.at < at)
+                .map_or(KeyEase::LINEAR, |key| key.ease);
+            self.set_key(property, at, value, ease);
+            return;
+        }
+        match property {
+            KeyProperty::Scale => self.scale = value,
+            KeyProperty::OffsetX => self.offset_x = value,
+            KeyProperty::OffsetY => self.offset_y = value,
+            KeyProperty::Rotation => self.rotation = value,
+            KeyProperty::Opacity => self.opacity = value,
+            KeyProperty::Volume => self.volume = value,
+            // The mask's numbers are the mask's; a number written on a
+            // clip with none puts one on, the shape a new one starts as.
+            mask => self
+                .mask
+                .get_or_insert_with(ClipMask::default)
+                .set(mask, value),
         }
     }
 
@@ -1841,6 +2601,14 @@ pub struct Timeline {
     /// what a second timeline is for.
     #[serde(default)]
     pub video: VideoSettings,
+    /// What fills the frame behind the pictures on the lowest picture lane,
+    /// where they do not reach it; see [`Timeline::background_of`]. The
+    /// timeline's rather than [`VideoSettings`]' because that is the four
+    /// numbers a frame is, copied and compared everywhere, and this names
+    /// media. Black, and left out of the document, until one is chosen.
+    #[serde(default, skip_serializing_if = "Background::is_none")]
+    #[serde(deserialize_with = "wire::background")]
+    pub background: Background,
     /// The lanes, top to bottom. Never empty - `RemoveTrack` keeps a floor
     /// of one.
     #[serde(deserialize_with = "wire::list")]
@@ -1854,6 +2622,14 @@ pub struct Timeline {
     /// [`Timeline::clip_mut`]). Reading through the `Arc` is transparent.
     #[serde(deserialize_with = "wire::list")]
     pub clips: Vec<Arc<Clip>>,
+    /// Linkage: whether the other lanes follow an edit that closes up or
+    /// opens the main lane ([`Timeline::background_lane`]), so a caption,
+    /// a title, an overlay or a sound placed against the footage stays on
+    /// the frames it was placed against. CapCut's Linkage, Final Cut's
+    /// connected clips. On unless turned off, and left out of the document
+    /// while on.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub linkage: bool,
     /// Fields this build does not know, kept so they round-trip.
     #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
     pub extra: Map<String, Value>,
@@ -1865,8 +2641,10 @@ impl Default for Timeline {
             id: String::new(),
             name: "Timeline".to_owned(),
             video: VideoSettings::default(),
+            background: Background::None,
             tracks: Vec::new(),
             clips: Vec::new(),
+            linkage: true,
             extra: Map::new(),
         }
     }
@@ -1875,6 +2653,7 @@ impl Default for Timeline {
 /// The colour a picture is in: SDR on Rec. 709, or HDR on Rec. 2020 with
 /// the hybrid log-gamma or the perceptual quantiser transfer. A timeline's
 /// is what it is output in; a media file's, what it was recorded in.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ColorSpace {
@@ -1908,6 +2687,7 @@ impl ColorSpace {
 /// rate, so a build that predates this reads the document it always did,
 /// and a document from such a build gives every timeline that block on the
 /// way in.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoSettings {
@@ -1926,6 +2706,78 @@ pub struct VideoSettings {
     #[serde(default, skip_serializing_if = "ColorSpace::is_sdr")]
     #[serde(deserialize_with = "wire::color_space")]
     pub color_space: ColorSpace,
+    /// What shows where no picture covers the frame - a gap, the space
+    /// around a title, a clip fading in - as straight `[r, g, b, a]`,
+    /// written `#rrggbb` in the document, or `#rrggbbaa` when it lets
+    /// something show through: opaque black unless the project was given
+    /// another (#456). Alpha zero is a transparent frame, for an overlay
+    /// exported in a format that keeps alpha; a format that does not
+    /// gets black there. Left out of the document while it is opaque
+    /// black, so those documents stay as they were.
+    #[serde(
+        default = "opaque_black",
+        skip_serializing_if = "is_black",
+        with = "hex_rgba"
+    )]
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub canvas: [u8; 4],
+}
+
+/// The canvas every project had before it could be given one.
+pub const OPAQUE_BLACK: [u8; 4] = [0, 0, 0, 255];
+
+/// A canvas written as a bare array of channels, as the recents list and
+/// the export and preview requests carry it: `[r, g, b, a]`, or `[r, g, b]`
+/// as it was written before the canvas had an alpha, which is opaque. Any
+/// other shape is opaque black, so one odd entry does not lose the rest of
+/// what it is read with.
+pub fn rgba_array<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<[u8; 4], D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let channels: Option<Vec<u8>> = value.as_array().and_then(|items| {
+        items
+            .iter()
+            .map(|item| item.as_u64().and_then(|n| u8::try_from(n).ok()))
+            .collect()
+    });
+    Ok(match channels.as_deref() {
+        Some(&[r, g, b]) => [r, g, b, 255],
+        Some(&[r, g, b, a]) => [r, g, b, a],
+        _ => OPAQUE_BLACK,
+    })
+}
+
+fn opaque_black() -> [u8; 4] {
+    OPAQUE_BLACK
+}
+
+fn is_black(rgba: &[u8; 4]) -> bool {
+    *rgba == OPAQUE_BLACK
+}
+
+/// A colour kept as four straight channels and written the way the
+/// document writes every colour: `#rrggbb` while it is opaque,
+/// `#rrggbbaa` when it is not. One that does not read is opaque black.
+pub mod hex_rgba {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// `#rrggbb`, or `#rrggbbaa` short of opaque; lower case.
+    pub fn serialize<S: Serializer>(rgba: &[u8; 4], serializer: S) -> Result<S::Ok, S::Error> {
+        let [r, g, b, a] = *rgba;
+        serializer.serialize_str(&if a == 255 {
+            format!("#{r:02x}{g:02x}{b:02x}")
+        } else {
+            format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
+        })
+    }
+
+    /// `#rrggbb` (opaque) or `#rrggbbaa`; opaque black for anything else.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u8; 4], D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(value
+            .as_str()
+            .and_then(super::rgba_of)
+            .unwrap_or(super::OPAQUE_BLACK))
+    }
 }
 
 impl Default for VideoSettings {
@@ -1938,6 +2790,7 @@ impl Default for VideoSettings {
             rate_num: 30,
             rate_den: 1,
             color_space: ColorSpace::Sdr,
+            canvas: OPAQUE_BLACK,
         }
     }
 }
@@ -1989,6 +2842,7 @@ impl VideoSettings {
                 fallback.rate_den
             },
             color_space: self.color_space,
+            canvas: self.canvas,
         }
     }
 
@@ -2076,6 +2930,7 @@ impl Project {
                 id: "TL1".to_owned(),
                 name: "Timeline 1".to_owned(),
                 video,
+                background: Background::None,
                 tracks: (1..=4)
                     .map(|number| Track {
                         id: format!("T{number}"),
@@ -2083,6 +2938,7 @@ impl Project {
                     })
                     .collect(),
                 clips: Vec::new(),
+                linkage: true,
                 extra: Map::new(),
             })],
             active_timeline_id: "TL1".to_owned(),
@@ -2201,6 +3057,46 @@ impl Timeline {
     /// The track with this id, or None if it was removed.
     pub fn track(&self, track_id: &str) -> Option<&Track> {
         self.tracks.iter().find(|track| track.id == track_id)
+    }
+
+    /// The lane whose pictures have a background: the lowest lane holding a
+    /// video or a still - the main picture of the cut, where CapCut has its
+    /// main track. Lowest rather than simply the first lane, so a cut whose
+    /// bottom lane holds only music still has one. None for a timeline
+    /// without a picture.
+    pub fn background_lane(&self) -> Option<&str> {
+        self.tracks
+            .iter()
+            .find(|track| {
+                self.clips
+                    .iter()
+                    .any(|clip| clip.track_id == track.id && clip.kind.is_visual())
+            })
+            .map(|track| track.id.as_str())
+    }
+
+    /// What fills the frame behind `clip`: its own background, else the
+    /// timeline's, for a video or a still on [`Timeline::background_lane`];
+    /// None for any other clip, and for one whose background is black.
+    /// Titles, shapes and pictures on the lanes above sit over the frame the
+    /// main picture and its background have already filled, so they never
+    /// have one of their own.
+    pub fn background_of<'a>(&'a self, clip: &'a Clip) -> Option<&'a Background> {
+        self.background_on(clip, self.background_lane())
+    }
+
+    /// [`Timeline::background_of`] with the lane found once, by
+    /// [`Timeline::background_lane`], for a caller asking of every clip.
+    pub fn background_on<'a>(
+        &'a self,
+        clip: &'a Clip,
+        lane: Option<&str>,
+    ) -> Option<&'a Background> {
+        if !clip.kind.is_visual() || lane != Some(clip.track_id.as_str()) {
+            return None;
+        }
+        let background = clip.background.as_ref().unwrap_or(&self.background);
+        (!background.is_none()).then_some(background)
     }
 
     /// Where the last clip ends. Zero for an empty timeline.

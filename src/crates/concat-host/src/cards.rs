@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Effect cards: every picture package's still, drawn by the package.
 //!
@@ -33,21 +33,22 @@ use concat_effects::{At, Catalogue, Package};
 use concat_media::{DecodeOptions, Decoder, FrameSource};
 use concat_render::{Compositor, FramePlan, PlannedLayer, WgpuCompositor, detached_clip};
 
-/// A card's width in pixels: 16:9, and twice the widest a card is shown,
-/// for a high-density screen.
-pub const WIDTH: u32 = 480;
+/// A card's width in pixels: square, and twice the widest a card is
+/// shown, for a high-density screen.
+pub const WIDTH: u32 = 360;
 
 /// A card's height in pixels.
-pub const HEIGHT: u32 = 270;
+pub const HEIGHT: u32 = 360;
 
-/// The picture every card is drawn from: a person in a bright, colourful
-/// room, so a look has skin, saturated colour, shadow and highlight to
-/// work on.
+/// The picture every card is drawn from, square like the cards: a person
+/// in hard daylight under a blue sky, against yellow and navy bars and a
+/// red roof, so a look has skin, saturated colour, edges, shadow and
+/// highlight to work on.
 pub const STILL: &[u8] = include_bytes!("../assets/card-still.jpg");
 
 /// Bumped whenever the way a card is drawn changes - the still, the moment,
 /// the title, the size, the encoding - so every kept card is drawn again.
-const EDITION: u64 = 1;
+const EDITION: u64 = 2;
 
 /// The instant a card shows, in seconds into its clip: late enough that a
 /// reveal is under way and a pulse is lit, early enough that a one-shot
@@ -297,8 +298,11 @@ impl Painter {
             Drawing::Title(pass) => {
                 let (title, reveal) = self.title(width, height)?;
                 let ground = PlannedLayer::picture(detached_clip(), Arc::clone(&self.still));
+                let overscan = (title.width() as f32 / width as f32)
+                    .max(title.height() as f32 / height as f32);
                 let mut words = PlannedLayer::picture(detached_clip(), title);
                 words.track = 1;
+                words.overscan = overscan;
                 let mut pass = pass.clone();
                 pass.reveal_map = Some(reveal);
                 words.effects = vec![pass];
@@ -338,6 +342,8 @@ impl Painter {
             font_size: 0.26,
             font_weight: 800.0,
             italic: false,
+            underline: false,
+            strikethrough: false,
             color: "#ffffff".to_owned(),
             align: concat_text::Align::Center,
             stroke_width: 0.0,
@@ -351,11 +357,11 @@ impl Painter {
             tracking: 0.0,
             max_width: 0.0,
             max_height: 0.0,
-            underline: false,
             vertical: false,
             background_shape: concat_text::PlateShape::Box,
             background_outline: String::new(),
             gradient: String::new(),
+            runs: Vec::new(),
         };
         let fonts = concat_text::Fonts::new();
         let rendered = concat_text::render_frame(&fonts, &style, width, height)
@@ -365,7 +371,13 @@ impl Painter {
             .iter()
             .map(|word| (word.x, word.y, word.width, word.height))
             .collect();
-        let reveal = Arc::new(RevealMap::from_rects(width, height, &rects));
+        // The canvas's size, which is the still's unless the words ran
+        // past its edges.
+        let reveal = Arc::new(RevealMap::from_rects(
+            rendered.width,
+            rendered.height,
+            &rects,
+        ));
         let frame = Arc::new(
             Frame::from_rgba(rendered.width, rendered.height, rendered.rgba)
                 .ok_or("the title came back the wrong size")?,
@@ -399,6 +411,12 @@ fn turned(still: &Frame) -> Frame {
 /// adapter is to be had - handing their ids to `report` a few at a time as
 /// they land, so a shelf fills as it goes, and a last time with `done`. A
 /// card that fails is logged and skipped: its package shows no picture.
+///
+/// On a software adapter - WARP, lavapipe, the Android emulator's
+/// SwiftShader, a safe start's CONCAT_GPU=software - none are drawn unless
+/// CONCAT_REQUIRE_GPU is set: there the hundred cards are every pixel
+/// through the CPU, an hour and more on WARP, and on CI's API 30 emulator
+/// they froze the whole device. The shelves show their names alone.
 pub fn draw_all(
     dir: &Path,
     cards: &[Card],
@@ -409,7 +427,13 @@ pub fn draw_all(
     let painter = compositor
         .or_else(WgpuCompositor::new)
         .ok_or_else(|| "no GPU or software renderer is available to draw with".to_owned())
-        .and_then(|compositor| Painter::new(compositor, &still_in(dir)?, WIDTH, HEIGHT));
+        .and_then(|compositor| {
+            if compositor.on_software_adapter() && std::env::var_os("CONCAT_REQUIRE_GPU").is_none()
+            {
+                return Err("a software adapter only; the cards are left undrawn".to_owned());
+            }
+            Painter::new(compositor, &still_in(dir)?, WIDTH, HEIGHT)
+        });
     let mut painter = match painter {
         Ok(painter) => painter,
         Err(error) => {
@@ -446,12 +470,12 @@ fn checker(width: u32, height: u32) -> Frame {
     frame
 }
 
-/// The still before a screen of `colour`: everything left of the person
-/// in the middle, and right of him, painted that colour, as a key's card
-/// needs something to take out.
+/// The still before a screen of `colour`: everything left of the person,
+/// and the strip right of her shoulder, painted that colour, as a key's
+/// card needs something to take out.
 fn screened(still: &Frame, [r, g, b]: [u8; 3]) -> Frame {
     let (width, height) = (still.width(), still.height());
-    let (left, right) = (width * 33 / 100, width * 80 / 100);
+    let (left, right) = (width * 30 / 100, width * 92 / 100);
     let mut out = still.clone();
     for y in 0..height {
         for x in (0..left).chain(right..width) {
@@ -497,6 +521,20 @@ mod tests {
 
     /// Every picture package has a card and every sound has none, each
     /// under a name of its own.
+    /// Draws every built-in card into `CONCAT_CARDS_OUT` on this machine's
+    /// GPU, for `scripts/bundle-cards.sh` to copy into the binary's set:
+    /// `CONCAT_CARDS_OUT=/tmp/cards cargo test -p concat-host --lib --
+    /// --ignored draw_every_card`.
+    #[test]
+    #[ignore = "needs a GPU and writes the cards to a folder of your choosing"]
+    fn draw_every_card() {
+        let dir = PathBuf::from(std::env::var("CONCAT_CARDS_OUT").expect("CONCAT_CARDS_OUT"));
+        let cards = cards(Catalogue::builtin(), &dir);
+        let mut drawn = 0;
+        draw_all(&dir, &cards, None, |batch, _| drawn += batch.len());
+        assert_eq!(drawn, cards.len(), "every card is drawn");
+    }
+
     #[test]
     fn every_picture_package_has_a_card_of_its_own() {
         let catalogue = Catalogue::builtin();

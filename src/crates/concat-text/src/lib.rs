@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Titles as pixels.
 //!
@@ -14,6 +14,15 @@
 //! canvas that *is* the frame fits at exactly one, decodes without resampling,
 //! and puts the canvas's centre where the clip's centre is. The clip's offset
 //! and rotation then mean the same thing for a title as for footage.
+//!
+//! Frame-sized at the least, that is. Ink past the frame's edges - a box
+//! pulled wider than the frame, a word too long for any line, the outline,
+//! shadow or lean of letters on a line as wide as the frame - would be cut
+//! off at the canvas's edge, and a title scaled down, moved or turned
+//! showed the cut. The canvas grows instead, by the same margin either
+//! side, so its centre stays the clip's centre; [`Rendered::overscan`] says
+//! by how much, for the compositor to draw it at one pixel to one rather
+//! than fit it into the frame.
 //!
 //! Where the block sits on that canvas is the alignment's to say. A centred
 //! title has its block centred, so the clip's position is the block's middle.
@@ -269,6 +278,10 @@ pub struct TitleStyle {
     pub font_weight: f64,
     /// Italic when true.
     pub italic: bool,
+    /// Decorations share the glyph fill, outline and shadow.
+    pub underline: bool,
+    /// A rule through each line using the selected face's strike metrics.
+    pub strikethrough: bool,
     /// Fill colour as `#rrggbb` or `#rrggbbaa`.
     pub color: String,
     /// Line alignment within the block.
@@ -302,9 +315,6 @@ pub struct TitleStyle {
     /// own. With a height the block is a box that tall, at least, and the
     /// words sit centred in it.
     pub max_height: f64,
-    /// A bar under each line, part of the words: filled, outlined and
-    /// shadowed as they are.
-    pub underline: bool,
     /// Set top to bottom: the lines laid out as they would be across, then
     /// the whole block turned a quarter clockwise, so the first line is the
     /// right-hand column and each letter lies on its side. The alignment
@@ -320,6 +330,36 @@ pub struct TitleStyle {
     /// A second fill colour, `#rrggbb[aa]`: the words run from `color` at
     /// the top of the block to this at the bottom. Empty for one colour.
     pub gradient: String,
+    /// Stretches of the words in a look of their own over the rest; see
+    /// [`TitleRun`]. Empty for a title in one look.
+    pub runs: Vec<TitleRun>,
+}
+
+/// Some of a title's words in a look of their own: the characters
+/// `start..end` of the content - characters, not bytes - and the fields
+/// they wear instead of the title's. A field left out is the title's. The
+/// document's run, field for field.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct TitleRun {
+    /// The first character.
+    pub start: usize,
+    /// One past the last.
+    pub end: usize,
+    /// Fill colour as `#rrggbb[aa]`.
+    pub color: Option<String>,
+    /// CSS-scale weight; the face is picked for it, as for the title's.
+    pub font_weight: Option<f64>,
+    /// Italic or upright.
+    pub italic: Option<bool>,
+    /// Underlined or not.
+    pub underline: Option<bool>,
+    /// Struck through or not.
+    pub strikethrough: Option<bool>,
+    /// The em as a multiple of the title's; a line with a bigger word in
+    /// it is as tall as that word.
+    pub font_scale: Option<f64>,
+    /// Outline colour, where the title has an outline.
+    pub stroke_color: Option<String>,
 }
 
 /// One word's box in canvas pixels, top-left origin, in reading order
@@ -344,10 +384,12 @@ pub struct WordRect {
 pub struct RenderedFrame {
     /// The canvas, `width` by `height` RGBA, alpha straight.
     pub rgba: Vec<u8>,
-    /// The canvas width: the frame's.
+    /// See [`Rendered::width`].
     pub width: u32,
-    /// The canvas height: the frame's.
+    /// See [`Rendered::height`].
     pub height: u32,
+    /// See [`Rendered::overscan`].
+    pub overscan: f64,
     /// See [`Rendered::block_width`].
     pub block_width: u32,
     /// See [`Rendered::block_height`].
@@ -365,10 +407,18 @@ pub struct RenderedFrame {
 pub struct Rendered {
     /// The canvas, PNG-encoded, RGBA with alpha.
     pub png: Vec<u8>,
-    /// The canvas width: the frame's.
+    /// The canvas width: the frame's, and more where the title's ink runs
+    /// past the frame's left or right edge - the same margin either side.
     pub width: u32,
-    /// The canvas height: the frame's.
+    /// The canvas height: the frame's, grown the same way for ink past the
+    /// top or the bottom.
     pub height: u32,
+    /// How many times the frame the canvas is, along the axis it grew the
+    /// most: one for a title inside the frame, which is nearly every title.
+    /// A picture this many times the frame is drawn at one canvas pixel to
+    /// one frame pixel, where the compositor would otherwise fit the whole
+    /// canvas into the frame.
+    pub overscan: f64,
     /// The painted block's width in pixels, plate included - what an
     /// outline on a monitor should be drawn around.
     pub block_width: u32,
@@ -527,18 +577,103 @@ pub const BASE_FONTS: [&[u8]; 41] = [
     include_bytes!("../fonts/ZenTokyoZoo-Regular.ttf"),
 ];
 
+/// Noto Sans CJK SC, cut to GB 2312, Big5 level 1, JIS X 0208, KS X 1001's
+/// Hangul, the kana, the CJK punctuation and fullwidth forms, and every
+/// character in the shipped locales. Under three megabytes rather than
+/// sixteen. Japanese and Traditional Chinese read in the Simplified face's
+/// forms where the regions differ; a machine's own font for them comes
+/// first.
+pub const NOTO_SANS_CJK_SC: &[u8] = include_bytes!("../fonts/NotoSansCJKsc-Concat.otf");
+
+/// Noto Sans Arabic UI 2.011, for Arabic, Persian and Urdu: the UI cut,
+/// whose ascent and descent fit a line of Latin, where Noto Sans Arabic's
+/// would stand taller than the rows it is put in. Urdu reads in its
+/// Naskh-like forms, not Nastaliq; every Urdu letter is there. From
+/// https://github.com/notofonts/arabic/releases/download/NotoSansArabicUI-v2.011/NotoSansArabicUI-v2.011.zip
+/// (SHA-256 f775ee259557195721466e99ec0316bbcd897f0429e25955f5d9582ca1202ce7).
+pub const NOTO_SANS_ARABIC_UI: &[u8] = include_bytes!("../fonts/NotoSansArabicUI-Concat.ttf");
+
+/// Noto Sans Hebrew 3.001. From
+/// https://github.com/notofonts/hebrew/releases/download/NotoSansHebrew-v3.001/NotoSansHebrew-v3.001.zip
+/// (SHA-256 df0a71814b4e63644cf40fcc4529111b61266b7a2dafbe95068b29a7520cc3cb).
+pub const NOTO_SANS_HEBREW: &[u8] = include_bytes!("../fonts/NotoSansHebrew-Concat.ttf");
+
+/// Noto Sans Devanagari 2.007, for Hindi. From
+/// https://github.com/notofonts/devanagari/releases/download/NotoSansDevanagari-v2.007/NotoSansDevanagari-v2.007.zip
+/// (SHA-256 820c7da45b1e63562cb41c0a8cac5d9a4202312043a3a040ed1325857ef469b1).
+pub const NOTO_SANS_DEVANAGARI: &[u8] = include_bytes!("../fonts/NotoSansDevanagari-Concat.ttf");
+
+/// Noto Sans Bengali 3.011. From
+/// https://github.com/notofonts/bengali/releases/download/NotoSansBengali-v3.011/NotoSansBengali-v3.011.zip
+/// (SHA-256 2aca24bf71665e66c32e14862ee58857dd8b8b07b6321ec7c96f3121ad6683b1).
+pub const NOTO_SANS_BENGALI: &[u8] = include_bytes!("../fonts/NotoSansBengali-Concat.ttf");
+
+/// Noto Sans Thai 2.002, the loopless face Thai interfaces are set in.
+/// From https://github.com/notofonts/thai/releases/download/NotoSansThai-v2.002/NotoSansThai-v2.002.zip
+/// (SHA-256 af889cc673fc714060ce5e4e088fbad32aa4c0571a19958efeaff128a22da485).
+pub const NOTO_SANS_THAI: &[u8] = include_bytes!("../fonts/NotoSansThai-Concat.ttf");
+
+/// A face for each script the base fonts have no glyphs for, which every
+/// title falls back on after the machine's own fonts: a caption in Thai,
+/// Arabic or Korean draws its words wherever it is painted, not boxes on a
+/// phone with no font of its own to lend. Each is the static Regular
+/// instance from the notofonts releases, unhinted, cut with fonttools'
+/// `pyftsubset` to the script's whole basic block, Latin-1, the general
+/// punctuation, U+25CC (the dotted circle the shaper puts under a mark
+/// with nothing to sit on) and every character the shipped locales use,
+/// with every layout feature kept so the joining and conjuncts still shape:
+///
+/// ```text
+/// pyftsubset <face>-Regular.ttf --unicodes=<block>,U+0020-007E,U+00A0-00FF,U+2000-206F,U+25CC \
+///     --text-file=<every locale's characters> --layout-features='*' --no-hinting \
+///     --notdef-outline --name-IDs=0,1,2,3,4,5,6,13,14 --output-file=<face>-Concat.ttf
+/// ```
+///
+/// The licences are `fonts/LICENSE-<face>.txt`. The window registers the
+/// same bytes as its interface's fallbacks (concat's fonts.rs).
+pub const SCRIPT_FALLBACKS: [&[u8]; 6] = [
+    NOTO_SANS_CJK_SC,
+    NOTO_SANS_ARABIC_UI,
+    NOTO_SANS_HEBREW,
+    NOTO_SANS_DEVANAGARI,
+    NOTO_SANS_BENGALI,
+    NOTO_SANS_THAI,
+];
+
 /// Faces that used to be bundled and no longer are: a document that names
 /// one is painted in the bundled face, not in whatever the system offers
 /// for a name it does not know.
 const RETIRED: [&str; 2] = ["Helvetica Neue", "Synonym"];
 
 impl Fonts {
-    /// The bundled face and the system's fonts.
+    /// The bundled faces, the system's fonts, and a face for every script
+    /// the bundled ones lack.
     pub fn new() -> Fonts {
+        Fonts::with_system(true)
+    }
+
+    /// The faces titles can use, the machine's own among them or not. The
+    /// machine's come first, so where it has a face for a script, at the
+    /// title's weight, that face draws it; the script fallbacks come last.
+    fn with_system(system: bool) -> Fonts {
         let mut db = fontdb::Database::new();
-        db.load_system_fonts();
+        if system {
+            db.load_system_fonts();
+            // fontdb knows a desk's font folders and not a phone's, so on a
+            // phone the system had lent titles nothing: every script the
+            // bundled faces lack was boxes.
+            #[cfg(target_os = "android")]
+            for dir in ["/system/fonts", "/product/fonts"] {
+                db.load_fonts_dir(dir);
+            }
+            #[cfg(target_os = "ios")]
+            db.load_fonts_dir("/System/Library/Fonts");
+        }
         for face in BUNDLED.iter().chain(BASE_FONTS.iter()) {
             db.load_font_data(face.to_vec());
+        }
+        for face in SCRIPT_FALLBACKS {
+            db.load_font_source(fontdb::Source::Binary(Arc::new(face)));
         }
         Fonts {
             db,
@@ -598,17 +733,20 @@ fn family_names(db: &fontdb::Database) -> Vec<String> {
 impl Fonts {
     /// The best face for a style: the named family at the nearest weight and
     /// slant, then any sans-serif, then anything at all.
+    #[cfg(test)]
     fn pick(&self, style: &TitleStyle) -> Result<fontdb::ID, Error> {
-        let mut family = style
-            .font_family
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'');
+        self.pick_face(&style.font_family, style.font_weight, style.italic)
+    }
+
+    /// [`Fonts::pick`] for one look of a title: its family, at a weight
+    /// and slant that may be a run's rather than the title's.
+    fn pick_face(&self, family: &str, weight: f64, italic: bool) -> Result<fontdb::ID, Error> {
+        let mut family = family.trim().trim_matches('"').trim_matches('\'');
         if RETIRED.contains(&family) {
             family = BUNDLED_FAMILY;
         }
-        let weight = fontdb::Weight(style.font_weight.clamp(100.0, 900.0).round() as u16);
-        let slant = if style.italic {
+        let weight = fontdb::Weight(weight.clamp(100.0, 900.0).round() as u16);
+        let slant = if italic {
             fontdb::Style::Italic
         } else {
             fontdb::Style::Normal
@@ -631,49 +769,98 @@ impl Fonts {
     }
 
     /// The faces a title is set in and which of them sets each character.
-    ///
-    /// The style's own face sets everything it has a glyph for. A character
-    /// it lacks is lent by another face that can draw it - one the title
-    /// already borrows from if one can, so a line of Japanese is not set in
-    /// three faces, else the nearest in weight and slant. What nothing can
-    /// draw stays with the style's face, whose .notdef box says so.
+    #[cfg(test)]
     fn cast(&self, style: &TitleStyle) -> Result<Casting, Error> {
-        let own_id = self.pick(style)?;
+        let (looks, look_of) = looks_of(style);
+        self.cast_looks(style, &looks, &look_of)
+    }
+
+    /// The faces a title is set in and which of them sets each character,
+    /// for its looks (see [`Look`]) and the look of each byte.
+    ///
+    /// Each look's own face - the family at that look's weight and slant,
+    /// the title's own first - sets everything it has a glyph for. A
+    /// character it lacks is lent by another face that can draw it - one
+    /// the title already borrows from if one can, so a line of Japanese is
+    /// not set in three faces, else the nearest in weight and slant. What
+    /// nothing can draw stays with the look's face, whose .notdef box says
+    /// so.
+    fn cast_looks(
+        &self,
+        style: &TitleStyle,
+        looks: &[Look],
+        look_of: &[usize],
+    ) -> Result<Casting, Error> {
+        // Each look's own face, once each however many looks share it; the
+        // title's is first, so index 0 is always the style's face.
+        let mut ids: Vec<fontdb::ID> = Vec::new();
+        let mut owns = Vec::with_capacity(looks.len());
+        for look in looks {
+            let id = self.pick_face(&style.font_family, look.weight, look.italic)?;
+            owns.push(match ids.iter().position(|&held| held == id) {
+                Some(index) => index,
+                None => {
+                    ids.push(id);
+                    ids.len() - 1
+                }
+            });
+        }
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let own = self.data(&mut cache, own_id).ok_or(Error::BadFont)?;
-        let own_face =
+        let own = self.data(&mut cache, ids[0]).ok_or(Error::BadFont)?;
+        // A run's face that will not open sets its characters in the
+        // title's: the right weight lost, the words still there.
+        let own_data: Vec<(FaceData, u32)> = std::iter::once(own.clone())
+            .chain(
+                ids[1..]
+                    .iter()
+                    .map(|&id| self.data(&mut cache, id).unwrap_or_else(|| own.clone())),
+            )
+            .collect();
+        let title_face =
             ttf_parser::Face::parse((*own.0).as_ref(), own.1).map_err(|_| Error::BadFont)?;
+        let own_faces: Vec<ttf_parser::Face<'_>> = own_data
+            .iter()
+            .map(|(data, index)| {
+                ttf_parser::Face::parse((**data).as_ref(), *index)
+                    .unwrap_or_else(|_| title_face.clone())
+            })
+            .collect();
+        let own_of = |at: usize| owns[look_of.get(at).copied().unwrap_or(0)];
 
         let mut missing: Vec<char> = style
             .content
-            .chars()
-            .filter(|&ch| {
+            .char_indices()
+            .filter(|&(at, ch)| {
                 !ch.is_control()
-                    && own_face.glyph_index(ch).is_none()
+                    && own_faces[own_of(at)].glyph_index(ch).is_none()
                     && !cache.covers.contains_key(&ch)
             })
+            .map(|(_, ch)| ch)
             .collect();
         missing.sort_unstable();
         missing.dedup();
         self.learn(&mut cache, &missing);
 
-        let want = Want {
-            weight: style.font_weight.clamp(100.0, 900.0).round() as u16,
-            italic: style.italic,
-        };
-        let mut ids = vec![own_id];
         let paragraphs = style
             .content
             .lines()
-            .map(|text| self.assign(text, &own_face, &cache, want, &mut ids))
+            .map(|text| {
+                let at = text.as_ptr() as usize - style.content.as_ptr() as usize;
+                let looks_here = look_of.get(at..at + text.len()).unwrap_or(&[]);
+                self.assign(text, looks_here, looks, &owns, &own_faces, &cache, &mut ids)
+            })
             .collect();
-        let mut faces = vec![own.clone()];
-        for &id in &ids[1..] {
+        let mut faces = own_data;
+        for &id in &ids[faces.len()..] {
             // A face that will not open sets its characters in the style's
             // face instead: boxes, but in the right places.
             faces.push(self.data(&mut cache, id).unwrap_or_else(|| own.clone()));
         }
-        Ok(Casting { faces, paragraphs })
+        Ok(Casting {
+            faces,
+            paragraphs,
+            owns,
+        })
     }
 
     /// Reads every face once for the characters in `chars`, and remembers
@@ -714,36 +901,46 @@ impl Fonts {
     }
 
     /// Which of `ids` sets each byte of one paragraph, adding the faces it
-    /// borrows to `ids`. Index 0 is the style's own face.
+    /// borrows to `ids`. `look_of` is the look of each of its bytes, and
+    /// `owns` each look's own face in `ids`, parsed in `own_faces`.
+    #[allow(clippy::too_many_arguments)]
     fn assign(
         &self,
         text: &str,
-        own: &ttf_parser::Face<'_>,
+        look_of: &[usize],
+        looks: &[Look],
+        owns: &[usize],
+        own_faces: &[ttf_parser::Face<'_>],
         cache: &Cache,
-        want: Want,
         ids: &mut Vec<fontdb::ID>,
     ) -> Vec<usize> {
         let mut out = vec![0; text.len()];
         let mut last = 0;
         for (at, ch) in text.char_indices() {
+            let look = look_of.get(at).copied().unwrap_or(0);
+            let own = owns[look];
+            let want = Want {
+                weight: looks[look].weight.clamp(100.0, 900.0).round() as u16,
+                italic: looks[look].italic,
+            };
             let covers = cache.covers.get(&ch);
             let lends = |ids: &[fontdb::ID], index: usize| {
-                index != 0 && covers.is_some_and(|covers| covers.has(ids[index]))
+                index != own && covers.is_some_and(|covers| covers.has(ids[index]))
             };
             let index = if joins(ch) && at > 0 {
                 // A mark, a joiner, a skin tone: with what it modifies.
                 last
-            } else if own.glyph_index(ch).is_some() {
-                0
+            } else if own_faces[own].glyph_index(ch).is_some() {
+                own
             } else if lends(ids, last) {
                 last
-            } else if let Some(index) = (1..ids.len()).find(|&index| lends(ids, index)) {
+            } else if let Some(index) = (0..ids.len()).find(|&index| lends(ids, index)) {
                 index
             } else if let Some(id) = self.nearest(covers, want) {
                 ids.push(id);
                 ids.len() - 1
             } else {
-                0
+                own
             };
             out[at..at + ch.len_utf8()].fill(index);
             last = index;
@@ -798,13 +995,81 @@ struct Want {
     italic: bool,
 }
 
-/// A title's faces, and which sets each character; see [`Fonts::cast`].
+/// A title's faces, and which sets each character; see [`Fonts::cast_looks`].
 struct Casting {
-    /// Each face's bytes and index in its collection, the style's first.
+    /// Each face's bytes and index in its collection: each look's own
+    /// first, the style's at 0, then the ones borrowed.
     faces: Vec<(FaceData, u32)>,
     /// Per line of the content, per byte, the index of the face that sets
     /// it.
     paragraphs: Vec<Vec<usize>>,
+    /// Per look, the index of its own face.
+    owns: Vec<usize>,
+}
+
+/// One look a title's characters are set in, resolved: the title's own,
+/// at index 0, or a run's laid over it - each field the run's where it
+/// says and the title's where it does not.
+#[derive(Clone, Debug)]
+struct Look {
+    weight: f64,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+    /// Its em, as a multiple of the title's.
+    scale: f32,
+    fill: Color,
+    /// The outline's colour; none for one that does not parse, which the
+    /// title's outline did not draw either.
+    edge: Option<Color>,
+}
+
+/// The looks a title is set in - its own first, then one per run - and,
+/// per byte of the content, which. A title with no runs is one look, and
+/// is set exactly as it was before runs.
+fn looks_of(style: &TitleStyle) -> (Vec<Look>, Vec<usize>) {
+    let base = Look {
+        weight: style.font_weight,
+        italic: style.italic,
+        underline: style.underline,
+        strikethrough: style.strikethrough,
+        scale: 1.0,
+        fill: colour(&style.color).unwrap_or(Color::WHITE),
+        edge: colour(&style.stroke_color),
+    };
+    let mut look_of = vec![0; style.content.len()];
+    let mut looks = vec![base.clone()];
+    if style.runs.is_empty() {
+        return (looks, look_of);
+    }
+    // Characters to bytes: a run counts characters, the setter bytes.
+    let bytes: Vec<usize> = style
+        .content
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain(std::iter::once(style.content.len()))
+        .collect();
+    let count = bytes.len() - 1;
+    for run in &style.runs {
+        let (start, end) = (run.start.min(count), run.end.min(count));
+        if start >= end {
+            continue;
+        }
+        looks.push(Look {
+            weight: run.font_weight.unwrap_or(base.weight),
+            italic: run.italic.unwrap_or(base.italic),
+            underline: run.underline.unwrap_or(base.underline),
+            strikethrough: run.strikethrough.unwrap_or(base.strikethrough),
+            scale: run
+                .font_scale
+                .filter(|scale| scale.is_finite())
+                .map_or(1.0, |scale| scale.clamp(0.1, 10.0) as f32),
+            fill: run.color.as_deref().and_then(colour).unwrap_or(base.fill),
+            edge: run.stroke_color.as_deref().and_then(colour).or(base.edge),
+        });
+        look_of[bytes[start]..bytes[end]].fill(looks.len() - 1);
+    }
+    (looks, look_of)
 }
 
 /// What `face` draws `ch` with, when it draws it: colours of its own, or
@@ -938,17 +1203,26 @@ fn joins(ch: char) -> bool {
         || ('\u{E0020}'..='\u{E007F}').contains(&ch)
 }
 
-/// One shaped line: its outline path in pixels, pen at the origin, its
-/// advance width, and each of its words' `(start_x, end_x)` in that same
-/// pen space, left to right.
+/// One shaped line: its outlines in pixels, pen at the origin, one path
+/// per look that has glyphs on it, its advance width, and each of its
+/// words' `(start_x, end_x)` in that same pen space, left to right.
 struct Line {
-    path: Option<Path>,
+    /// `(look, outlines)`, for the look's fill and outline to paint.
+    paths: Vec<(usize, Path)>,
     /// The glyphs that paint their own colours - a picture rather than an
     /// outline - at that same pen origin, for laying over the words. The
-    /// fill would wash their colours out, so they stay out of `path`.
+    /// fill would wash their colours out, so they stay out of `paths`.
     marks: Vec<Mark>,
     width: f32,
     words: Vec<(f32, f32)>,
+    /// The stretches set in one look, `(look, start_x, end_x)` left to
+    /// right: where a look's underline and strike are ruled.
+    stretches: Vec<(usize, f32, f32)>,
+    /// The tallest of its looks' ascents and descents, and its biggest em,
+    /// in pixels: a line with one big word is as tall as that word.
+    ascent: f32,
+    descent: f32,
+    em: f32,
 }
 
 /// A glyph that colours itself, in pen space at its line's origin: an
@@ -1033,22 +1307,24 @@ impl ttf_parser::OutlineBuilder for Outliner<'_> {
 }
 
 /// What setting a line needs: the title's faces, in [`Casting`]'s order,
-/// and its sizes in pixels.
+/// its looks, and its sizes in pixels.
 struct Setter<'a> {
     faces: &'a [rustybuzz::Face<'a>],
+    /// The title's em; a look's is this times its scale.
     em: f32,
     tracking: f32,
-    /// The words' colour, for the `COLR` palette entry that means "paint
-    /// it with the text's own colour".
-    foreground: ttf_parser::RgbaColor,
+    looks: &'a [Look],
+    /// Per look, its own face's ascent and descent at the look's size.
+    metrics: &'a [(f32, f32)],
 }
 
 /// One line of the content, ready to be set: its text, its directions,
-/// and the face each byte is set in.
+/// and the face and the look each byte is set in.
 struct Paragraph<'a> {
     text: &'a str,
     bidi: ParagraphBidiInfo<'a>,
     face_of: &'a [usize],
+    look_of: &'a [usize],
 }
 
 impl Setter<'_> {
@@ -1096,35 +1372,72 @@ impl Setter<'_> {
         lines
     }
 
+    /// How tall a line of `range` stands: the tallest ascent and descent
+    /// of the looks on it, and the biggest em. An empty line stands as
+    /// tall as the look it would be typed in.
+    fn measure(&self, para: &Paragraph<'_>, range: Range<usize>) -> (f32, f32, f32) {
+        let mut tallest: Option<(f32, f32, f32)> = None;
+        if self.looks.len() > 1 {
+            for at in range.clone() {
+                let Some(&look) = para.look_of.get(at) else {
+                    break;
+                };
+                let (ascent, descent) = self.metrics[look];
+                let em = self.em * self.looks[look].scale;
+                tallest = Some(tallest.map_or((ascent, descent, em), |(a, d, e)| {
+                    (a.max(ascent), d.max(descent), e.max(em))
+                }));
+            }
+        }
+        tallest.unwrap_or_else(|| {
+            let look = para
+                .look_of
+                .get(range.start)
+                .or_else(|| para.look_of.get(range.start.wrapping_sub(1)))
+                .copied()
+                .unwrap_or(0);
+            let (ascent, descent) = self.metrics[look];
+            (ascent, descent, self.em * self.looks[look].scale)
+        })
+    }
+
     /// Shapes `range` of a paragraph as one line, pen starting at (0, 0) on
     /// the baseline, and outlines it when `outline` - a line only being
     /// measured is not.
     ///
     /// The line's runs are laid left to right in the order they are seen,
     /// which for right-to-left text is not the order they are read; each
-    /// run is split where its face changes, and shaped piece by piece.
+    /// run is split where its face or its look changes, and shaped piece by
+    /// piece, each at its look's size.
     fn set(&self, para: &Paragraph<'_>, range: Range<usize>, outline: bool) -> Line {
+        let (ascent, descent, em) = self.measure(para, range.clone());
         if range.is_empty() {
             return Line {
-                path: None,
+                paths: Vec::new(),
                 marks: Vec::new(),
                 width: 0.0,
                 words: Vec::new(),
+                stretches: Vec::new(),
+                ascent,
+                descent,
+                em,
             };
         }
+        let look_at = |at: usize| para.look_of.get(at).copied().unwrap_or(0);
         let (levels, runs) = para.bidi.visual_runs(range.clone());
-        let mut builder = PathBuilder::new();
+        // One outline per look, made as the look first turns up.
+        let mut builders: Vec<Option<PathBuilder>> = self.looks.iter().map(|_| None).collect();
         let mut marks: Vec<Mark> = Vec::new();
         let mut pen = 0.0_f32;
-        // Each glyph's cluster, as a byte into the paragraph, and the span
-        // it advances over.
-        let mut spans: Vec<(usize, f32, f32)> = Vec::new();
+        // Each glyph's cluster, as a byte into the paragraph, the span it
+        // advances over, and its look.
+        let mut spans: Vec<(usize, f32, f32, usize)> = Vec::new();
         for run in runs {
             let rtl = levels[run.start].is_rtl();
             let mut pieces = Vec::new();
             let mut start = run.start;
             for at in run.clone() {
-                if para.face_of[at] != para.face_of[start] {
+                if para.face_of[at] != para.face_of[start] || look_at(at) != look_at(start) {
                     pieces.push(start..at);
                     start = at;
                 }
@@ -1136,7 +1449,9 @@ impl Setter<'_> {
             }
             for piece in pieces {
                 let face = &self.faces[para.face_of[piece.start]];
-                let scale = self.em / face.units_per_em() as f32;
+                let look = look_at(piece.start);
+                let em = self.em * self.looks[look].scale;
+                let scale = em / face.units_per_em() as f32;
                 let mut buffer = rustybuzz::UnicodeBuffer::new();
                 buffer.push_str(&para.text[piece.clone()]);
                 buffer.set_direction(if rtl {
@@ -1156,14 +1471,15 @@ impl Setter<'_> {
                         let y = -(position.y_offset as f32 * scale);
                         // A glyph that colours itself - a strike's
                         // picture, layered paints - goes into the line's
-                        // marks instead of its path: the words' fill
+                        // marks instead of its outlines: the words' fill
                         // would wash its colours out. Anything else is
-                        // an outline, as always.
-                        if let Some(mark) = self.mark(face, glyph, x, y, scale) {
+                        // an outline in its look's path, as always.
+                        let foreground = rgba(self.looks[look].fill);
+                        if let Some(mark) = self.mark(face, glyph, x, y, em, foreground) {
                             marks.push(mark);
                         } else {
                             let mut outliner = Outliner {
-                                builder: &mut builder,
+                                builder: builders[look].get_or_insert_with(PathBuilder::new),
                                 scale,
                                 x,
                                 y,
@@ -1172,7 +1488,12 @@ impl Setter<'_> {
                         }
                     }
                     let advance = position.x_advance as f32 * scale;
-                    spans.push((piece.start + info.cluster as usize, pen, pen + advance));
+                    spans.push((
+                        piece.start + info.cluster as usize,
+                        pen,
+                        pen + advance,
+                        look,
+                    ));
                     pen += advance + self.tracking;
                 }
             }
@@ -1183,41 +1504,59 @@ impl Setter<'_> {
         } else {
             (pen - self.tracking).max(0.0)
         };
-        let words = if outline {
-            words(para.text, range)
+        let (words, stretches) = if outline {
+            let words = words(para.text, range)
                 .into_iter()
                 .filter_map(|word| {
                     spans
                         .iter()
-                        .filter(|(cluster, _, _)| word.contains(cluster))
-                        .fold(None, |span: Option<(f32, f32)>, &(_, left, right)| {
+                        .filter(|(cluster, _, _, _)| word.contains(cluster))
+                        .fold(None, |span: Option<(f32, f32)>, &(_, left, right, _)| {
                             Some(span.map_or((left, right), |(l, r)| (l.min(left), r.max(right))))
                         })
                 })
-                .collect()
+                .collect();
+            let mut stretches: Vec<(usize, f32, f32)> = Vec::new();
+            for &(_, left, right, look) in &spans {
+                match stretches.last_mut() {
+                    Some((held, _, end)) if *held == look => *end = end.max(right),
+                    _ => stretches.push((look, left, right)),
+                }
+            }
+            (words, stretches)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         Line {
-            path: builder.finish(),
+            paths: builders
+                .into_iter()
+                .enumerate()
+                .filter_map(|(look, builder)| Some((look, builder?.finish()?)))
+                .collect(),
             marks,
             width,
             words,
+            stretches,
+            ascent,
+            descent,
+            em,
         }
     }
 
-    /// A glyph's own colours, at its origin `(x, y)` on the baseline: its
-    /// font's bitmap, decoded and boxed to the strike's size, or its
-    /// `COLR` layers outlined in their palette colours. `None` for a plain
-    /// outline - most glyphs - and for a colour glyph this crate does not
-    /// follow, which falls back to its outline as before.
+    /// A glyph's own colours, at its origin `(x, y)` on the baseline and
+    /// at `em` pixels: its font's bitmap, decoded and boxed to the strike's
+    /// size, or its `COLR` layers outlined in their palette colours, with
+    /// `foreground` for the palette's "the text's own colour". `None` for a
+    /// plain outline - most glyphs - and for a colour glyph this crate does
+    /// not follow, which falls back to its outline as before.
     fn mark(
         &self,
         face: &rustybuzz::Face<'_>,
         glyph: ttf_parser::GlyphId,
         x: f32,
         y: f32,
-        scale: f32,
+        em: f32,
+        foreground: ttf_parser::RgbaColor,
     ) -> Option<Mark> {
         if let Some(image) = face.glyph_raster_image(glyph, u16::MAX)
             && matches!(
@@ -1231,7 +1570,7 @@ impl Setter<'_> {
             // the glyph's origin to the bitmap's *bottom* edge - both for
             // `CBDT` and for `sbix` - while the canvas goes down. `k`
             // turns a strike pixel into canvas pixels at this size.
-            let k = self.em / f32::from(image.pixels_per_em.max(1));
+            let k = em / f32::from(image.pixels_per_em.max(1));
             let height = f32::from(image.height) * k;
             return Some(Mark::Bitmap {
                 x: x + f32::from(image.x) * k,
@@ -1241,7 +1580,8 @@ impl Setter<'_> {
                 pixmap,
             });
         }
-        let layers = Layering::of(face, glyph, self.foreground)?;
+        let scale = em / face.units_per_em() as f32;
+        let layers = Layering::of(face, glyph, foreground)?;
         let mut placed = Vec::with_capacity(layers.len());
         for (glyph_id, colour) in layers {
             let mut builder = PathBuilder::new();
@@ -1377,8 +1717,9 @@ pub fn render(
         .map_err(|error| Error::Encode(error.to_string()))?;
     Ok(Rendered {
         png,
-        width,
-        height,
+        width: canvas.width(),
+        height: canvas.height(),
+        overscan: overscan_of(&canvas, width, height),
         block_width: block.0,
         block_height: block.1,
         block_dx: block.2,
@@ -1400,8 +1741,9 @@ pub fn render_frame(
     let (canvas, block, words) = paint(fonts, style, width, height)?;
     Ok(RenderedFrame {
         rgba: straight_rgba(&canvas),
-        width,
-        height,
+        width: canvas.width(),
+        height: canvas.height(),
+        overscan: overscan_of(&canvas, width, height),
         block_width: block.0,
         block_height: block.1,
         block_dx: block.2,
@@ -1412,6 +1754,62 @@ pub fn render_frame(
 
 /// A painted block: (width, height, dx, dy), on [`Rendered`]'s terms.
 type Block = (u32, u32, i32, i32);
+
+/// The longest side a canvas may grow to: the largest texture every GPU
+/// takes, `concat_core::frame::MAX_SIDE`. Ink past it is cut as all ink
+/// past the frame once was, which takes a box several frames wide.
+const MAX_SIDE: u32 = 8192;
+
+/// How many times a `width` by `height` frame `canvas` is, along the axis
+/// it grew the most; see [`Rendered::overscan`].
+fn overscan_of(canvas: &Pixmap, width: u32, height: u32) -> f64 {
+    (f64::from(canvas.width()) / f64::from(width.max(1)))
+        .max(f64::from(canvas.height()) / f64::from(height.max(1)))
+        .max(1.0)
+}
+
+/// Where ink lands, as left, top, right and bottom edges in pixels: what
+/// the canvas has to hold. Empty until something is added.
+#[derive(Clone, Copy)]
+struct Ink(Option<[f32; 4]>);
+
+impl Ink {
+    /// Takes in `rect`, moved by `(dx, dy)` and grown by `by` on every side.
+    fn add(&mut self, rect: Rect, (dx, dy): (f32, f32), by: f32) {
+        let edges = [
+            rect.left() + dx - by,
+            rect.top() + dy - by,
+            rect.right() + dx + by,
+            rect.bottom() + dy + by,
+        ];
+        self.0 = Some(match self.0 {
+            None => edges,
+            Some([l, t, r, b]) => [
+                l.min(edges[0]),
+                t.min(edges[1]),
+                r.max(edges[2]),
+                b.max(edges[3]),
+            ],
+        });
+    }
+
+    /// The margin a `width` by `height` canvas needs on each side to hold
+    /// the ink, x and y, in whole pixels; nothing for ink inside it. The
+    /// same either side, so the canvas's centre does not move, and held so
+    /// the canvas grows no larger than [`MAX_SIDE`].
+    fn margins(&self, width: u32, height: u32) -> (u32, u32) {
+        let Some([left, top, right, bottom]) = self.0 else {
+            return (0, 0);
+        };
+        let past = |low: f32, high: f32, side: u32| -> u32 {
+            let over = (-low).max(high - side as f32).max(0.0);
+            // A hair over is anti-aliasing's guess at an edge, not ink.
+            let over = if over < 0.01 { 0 } else { over.ceil() as u32 };
+            over.min(MAX_SIDE.saturating_sub(side) / 2)
+        };
+        (past(left, right, width), past(top, bottom, height))
+    }
+}
 
 /// The canvas with the title on it, the block, and every word's box on the
 /// canvas in reading order.
@@ -1424,13 +1822,17 @@ fn paint(
     if style.vertical {
         return paint_turned(fonts, style, width, height);
     }
-    let mut canvas = Pixmap::new(width, height).ok_or(Error::Canvas(width, height))?;
+    // The frame's canvas, for a title with nothing to paint; one with ink
+    // gets a canvas as big as its ink needs, below.
+    let empty = Pixmap::new(width, height).ok_or(Error::Canvas(width, height))?;
     let frame_h = height as f32;
     let em = (style.font_size.clamp(0.005, 1.0) as f32) * frame_h;
     let tracking = style.tracking as f32 * frame_h;
-    let pitch = em * (style.line_height.max(0.5) as f32);
+    let line_height = style.line_height.max(0.5) as f32;
 
-    let casting = fonts.cast(style)?;
+    // The title's own look and its runs', and which each byte is in.
+    let (looks, look_of) = looks_of(style);
+    let casting = fonts.cast_looks(style, &looks, &look_of)?;
     let own = {
         let (data, index) = &casting.faces[0];
         rustybuzz::Face::from_slice((**data).as_ref(), *index).ok_or(Error::BadFont)?
@@ -1444,12 +1846,22 @@ fn paint(
             rustybuzz::Face::from_slice((**data).as_ref(), *index).unwrap_or_else(|| own.clone())
         })
         .collect();
-    // The line's metrics are the style's face's, whatever it borrows: the
-    // pitch and the block should not jump because one character came from
-    // elsewhere.
-    let upem = own.units_per_em() as f32;
-    let ascent = own.ascender() as f32 / upem * em;
-    let descent = -(own.descender() as f32) / upem * em;
+    // A line's metrics are its looks' own faces', whatever they borrow:
+    // the pitch and the block should not jump because one character came
+    // from elsewhere. A title in one look is the style's face's.
+    let metrics: Vec<(f32, f32)> = looks
+        .iter()
+        .zip(&casting.owns)
+        .map(|(look, &face)| {
+            let face = &faces[face];
+            let size = em * look.scale / face.units_per_em() as f32;
+            (
+                face.ascender() as f32 * size,
+                -(face.descender() as f32) * size,
+            )
+        })
+        .collect();
+    let (ascent, descent) = metrics[0];
 
     // The box's limits, where the style sets them; zero is a box the words
     // size.
@@ -1487,35 +1899,50 @@ fn paint(
     };
 
     // Shape every line with the pen at the origin; placement comes after,
-    // once the block's width is known. The words' colour goes along: a
+    // once the block's width is known. Each look's colour goes along: a
     // `COLR` palette entry of 0xFFFF means "paint it with the text's own".
-    let fill = colour(&style.color).unwrap_or(Color::WHITE);
     let setter = Setter {
         faces: &faces,
         em,
         tracking,
-        foreground: rgba(fill),
+        looks: &looks,
+        metrics: &metrics,
     };
     let lines: Vec<Line> = style
         .content
         .lines()
         .zip(&casting.paragraphs)
         .flat_map(|(text, face_of)| {
+            let at = text.as_ptr() as usize - style.content.as_ptr() as usize;
             let para = Paragraph {
                 text,
                 bidi: ParagraphBidiInfo::new(text, None),
                 face_of,
+                look_of: look_of.get(at..at + text.len()).unwrap_or(&[]),
             };
             setter.wrap(&para, wrap_w)
         })
         .collect();
-    let rows = lines.len().max(1);
     let words_w = lines.iter().map(|line| line.width).fold(0.0, f32::max);
-    let words_h = (rows as f32 - 1.0) * pitch + ascent + descent;
     if words_w <= 0.0 || lines.is_empty() {
         // Nothing to paint: an empty, valid canvas.
-        return Ok((canvas, (0, 0, 0, 0), Vec::new()));
+        return Ok((empty, (0, 0, 0, 0), Vec::new()));
     }
+    // Each baseline below the first by the pitch of the bigger of the two
+    // lines it sits between, so a line with a big word in it pushes its
+    // neighbours away rather than running into them. In one look every
+    // pitch is the same, as it always was.
+    let mut drops = Vec::with_capacity(lines.len());
+    let mut drop = 0.0_f32;
+    for (row, line) in lines.iter().enumerate() {
+        if row > 0 {
+            drop += line_height * lines[row - 1].em.max(line.em);
+        }
+        drops.push(drop);
+    }
+    let first_ascent = lines.first().map_or(ascent, |line| line.ascent);
+    let last_descent = lines.last().map_or(descent, |line| line.descent);
+    let words_h = drop + first_ascent + last_descent;
 
     // The box the words sit in. Sized by the style where the style says,
     // and by the words where it does not; never smaller than the words,
@@ -1548,58 +1975,181 @@ fn paint(
     // where it is.
     let anchor_x = width as f32 / 2.0;
     let outer_left = match style.align {
-        Align::Left => anchor_x,
+        // A box wider than the half the anchored edge leaves would run
+        // off the canvas and its far end was never drawn: a left-aligned
+        // caption came out cut where a centred one did not. It slides back
+        // in instead, as far as the canvas allows; one that fits stays on
+        // its anchor.
+        Align::Left => anchor_x.min(width as f32 - outer_w).max(0.0),
         Align::Center => anchor_x - outer_w / 2.0,
-        Align::Right => anchor_x - outer_w,
+        Align::Right => (anchor_x - outer_w).max(0.0).min(width as f32 - outer_w),
     };
     let left = outer_left + spare_x + pad_x;
     // The words are centred in a box taller than they are.
     let top = (frame_h - inner_h) / 2.0 + pad_y + (box_h - words_h) / 2.0;
     let block_dx = (outer_left + outer_w / 2.0 - anchor_x).round() as i32;
+    let indent_of = |line: &Line| match style.align {
+        Align::Left => 0.0,
+        Align::Center => (box_w - line.width) / 2.0,
+        Align::Right => box_w - line.width,
+    };
+    let baseline_of = |row: usize| top + first_ascent + drops[row];
 
-    // One path for all the words, placed. Each line is aligned within the
-    // box's width and sits on its own baseline. A word's box rides the
-    // same indent and baseline, in reading order - a line that paints
-    // its glyphs' own colours has no path to place but still has words.
-    let mut words = PathBuilder::new();
+    // Each look's words as one path, placed, ruled lines included. Each
+    // line is aligned within the box's width and sits on its own
+    // baseline. A word's box rides the same indent and baseline, in
+    // reading order - a line that paints its glyphs' own colours has no
+    // path to place but still has words.
+    let mut placed: Vec<PathBuilder> = looks.iter().map(|_| PathBuilder::new()).collect();
+    // A look's ruled lines in its own face's metrics, at its own size, so
+    // they sit where the face's designer put them; an em-based guess for
+    // a face that does not say.
+    let rules: Vec<[(f32, f32); 2]> = looks
+        .iter()
+        .zip(&casting.owns)
+        .map(|(look, &face)| {
+            let face = &faces[face];
+            let em = em * look.scale;
+            let upem = face.units_per_em() as f32;
+            let metric = |m: Option<ttf_parser::LineMetrics>, fallback: f32| {
+                m.map_or((fallback, (em * 0.05).max(1.0)), |m| {
+                    (
+                        -f32::from(m.position) / upem * em,
+                        (f32::from(m.thickness).abs() / upem * em).max(1.0),
+                    )
+                })
+            };
+            [
+                metric(face.underline_metrics(), em * 0.1),
+                metric(face.strikeout_metrics(), -em * 0.3),
+            ]
+        })
+        .collect();
     let mut word_rects = Vec::new();
     for (row, line) in lines.iter().enumerate() {
-        let indent = match style.align {
-            Align::Left => 0.0,
-            Align::Center => (box_w - line.width) / 2.0,
-            Align::Right => box_w - line.width,
-        };
-        let baseline = top + ascent + row as f32 * pitch;
-        if let Some(path) = &line.path {
-            let placed = path
+        let indent = indent_of(line);
+        let baseline = baseline_of(row);
+        for (look, path) in &line.paths {
+            let path = path
                 .clone()
                 .transform(Transform::from_translate(left + indent, baseline))
                 .expect("a translated glyph path stays finite");
-            words.push_path(&placed);
+            placed[*look].push_path(&path);
         }
-        // the underline: a bar a little below the baseline, as wide as the line
-        if style.underline
-            && line.width > 0.0
-            && let Some(bar) = Rect::from_xywh(
-                left + indent,
-                baseline + em * 0.08,
-                line.width,
-                (em * 0.06).max(1.0),
-            )
-        {
-            words.push_rect(bar);
+        // Rules share the glyphs' fill, outline and shadow.
+        for &(look, start_x, end_x) in &line.stretches {
+            let wanted = [looks[look].underline, looks[look].strikethrough];
+            for (on, (offset, thickness)) in wanted.into_iter().zip(rules[look]) {
+                if on
+                    && line.width > 0.0
+                    && let Some(rect) = Rect::from_xywh(
+                        left + indent + start_x,
+                        baseline + offset - thickness / 2.0,
+                        end_x - start_x,
+                        thickness,
+                    )
+                {
+                    placed[look].push_rect(rect);
+                }
+            }
         }
-        let line_top = baseline - ascent;
+        let line_top = baseline - line.ascent;
         for &(start_x, end_x) in &line.words {
             word_rects.push(WordRect {
                 x: (left + indent + start_x).round() as i32,
                 y: line_top.round() as i32,
                 width: (end_x - start_x).max(0.0).round() as u32,
-                height: (ascent + descent).round() as u32,
+                height: (line.ascent + line.descent).round() as u32,
             });
         }
     }
-    let words = words.finish();
+    let words: Vec<(usize, Path)> = placed
+        .into_iter()
+        .enumerate()
+        .filter_map(|(look, builder)| Some((look, builder.finish()?)))
+        .collect();
+
+    // Everything about to be painted, in the frame's pixels: the plate,
+    // the words with the outer half of their outline, their shadow and
+    // its blur, and the glyphs that paint their own colours. The words'
+    // advances are not their ink - a letter's outline, an italic's lean, a
+    // side bearing below zero all reach past them - so the outlines are
+    // measured, not the line. Whatever reaches past the frame's edge
+    // grows the canvas by that much on both sides, so it is painted
+    // rather than cut, and the canvas's centre stays the frame's.
+    let stroke_w = style.stroke_width.max(0.0) as f32 * frame_h;
+    let shadow_offset = (em * 0.05, em * 0.07);
+    let shadow_blur = (em * 0.04).round().max(1.0) as usize;
+    // The plate: the shape round the words and their air, a box or a
+    // bubble, whose tail or bumps may reach past the block; its outline is
+    // half outside it.
+    let plate_outlines = plate
+        .and_then(|_| {
+            Rect::from_xywh(
+                outer_left + spare_x,
+                (frame_h - inner_h) / 2.0,
+                inner_w,
+                inner_h,
+            )
+        })
+        .map(|rect| shape.outlines(rect, (style.background_radius.max(0.0) as f32) * frame_h))
+        .unwrap_or_default();
+    let plate_edge = colour(&style.background_outline).map(|edge| (edge, (em * 0.05).max(1.5)));
+    // A pixel more than the edges, for the anti-aliasing either side.
+    let mut ink = Ink(None);
+    for outline in &plate_outlines {
+        ink.add(outline.bounds(), (0.0, 0.0), plate_edge.map_or(0.0, |(_, w)| w) + 1.0);
+    }
+    for (look, path) in &words {
+        let edge = if stroke_w > 0.0 && looks[*look].edge.is_some() {
+            stroke_w
+        } else {
+            0.0
+        };
+        ink.add(path.bounds(), (0.0, 0.0), edge + 1.0);
+        if style.shadow {
+            // The blur is a box run twice, so it spreads twice its radius.
+            ink.add(path.bounds(), shadow_offset, 2.0 * shadow_blur as f32 + 1.0);
+        }
+    }
+    for (row, line) in lines.iter().enumerate() {
+        let at = (left + indent_of(line), baseline_of(row));
+        for mark in &line.marks {
+            match mark {
+                Mark::Bitmap {
+                    x,
+                    y,
+                    width,
+                    height,
+                    ..
+                } => {
+                    if let Some(rect) = Rect::from_xywh(*x, *y, *width, *height) {
+                        ink.add(rect, at, 1.0);
+                    }
+                }
+                Mark::Layers(layers) => {
+                    for (path, _) in layers {
+                        ink.add(path.bounds(), at, 1.0);
+                    }
+                }
+            }
+        }
+    }
+    let (margin_x, margin_y) = ink.margins(width, height);
+    let mut canvas = if (margin_x, margin_y) == (0, 0) {
+        empty
+    } else {
+        let (grown_w, grown_h) = (width + 2 * margin_x, height + 2 * margin_y);
+        Pixmap::new(grown_w, grown_h).ok_or(Error::Canvas(grown_w, grown_h))?
+    };
+    // Everything below is laid out in the frame's pixels and painted
+    // through this, onto the canvas the frame sits in the middle of.
+    let (shift_x, shift_y) = (margin_x as f32, margin_y as f32);
+    let shift = Transform::from_translate(shift_x, shift_y);
+    for word in &mut word_rects {
+        word.x += margin_x as i32;
+        word.y += margin_y as i32;
+    }
 
     let mut paint = Paint {
         anti_alias: true,
@@ -1610,54 +2160,43 @@ fn paint(
     // round it. Its outline goes under it at twice the width, as the words'
     // does, so only the outer half shows and a bubble's tail or bumps meet
     // its body without a seam.
-    if let Some(fill) = plate
-        && let Some(rect) = Rect::from_xywh(
-            outer_left + spare_x,
-            (frame_h - inner_h) / 2.0,
-            inner_w,
-            inner_h,
-        )
-    {
-        let radius = (style.background_radius.max(0.0) as f32) * frame_h;
-        let outlines = shape.outlines(rect, radius);
-        if let Some(edge) = colour(&style.background_outline) {
+    if let Some(fill) = plate {
+        if let Some((edge, edge_w)) = plate_edge {
             paint.set_color(edge);
             let stroke = Stroke {
-                width: (em * 0.05).max(1.5) * 2.0,
+                width: edge_w * 2.0,
                 line_join: LineJoin::Round,
                 line_cap: LineCap::Round,
                 ..Stroke::default()
             };
-            for outline in &outlines {
-                canvas.stroke_path(outline, &paint, &stroke, Transform::identity(), None);
+            for outline in &plate_outlines {
+                canvas.stroke_path(outline, &paint, &stroke, shift, None);
             }
         }
         paint.set_color(fill);
-        for outline in &outlines {
-            canvas.fill_path(
-                outline,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
+        for outline in &plate_outlines {
+            canvas.fill_path(outline, &paint, FillRule::Winding, shift, None);
         }
     }
 
     // The shadow: the words again, offset down and right, black, blurred on
-    // a layer of their own and laid under the real words.
+    // a layer of their own and laid under the real words - every look's
+    // under all of them, one shadow for the title.
     if style.shadow
-        && let Some(words) = &words
-        && let Some(mut layer) = Pixmap::new(width, height)
+        && !words.is_empty()
+        && let Some(mut layer) = Pixmap::new(canvas.width(), canvas.height())
     {
         let mut shade = Paint {
             anti_alias: true,
             ..Paint::default()
         };
         shade.set_color(Color::from_rgba8(0, 0, 0, 150));
-        let offset = Transform::from_translate(em * 0.05, em * 0.07);
-        layer.fill_path(words, &shade, FillRule::Winding, offset, None);
-        blur(&mut layer, (em * 0.04).round().max(1.0) as usize);
+        let offset =
+            Transform::from_translate(shadow_offset.0 + shift_x, shadow_offset.1 + shift_y);
+        for (_, path) in &words {
+            layer.fill_path(path, &shade, FillRule::Winding, offset, None);
+        }
+        blur(&mut layer, shadow_blur);
         canvas.draw_pixmap(
             0,
             0,
@@ -1669,46 +2208,42 @@ fn paint(
     }
 
     // The outline, under the fill so only its outer half shows - which is
-    // why it is drawn at twice the asked-for width.
-    let stroke_w = style.stroke_width.max(0.0) as f32 * frame_h;
-    if stroke_w > 0.0
-        && let Some(edge) = colour(&style.stroke_color)
-        && let Some(words) = &words
-    {
-        paint.set_color(edge);
+    // why it is drawn at twice the asked-for width. Every look's outline
+    // goes down before any fill, so one word's outline never covers its
+    // neighbour's letters.
+    if stroke_w > 0.0 {
         let stroke = Stroke {
             width: stroke_w * 2.0,
             line_join: LineJoin::Round,
             line_cap: LineCap::Round,
             ..Stroke::default()
         };
-        canvas.stroke_path(words, &paint, &stroke, Transform::identity(), None);
+        for (look, path) in &words {
+            if let Some(edge) = looks[*look].edge {
+                paint.set_color(edge);
+                canvas.stroke_path(path, &paint, &stroke, shift, None);
+            }
+        }
     }
 
-    // The words: one colour, or a gradient from it at the top of the block
-    // to the second colour at the bottom.
-    if let Some(words) = &words {
-        let lines_h = (lines.len().max(1) - 1) as f32 * pitch + ascent + descent;
-        let shader = colour(&style.gradient).and_then(|to| {
-            LinearGradient::new(
-                Point::from_xy(0.0, top),
-                Point::from_xy(0.0, top + lines_h.max(1.0)),
-                vec![GradientStop::new(0.0, fill), GradientStop::new(1.0, to)],
-                SpreadMode::Pad,
-                Transform::identity(),
-            )
-        });
-        match shader {
-            Some(shader) => paint.shader = shader,
-            None => paint.set_color(fill),
-        }
-        canvas.fill_path(
-            words,
-            &paint,
-            FillRule::Winding,
+    // The words, each look in its own colour; the title's own, given a
+    // second colour, a gradient from its own at the top of the block to the
+    // second at the bottom.
+    let gradient = colour(&style.gradient).and_then(|to| {
+        LinearGradient::new(
+            Point::from_xy(0.0, top),
+            Point::from_xy(0.0, top + words_h.max(1.0)),
+            vec![GradientStop::new(0.0, looks[0].fill), GradientStop::new(1.0, to)],
+            SpreadMode::Pad,
             Transform::identity(),
-            None,
-        );
+        )
+    });
+    for (look, path) in &words {
+        match &gradient {
+            Some(shader) if *look == 0 => paint.shader = shader.clone(),
+            _ => paint.set_color(looks[*look].fill),
+        }
+        canvas.fill_path(path, &paint, FillRule::Winding, shift, None);
     }
 
     // The glyphs that paint their own colours - an emoji's picture, a
@@ -1720,13 +2255,9 @@ fn paint(
         if line.marks.is_empty() {
             continue;
         }
-        let indent = match style.align {
-            Align::Left => 0.0,
-            Align::Center => (box_w - line.width) / 2.0,
-            Align::Right => box_w - line.width,
-        };
-        let baseline = top + ascent + row as f32 * pitch;
-        let placed = Transform::from_translate(left + indent, baseline);
+        let indent = indent_of(line);
+        let baseline = baseline_of(row);
+        let placed = Transform::from_translate(left + indent + shift_x, baseline + shift_y);
         for mark in &line.marks {
             match mark {
                 Mark::Bitmap {
@@ -1753,8 +2284,8 @@ fn paint(
                             0.0,
                             0.0,
                             scale_y,
-                            left + indent + *x,
-                            baseline + *y,
+                            left + indent + *x + shift_x,
+                            baseline + *y + shift_y,
                         ),
                         None,
                     );
@@ -1786,7 +2317,6 @@ fn paint_turned(
     width: u32,
     height: u32,
 ) -> Result<(Pixmap, Block, Vec<WordRect>), Error> {
-    let mut canvas = Pixmap::new(width, height).ok_or(Error::Canvas(width, height))?;
     // The style's sizes are fractions of the frame's height, which on the
     // turned canvas is its width: rescaled, they land at the size they
     // would across. The box's limits and the plate's air swap axes, so
@@ -1806,17 +2336,22 @@ fn paint_turned(
     };
     let (turned, (block_w, block_h, block_dx, block_dy), words) =
         paint(fonts, &across, height, width)?;
-    // (x, y) on the turned canvas lands at (width - 1 - y, x) on the frame.
-    let (frame_w, turned_w) = (width as usize, height as usize);
+    // The turned canvas grows past the turned frame where its ink does,
+    // centred on it (see `paint`); turned back, it is as far past the
+    // frame the other way round, centred still.
+    let (turned_w, turned_h) = (turned.width(), turned.height());
+    let mut canvas = Pixmap::new(turned_h, turned_w).ok_or(Error::Canvas(turned_h, turned_w))?;
+    // (x, y) on the turned canvas lands at (canvas width - 1 - y, x).
+    let (canvas_w, turned_w) = (turned_h as usize, turned_w as usize);
     let to = canvas.pixels_mut();
     for (i, pixel) in turned.pixels().iter().enumerate() {
         let (x, y) = (i % turned_w, i / turned_w);
-        to[x * frame_w + (frame_w - 1 - y)] = *pixel;
+        to[x * canvas_w + (canvas_w - 1 - y)] = *pixel;
     }
     let words = words
         .into_iter()
         .map(|word| WordRect {
-            x: width as i32 - (word.y + word.height as i32),
+            x: turned_h as i32 - (word.y + word.height as i32),
             y: word.x,
             width: word.height,
             height: word.width,
@@ -1922,6 +2457,8 @@ pub fn render_shape(style: &ShapeStyle, width: u32, height: u32) -> Result<Rende
         png,
         width,
         height,
+        // A shape is painted on the frame alone, as it always was.
+        overscan: 1.0,
         block_width: block.0,
         block_height: block.1,
         block_dx: block.2,
@@ -1942,6 +2479,8 @@ pub fn render_shape_frame(
         rgba: straight_rgba(&canvas),
         width,
         height,
+        // A shape is painted on the frame alone, as it always was.
+        overscan: 1.0,
         block_width: block.0,
         block_height: block.1,
         block_dx: block.2,
@@ -2234,6 +2773,8 @@ mod tests {
             font_size: 0.09,
             font_weight: 700.0,
             italic: false,
+            underline: false,
+            strikethrough: false,
             color: "#ffffff".to_owned(),
             align: Align::Center,
             stroke_width: 0.0,
@@ -2247,11 +2788,11 @@ mod tests {
             tracking: 0.0,
             max_width: 0.0,
             max_height: 0.0,
-            underline: false,
             vertical: false,
             background_shape: PlateShape::Box,
             background_outline: String::new(),
             gradient: String::new(),
+            runs: Vec::new(),
         }
     }
 
@@ -2433,6 +2974,175 @@ mod tests {
             lowest(&underlined),
             lowest(&plain)
         );
+    }
+
+
+    #[test]
+    fn decorations_change_pixels_without_moving_the_text() {
+        let fonts = Fonts::new();
+        let plain = style("First line\nSecond line");
+        let base = render_frame(&fonts, &plain, 640, 360).unwrap();
+        for (underline, strikethrough) in [(true, false), (false, true), (true, true)] {
+            let decorated = TitleStyle {
+                underline,
+                strikethrough,
+                ..plain.clone()
+            };
+            let painted = render_frame(&fonts, &decorated, 640, 360).unwrap();
+            assert_ne!(painted.rgba, base.rgba);
+            assert_eq!(painted.words, base.words);
+            assert_eq!(painted.block_width, base.block_width);
+            assert_eq!(painted.block_height, base.block_height);
+            // The PNG export path and live preview share the same painter.
+            let exported = render(&fonts, &decorated, 640, 360).unwrap();
+            assert_eq!(exported.words, painted.words);
+        }
+    }
+
+    /// How many of the canvas's pixels inside `word` pass `test`, read
+    /// straight from the RGBA, only those mostly opaque.
+    fn pixels_in(
+        frame: &RenderedFrame,
+        word: WordRect,
+        test: impl Fn(u8, u8, u8) -> bool,
+    ) -> usize {
+        let mut count = 0;
+        for y in word.y.max(0)..(word.y + word.height as i32).min(frame.height as i32) {
+            for x in word.x.max(0)..(word.x + word.width as i32).min(frame.width as i32) {
+                let at = (y as usize * frame.width as usize + x as usize) * 4;
+                let px = &frame.rgba[at..at + 4];
+                if px[3] > 200 && test(px[0], px[1], px[2]) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    fn is_white(r: u8, g: u8, b: u8) -> bool {
+        r > 200 && g > 200 && b > 200
+    }
+
+    /// "Make" in red, "this" in the title's white: each word is painted in
+    /// its own colour, and only its own.
+    #[test]
+    fn a_coloured_run_paints_its_words_and_only_its_words() {
+        let fonts = Fonts::new();
+        let mut styled = style("Make this");
+        styled.shadow = false;
+        styled.runs = vec![TitleRun {
+            start: 0,
+            end: 4,
+            color: Some("#ff0000".into()),
+            ..TitleRun::default()
+        }];
+        let frame = render_frame(&fonts, &styled, 640, 360).expect("renders");
+        assert_eq!(frame.words.len(), 2);
+        let (make, this) = (frame.words[0], frame.words[1]);
+        assert!(pixels_in(&frame, make, is_red) > 50, "the run is red");
+        assert_eq!(pixels_in(&frame, make, is_white), 0, "and nothing else");
+        assert!(
+            pixels_in(&frame, this, is_white) > 50,
+            "its neighbour is white"
+        );
+        assert_eq!(pixels_in(&frame, this, is_red), 0, "and not red");
+        // A colour moves no word: the boxes are the title's in one look.
+        styled.runs.clear();
+        let plain = render_frame(&fonts, &styled, 640, 360).expect("renders");
+        assert_eq!(plain.words, frame.words);
+        assert_eq!(
+            (plain.block_width, plain.block_height),
+            (frame.block_width, frame.block_height)
+        );
+    }
+
+    /// A word twice the size is twice as wide and makes its line taller:
+    /// the block grows to hold it and the next line moves down.
+    #[test]
+    fn a_bigger_run_is_bigger_and_its_line_is_taller() {
+        let fonts = Fonts::new();
+        let plain = style("big word\nnext");
+        let mut styled = plain.clone();
+        styled.runs = vec![TitleRun {
+            start: 0,
+            end: 3,
+            font_scale: Some(2.0),
+            ..TitleRun::default()
+        }];
+        let before = render_frame(&fonts, &plain, 640, 360).expect("renders");
+        let after = render_frame(&fonts, &styled, 640, 360).expect("renders");
+        let ratio = after.words[0].width as f32 / before.words[0].width as f32;
+        assert!((1.8..2.2).contains(&ratio), "twice as wide: {ratio}");
+        assert!(
+            after.words[0].height > before.words[0].height,
+            "its line stands taller"
+        );
+        assert_eq!(after.words[1].width, before.words[1].width, "word is not");
+        assert!(after.block_height > before.block_height);
+        let gap = |frame: &RenderedFrame| frame.words[2].y - frame.words[0].y;
+        assert!(gap(&after) > gap(&before), "the next line moved down");
+    }
+
+    /// An underline on one word is ruled under that word alone, and a
+    /// bold run is set in the heavier face: wider, with more ink.
+    #[test]
+    fn a_runs_rule_and_weight_stay_on_its_words() {
+        let fonts = Fonts::new();
+        let mut plain = style("ruled plain");
+        plain.font_family = BUNDLED_FAMILY.to_owned();
+        plain.font_weight = 400.0;
+        plain.shadow = false;
+        let mut styled = plain.clone();
+        styled.runs = vec![TitleRun {
+            start: 0,
+            end: 5,
+            underline: Some(true),
+            ..TitleRun::default()
+        }];
+        // Full HD: at 360 lines a rule is a pixel thick and never solid.
+        let before = render_frame(&fonts, &plain, 1920, 1080).expect("renders");
+        let after = render_frame(&fonts, &styled, 1920, 1080).expect("renders");
+        let ink =
+            |frame: &RenderedFrame, word: usize| pixels_in(frame, frame.words[word], is_white);
+        assert!(ink(&after, 0) > ink(&before, 0), "the run gained its rule");
+        assert_eq!(ink(&after, 1), ink(&before, 1), "its neighbour did not");
+
+        styled.runs = vec![TitleRun {
+            start: 0,
+            end: 5,
+            font_weight: Some(800.0),
+            ..TitleRun::default()
+        }];
+        let bold = render_frame(&fonts, &styled, 1920, 1080).expect("renders");
+        assert!(ink(&bold, 0) > ink(&before, 0), "a heavier face, more ink");
+        assert!(bold.words[0].width > before.words[0].width, "and wider");
+        // Its neighbour is the same word, moved along by however much
+        // wider the bold one is: only its edges land on other pixels.
+        assert_eq!(bold.words[1].width, before.words[1].width);
+        let (moved, still) = (ink(&bold, 1) as f32, ink(&before, 1) as f32);
+        assert!(
+            (moved / still - 1.0).abs() < 0.03,
+            "{moved} against {still}"
+        );
+    }
+
+    /// Runs count characters, not bytes: a run over "été" covers those
+    /// three letters, accents and all.
+    #[test]
+    fn a_run_counts_characters() {
+        let fonts = Fonts::new();
+        let mut styled = style("été ici");
+        styled.shadow = false;
+        styled.runs = vec![TitleRun {
+            start: 0,
+            end: 3,
+            color: Some("#ff0000".into()),
+            ..TitleRun::default()
+        }];
+        let frame = render_frame(&fonts, &styled, 640, 360).expect("renders");
+        assert!(pixels_in(&frame, frame.words[0], is_red) > 30);
+        assert_eq!(pixels_in(&frame, frame.words[0], is_white), 0);
+        assert_eq!(pixels_in(&frame, frame.words[1], is_red), 0);
     }
 
     /// A limit narrower than the words wraps them: the block comes out no
@@ -2761,6 +3471,56 @@ mod tests {
         assert!(opaque_pixels(&out.png) > 100);
     }
 
+    /// A caption in any language the app speaks draws its words with the
+    /// bundled faces alone, as on a phone whose fonts lend nothing: every
+    /// character lands on a face that has a glyph for it, never on a box.
+    #[test]
+    fn every_language_the_app_speaks_draws_without_the_machines_fonts() {
+        let fonts = Fonts::with_system(false);
+        let lines = [
+            ("Thai", "สวัสดีครับ ยินดีต้อนรับสู่คำบรรยาย"),
+            ("Arabic", "مرحبا بك في الترجمة"),
+            ("Persian", "سلام، به زیرنویس خوش آمدید"),
+            ("Urdu", "خوش آمدید، یہ سب ٹائٹل ہے"),
+            ("Hebrew", "שלום, ברוכים הבאים לכתוביות"),
+            ("Hindi", "नमस्ते, उपशीर्षक में आपका स्वागत है"),
+            ("Bengali", "হ্যালো, সাবটাইটেলে স্বাগতম"),
+            ("Korean", "안녕하세요, 자막에 오신 것을 환영합니다"),
+            ("Simplified Chinese", "你好，欢迎使用字幕"),
+            ("Traditional Chinese", "你好，歡迎使用字幕"),
+            ("Japanese", "こんにちは、字幕へようこそ。カタカナ"),
+            ("Russian", "Привет, добро пожаловать в субтитры"),
+            ("Ukrainian", "Привіт, ласкаво просимо до субтитрів ґ є ї"),
+            ("Vietnamese", "Xin chào, chào mừng đến với phụ đề ữ ỵ ẫ"),
+            ("Turkish", "Merhaba, altyazılara hoş geldiniz İ ğ ş"),
+            ("Polish", "Cześć, witaj w napisach ą ę ł ż ź"),
+            ("Croatian", "Bok, dobrodošli u titlove č ć đ š ž"),
+            ("German", "Grüß dich, willkommen bei den Untertiteln ß"),
+            ("Greek", "Γεια σας, καλώς ήρθατε στους υπότιτλους"),
+        ];
+        let mut boxes = Vec::new();
+        for (language, line) in lines {
+            let casting = fonts.cast(&style(line)).expect("casts");
+            let faces: Vec<_> = casting
+                .faces
+                .iter()
+                .map(|(data, index)| {
+                    ttf_parser::Face::parse((**data).as_ref(), *index).expect("parses")
+                })
+                .collect();
+            for (at, ch) in line.char_indices() {
+                if ch.is_whitespace() || joins(ch) {
+                    continue;
+                }
+                let face = &faces[casting.paragraphs[0][at]];
+                if face.glyph_index(ch).is_none() {
+                    boxes.push(format!("{language}: {ch:?} (U+{:04X})", ch as u32));
+                }
+            }
+        }
+        assert!(boxes.is_empty(), "drawn as boxes:\n{}", boxes.join("\n"));
+    }
+
     /// Left-aligned words start at the anchor and run right; right-aligned
     /// ones end there; centred ones straddle it. Growing the words moves
     /// only the far edge.
@@ -2810,6 +3570,153 @@ mod tests {
         let (first, last) = painted_span(&out.png);
         assert!(first < centre && last > centre);
         assert_eq!(out.block_dx, 0);
+    }
+
+    /// A sized box wider than half the canvas, aligned to an edge, would
+    /// start at the anchor and run off the canvas: its words were cut where
+    /// a centred one's were not. It slides back in whole.
+    #[test]
+    fn a_wide_box_aligned_to_an_edge_stays_on_the_canvas() {
+        let fonts = Fonts::new();
+        let (width, height) = (640, 360);
+        for align in [Align::Left, Align::Right] {
+            let mut wide = style("Escorpio - Casa 6 and Capricornio Cazimi");
+            wide.align = align;
+            wide.shadow = false;
+            wide.max_width = 0.8;
+            let out = render(&fonts, &wide, width, height).expect("renders");
+            assert!(!out.words.is_empty(), "{align:?}");
+            for word in &out.words {
+                assert!(
+                    word.x >= 0 && word.x as u32 + word.width <= width,
+                    "{align:?}: a word at {}..{} leaves the {width}-wide canvas",
+                    word.x,
+                    word.x as u32 + word.width
+                );
+            }
+            let half = out.block_width as i32 / 2;
+            let centre = width as i32 / 2 + out.block_dx;
+            assert!(
+                centre - half >= -1 && centre + half <= width as i32 + 1,
+                "{align:?}"
+            );
+        }
+    }
+
+    /// Whether any paint touches the canvas's outermost column or row: ink
+    /// that reached the edge, and so was cut there.
+    fn touches_an_edge(png: &[u8]) -> bool {
+        let pixmap = Pixmap::decode_png(png).expect("our own PNG decodes");
+        let (width, height) = (pixmap.width(), pixmap.height());
+        pixmap.pixels().iter().enumerate().any(|(index, pixel)| {
+            let (x, y) = (index as u32 % width, index as u32 / width);
+            pixel.alpha() > 0 && (x == 0 || y == 0 || x == width - 1 || y == height - 1)
+        })
+    }
+
+    /// A title inside the frame is painted on the frame, as every title
+    /// was: nothing about it changes for the canvas being able to grow.
+    #[test]
+    fn a_title_inside_the_frame_is_painted_on_the_frame() {
+        let fonts = Fonts::new();
+        let mut outlined = style("Your text");
+        outlined.stroke_width = 0.01;
+        outlined.background = "#000000".to_owned();
+        let out = render(&fonts, &outlined, 640, 360).expect("renders");
+        assert_eq!((out.width, out.height), (640, 360));
+        assert_eq!(out.overscan, 1.0);
+        assert!(!touches_an_edge(&out.png));
+    }
+
+    /// The situations that cut a title's sides off - its box pulled wider
+    /// than the frame with the side grips, a word too long for any line, a
+    /// line as wide as the frame with an outline, a shadow and an italic's
+    /// lean past its last letter - all paint whole: the canvas grows by
+    /// the same margin either side, so nothing reaches its edge and its
+    /// centre is still the frame's. Scaled down, moved or turned, such a
+    /// title showed the cut as a straight edge through its plate or its
+    /// letters.
+    #[test]
+    fn ink_past_the_frame_grows_the_canvas_rather_than_being_cut() {
+        let fonts = Fonts::new();
+        let (width, height) = (640_u32, 360_u32);
+        let mut boxed = style("a box wider than the frame");
+        boxed.background = "#2040a0".to_owned();
+        boxed.max_width = 1.6;
+        let mut long = style("Unbelievably");
+        long.font_family = BUNDLED_FAMILY.to_owned();
+        long.font_size = 0.4;
+        long.stroke_width = 0.02;
+        // A word sized so its letters' advances fill the frame but for two
+        // pixels a side: its outline, shadow and lean run past the edge.
+        let mut edge = style("Overhang");
+        edge.font_family = BUNDLED_FAMILY.to_owned();
+        edge.italic = true;
+        edge.shadow = false;
+        let natural = render(&fonts, &edge, width, height).expect("renders");
+        edge.font_size *= f64::from(width - 4) / f64::from(natural.block_width);
+        let fitted = render(&fonts, &edge, width, height).expect("renders");
+        assert!(
+            fitted.block_width <= width && fitted.block_width >= width - 8,
+            "{}",
+            fitted.block_width
+        );
+        edge.shadow = true;
+        edge.stroke_width = 0.02;
+        let mut left = boxed.clone();
+        left.align = Align::Left;
+        for (name, title) in [
+            ("box", boxed),
+            ("word", long),
+            ("edge", edge),
+            ("left", left),
+        ] {
+            let out = render(&fonts, &title, width, height).expect("renders");
+            assert!(out.width > width, "{name}: {} wide", out.width);
+            assert_eq!(
+                (out.width - width) % 2,
+                0,
+                "{name}: the same margin either side"
+            );
+            assert_eq!((out.height - height) % 2, 0, "{name}");
+            let expected = (f64::from(out.width) / f64::from(width))
+                .max(f64::from(out.height) / f64::from(height));
+            assert_eq!(out.overscan, expected, "{name}");
+            assert!(!touches_an_edge(&out.png), "{name}: ink was cut");
+            for word in &out.words {
+                assert!(
+                    word.x >= 0 && word.x as u32 + word.width <= out.width,
+                    "{name}: a word at {} leaves the canvas",
+                    word.x
+                );
+            }
+            // The live painting is the same canvas, pixel for pixel.
+            let live = render_frame(&fonts, &title, width, height).expect("renders");
+            assert_eq!((live.width, live.height), (out.width, out.height), "{name}");
+            assert_eq!(live.words, out.words, "{name}");
+        }
+    }
+
+    /// A box wider than the frame keeps its plate whole and centred on
+    /// the canvas: the canvas's centre is still where the clip's is.
+    #[test]
+    fn a_box_wider_than_the_frame_is_centred_on_the_grown_canvas() {
+        let fonts = Fonts::new();
+        let mut boxed = style("wide");
+        boxed.background = "#2040a0".to_owned();
+        boxed.shadow = false;
+        boxed.max_width = 1.5;
+        let out = render(&fonts, &boxed, 640, 360).expect("renders");
+        assert_eq!(out.block_width, 960);
+        assert_eq!(out.block_dx, 0);
+        let (left, right) = painted_span(&out.png);
+        let middle = (left + right) as f32 / 2.0;
+        assert!(
+            (middle - out.width as f32 / 2.0).abs() <= 1.0,
+            "{left}..{right} in {}",
+            out.width
+        );
+        assert!(right - left + 1 >= 959, "the plate whole: {left}..{right}");
     }
 
     // ── scripts the style's face lacks ──

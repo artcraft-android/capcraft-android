@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Media as the window sees it: what a file is, its waveform, its
 //! filmstrip, a project's poster - and the caches beside the project that
@@ -140,7 +140,8 @@ impl MediaSummary {
 
 /// Extensions Concat is willing to treat as stills.
 const IMAGE_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "avif", "heic", "heif", "gif",
+    "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "avif", "heic", "heif", "gif", "svg",
+    "svgz",
 ];
 
 /// Decides whether a file is footage, sound or a still.
@@ -450,7 +451,18 @@ pub fn filmstrip_between(
     let mut tiles: Vec<Option<Frame>> = (0..count).map(|_| None).collect();
 
     if span * fps <= STRIP_SEQUENTIAL_FRAMES {
-        read_through(path, from, fps, &instant, width, height, &mut tiles)?;
+        // The pass is exact, but it decodes every frame at full size, and a
+        // minute of 4K is many seconds of that. Where each tile's slice is
+        // long enough to hold a keyframe, the keyframes are tried first:
+        // one decode a tile, kept only when every tile has one of its own
+        // slice, so no tile shows a picture from anywhere else.
+        let slice = span / f64::from(count);
+        let keyed = slice >= KEYFRAME_SLICE
+            && keyframe_tiles(path, from, slice, width, height, &mut tiles).unwrap_or(false);
+        if !keyed {
+            tiles.iter_mut().for_each(|tile| *tile = None);
+            read_through(path, from, fps, &instant, width, height, &mut tiles)?;
+        }
     } else {
         seek_each(path, &instant, width, height, &mut tiles)?;
         if tiles.iter().all(Option::is_none) {
@@ -524,6 +536,58 @@ fn read_through(
         tiles[index] = Some(frame);
     }
     Ok(())
+}
+
+/// How long, in seconds, a filmstrip tile's slice of the footage must be
+/// before keyframes are tried in place of a pass through it. Phones and
+/// cameras write a keyframe every second or so, so a slice this long
+/// can have one in it; screen recordings and some encoders write one
+/// every several seconds, and their tiles fall back to the pass.
+const KEYFRAME_SLICE: f64 = 1.0;
+
+/// One keyframe a tile, for [`filmstrip_between`]: the last keyframe in
+/// each tile's own slice of the footage - `slice` seconds long, the first
+/// beginning at `from` - found by seeking to just short of the slice's
+/// end, and taken only while it lies inside the slice. `Ok(false)` at the
+/// first slice with no keyframe of its own, or a keyframe that will not
+/// say where it is; what was filled by then is the caller's to clear.
+fn keyframe_tiles(
+    path: &str,
+    from: f64,
+    slice: f64,
+    width: u32,
+    height: u32,
+    tiles: &mut [Option<Frame>],
+) -> Result<bool, String> {
+    let mut decoder = Decoder::open(
+        path,
+        &DecodeOptions::default()
+            .scaled_to(width, height)
+            .nearest_keyframes(),
+    )
+    .map_err(describe)?;
+    for (index, tile) in tiles.iter_mut().enumerate() {
+        let end = from + slice * (index as f64 + 1.0) - 1e-3;
+        let time = Rational::approximate(end).unwrap_or(Rational::ZERO);
+        decoder.seek(time).map_err(describe)?;
+        let Some(frame) = decoder.next_frame().map_err(describe)? else {
+            return Ok(false);
+        };
+        let landed = decoder.position().map(|position| position.as_f64());
+        if !landed.is_some_and(|at| in_slice(at, from, slice, index)) {
+            return Ok(false);
+        }
+        *tile = Some(frame);
+    }
+    Ok(true)
+}
+
+/// Whether `at` lies in tile `index`'s slice of a strip whose slices are
+/// `slice` seconds long from `from`, with a millisecond's slack for a
+/// stamp rounded to the container's clock.
+fn in_slice(at: f64, from: f64, slice: f64, index: usize) -> bool {
+    let start = from + slice * index as f64;
+    at >= start - 1e-3 && at < start + slice
 }
 
 /// One seek per tile, to the keyframe at or before its instant. Near
@@ -707,6 +771,22 @@ pub fn poster_frame(project: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// How long a project's active timeline runs, in seconds: where its last
+/// clip ends. For the launch screen's cards, read on a worker beside the
+/// poster; None when the manifest cannot be read as a project.
+pub fn timeline_seconds(project: &str) -> Option<f64> {
+    let manifest = projects::manifest_path(Path::new(project));
+    let text = std::fs::read_to_string(manifest).ok()?;
+    let document: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let project = concat_project::from_document(&document)?;
+    let timeline = project
+        .timelines
+        .iter()
+        .find(|timeline| timeline.id == project.active_timeline_id)
+        .or_else(|| project.timelines.first())?;
+    Some(timeline.duration())
+}
+
 /// Below this mean brightness, out of 255, a frame is a black one: a
 /// leader, the foot of a fade, a lens cap. A night scene is well above it.
 const DEAD_BELOW: u32 = 10;
@@ -823,6 +903,63 @@ pub fn still_at(path: &str, seconds: f64, width: u32) -> Result<Frame, String> {
     }
 }
 
+/// A bin card's picture of `path`: the keyframe at or before `seconds`,
+/// scaled to `width` across as it is decoded, with the height following
+/// the picture's shape.
+///
+/// One decoded frame, because a whole import's cards wait on these.
+/// [`still_at`]'s exact frame costs every picture from the keyframe before
+/// it, each at full size before the scale - up to sixty 4K decodes for one
+/// 88-pixel card. And in software: a lone keyframe is the CPU's best case
+/// and a device's worst, which would spend longer making its context than
+/// decoding the frame, and on a phone would hold one of MediaCodec's few
+/// seats while it did.
+///
+/// The exact frame is decoded instead, as it always was, when the
+/// keyframe will not serve: when it is black - a leader, the foot of a
+/// fade, no picture of the file - or cannot be read, or comes from after
+/// `seconds`. That last is FFmpeg's H.264 decoder told to skip all but
+/// keyframes, which on a stream whose keyframes are not all fresh starts
+/// (an encoder's scene cuts) hands them back out of order, a later one
+/// first.
+pub fn card_still(path: &str, seconds: f64, width: u32) -> Result<Frame, String> {
+    match keyframe_still(path, seconds, width) {
+        Ok((frame, landed)) if serves_as_card(&frame, landed, seconds) => Ok(frame),
+        _ => still_at(path, seconds, width),
+    }
+}
+
+/// Whether a keyframe decoded for a card's picture at `seconds`, shown at
+/// `landed`, will do: lit, and not from after `seconds` - by more than a
+/// stamp's rounding, or at all when it says nothing of where it is.
+fn serves_as_card(frame: &Frame, landed: Option<f64>, seconds: f64) -> bool {
+    !is_dead(frame) && landed.map_or(seconds <= 0.0, |at| at <= seconds + 1e-3)
+}
+
+/// The keyframe at or before `seconds`, for [`card_still`], and where the
+/// decoder says it is shown.
+fn keyframe_still(path: &str, seconds: f64, width: u32) -> Result<(Frame, Option<f64>), String> {
+    let info = concat_media::probe(path).map_err(describe)?;
+    let video = info.require_video().map_err(describe)?;
+    let height = ((f64::from(width) * f64::from(video.height) / f64::from(video.width)).round()
+        as u32)
+        .max(2)
+        & !1;
+    let mut options = DecodeOptions::default()
+        .scaled_to(width, height)
+        .nearest_keyframes()
+        .in_software();
+    if seconds > 0.0 {
+        options = options.starting_at(Rational::approximate(seconds).unwrap_or(Rational::ZERO));
+    }
+    let mut decoder = Decoder::open(path, &options).map_err(describe)?;
+    let frame = decoder
+        .next_frame()
+        .map_err(describe)?
+        .ok_or_else(|| format!("no keyframe to show for {path}"))?;
+    Ok((frame, decoder.position().map(|position| position.as_f64())))
+}
+
 /// Flattens an error and its causes into one line.
 ///
 /// `Display` on a `thiserror` enum prints only the outermost message, and the
@@ -856,6 +993,7 @@ mod tests {
                 width: 1440,
                 height: 1080,
                 frame_rate: concat_core::time::FrameRate::from_int(25),
+                cadence: concat_core::time::FrameRate::from_int(25),
                 color_range: None,
                 signal: Signal::Sdr,
             }),
@@ -962,6 +1100,153 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A card's picture is a frame from at or before its instant - the
+    /// keyframe there, or the exact frame - at the asked width, and never
+    /// black where the exact frame is not. The encoder puts keyframes
+    /// where it likes, scene cuts included, which is the point: whatever
+    /// the keyframes-only decode hands back, a card is never a picture
+    /// from later in the file, nor a black leader in front of a picture.
+    #[test]
+    fn a_card_picture_is_never_later_than_its_instant_nor_black_before_a_picture() {
+        use concat_core::time::FrameRate;
+        use concat_media::{EncodeOptions, Encoder, FrameSink};
+
+        // A second of black, then red brightening a step a frame.
+        let path =
+            std::env::temp_dir().join(format!("concat-card-still-test-{}.mp4", std::process::id()));
+        let mut encoder =
+            Encoder::create(&path, 64, 32, FrameRate::THIRTY, &EncodeOptions::default())
+                .expect("encodes");
+        for index in 0..120u32 {
+            let mut frame = Frame::black(64, 32);
+            if index >= 30 {
+                frame.fill([(100 + index) as u8, 30, 30, 255]);
+            }
+            encoder.write_frame(&frame).expect("writes");
+        }
+        encoder.finish().expect("finishes");
+        let file = path.to_string_lossy().into_owned();
+        let red = |frame: &Frame| frame.pixel(16, 8).expect("in bounds")[0];
+
+        for seconds in [0.0, 0.5, 1.2, 1.5, 2.0, 2.5, 3.0, 3.8] {
+            let card = card_still(&file, seconds, 32).expect("a picture");
+            let exact = still_at(&file, seconds, 32).expect("a frame");
+            assert_eq!((card.width(), card.height()), (32, 16));
+            assert!(
+                red(&card) <= red(&exact) + 4,
+                "at {seconds}s the card is red {}, from after the frame there (red {})",
+                red(&card),
+                red(&exact)
+            );
+            assert!(
+                is_dead(&exact) || !is_dead(&card),
+                "at {seconds}s the card is black in front of a picture"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_keyframe_serves_as_a_card_when_lit_and_not_from_later() {
+        let mut lit = Frame::black(16, 8);
+        lit.fill([200, 40, 40, 255]);
+        assert!(serves_as_card(&lit, Some(1.5), 2.0));
+        assert!(
+            serves_as_card(&lit, Some(2.0005), 2.0),
+            "a stamp rounded long"
+        );
+        assert!(
+            !serves_as_card(&lit, Some(3.0), 2.0),
+            "from after its instant"
+        );
+        assert!(
+            !serves_as_card(&Frame::black(16, 8), Some(0.0), 2.0),
+            "black"
+        );
+        assert!(serves_as_card(&lit, None, 0.0), "a still says nothing");
+        assert!(
+            !serves_as_card(&lit, None, 2.0),
+            "footage that says nothing"
+        );
+    }
+
+    /// Sixteen seconds of a red ramp at `path`, keyframes wherever the
+    /// encoder puts them: about a second apart for this picture, scene
+    /// cuts among them.
+    fn red_ramp(path: &Path) {
+        use concat_core::time::FrameRate;
+        use concat_media::{EncodeOptions, Encoder, FrameSink};
+
+        let mut encoder =
+            Encoder::create(path, 64, 32, FrameRate::THIRTY, &EncodeOptions::default())
+                .expect("encodes");
+        for index in 0..480u32 {
+            let mut frame = Frame::black(64, 32);
+            frame.fill([(index * 255 / 479) as u8, 60, 60, 255]);
+            encoder.write_frame(&frame).expect("writes");
+        }
+        encoder.finish().expect("finishes");
+    }
+
+    /// Whether each tile of `strip`, `count` across a sixteen-second red
+    /// ramp, is a picture from its own slice of the ramp.
+    fn tiles_in_their_slices(strip: &Frame, count: u32) -> Result<(), String> {
+        let per = 255.0 / f64::from(count);
+        for tile in 0..count {
+            let red = f64::from(strip.pixel(tile * 64 + 32, 16).expect("in bounds")[0]);
+            let low = per * f64::from(tile) - 6.0;
+            let high = per * f64::from(tile + 1) + 6.0;
+            if !(low..=high).contains(&red) {
+                return Err(format!(
+                    "{count} tiles: tile {tile} is red {red}, not from {low}..{high}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// A filmstrip's tile is a picture from its own slice of the footage,
+    /// whether the strip was made from keyframes or read through: the
+    /// keyframes are taken only when every slice has one of its own, and
+    /// a keyframe the decoder hands back from later - FFmpeg's H.264 does,
+    /// asked for keyframes alone on a stream with scene cuts, which this
+    /// one has - sends the strip to the pass rather than onto the tile.
+    #[test]
+    fn a_filmstrip_tile_is_a_picture_from_its_own_slice() {
+        let path = std::env::temp_dir().join(format!(
+            "concat-filmstrip-keyframes-test-{}.mp4",
+            std::process::id()
+        ));
+        red_ramp(&path);
+        let file = path.to_string_lossy().into_owned();
+
+        for count in [4u32, 8, 16] {
+            let slice = 16.0 / f64::from(count);
+            let mut tiles: Vec<Option<Frame>> = vec![None; count as usize];
+            if keyframe_tiles(&file, 0.0, slice, 64, 32, &mut tiles) == Ok(true) {
+                let mut strip = Frame::black(64 * count, 32);
+                for (index, tile) in tiles.iter().enumerate() {
+                    strip.blit(tile.as_ref().expect("every tile"), index as u32 * 64, 0);
+                }
+                tiles_in_their_slices(&strip, count).expect("keyframes from their own slices");
+            }
+            let strip = filmstrip(&file, count, 32).expect("strips");
+            assert_eq!((strip.width(), strip.height()), (count * 64, 32));
+            tiles_in_their_slices(&strip, count).expect("tiles from their own slices");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_keyframe_is_in_a_slice_from_its_start_to_the_next_ones() {
+        assert!(in_slice(4.0, 0.0, 4.0, 1));
+        assert!(in_slice(3.9995, 0.0, 4.0, 1), "a stamp rounded short");
+        assert!(in_slice(7.9, 0.0, 4.0, 1));
+        assert!(!in_slice(8.0, 0.0, 4.0, 1));
+        assert!(!in_slice(2.0, 0.0, 4.0, 1), "the slice before");
+        assert!(in_slice(12.5, 10.0, 1.0, 2), "a window that starts later");
+    }
+
     /// A black frame is dead, a dark scene is not, and a frame with a
     /// bright corner on a black ground is not either.
     #[test]
@@ -1057,6 +1342,7 @@ mod tests {
                 })
                 .expect("places");
             let settings = DocumentSettings {
+                canvas: [0, 0, 0, 255],
                 name: name.to_owned(),
                 width: 64,
                 height: 32,

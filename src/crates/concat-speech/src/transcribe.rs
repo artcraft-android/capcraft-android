@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Whisper transcription: audio in, timed caption segments out.
 //!
@@ -26,7 +26,10 @@ use std::sync::{Arc, Mutex};
 use concat_host::{AppDirs, SingleFlight};
 use concat_media::{AudioDecoder, AudioOptions, SampleFormat};
 use serde::{Deserialize, Serialize};
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperVadContext,
+    WhisperVadContextParams, WhisperVadParams,
+};
 
 use crate::{DownloadProgress, JobStage};
 
@@ -134,10 +137,167 @@ unsafe extern "C" fn abort_when_set(user_data: *mut std::ffi::c_void) -> bool {
     unsafe { (*(user_data as *const AtomicBool)).load(Ordering::Relaxed) }
 }
 
+/// Makes sure whisper has a CPU to run on, and names that CPU.
+///
+/// A build linked whisper statically - every one but the x86_64 Windows and
+/// Linux bundles - has its CPU backend from the start. Those two link it as
+/// shared libraries, with the kernels in one module per x86_64 generation
+/// (ggml-cpu-sandybridge, -haswell, -icelake, ...), and ggml registers
+/// nothing until it is told where to look: it then scores every module it
+/// finds against the CPU and loads the best one. That is how the same
+/// bundle runs AVX2, FMA and F16C on a Haswell or a Ryzen - eight times as
+/// fast as the AVX-only build on a Ryzen 5 2600 (#388) - and still runs on
+/// a Sandy Bridge (#193, #318).
+///
+/// The modules are beside the program on Windows and in its lib/ folder on
+/// Linux; a `cargo test` binary is one folder further down, in deps/.
+/// Only those folders are searched - not the working directory, which ggml
+/// would otherwise also look in. ggml logs which module it chose.
+///
+/// Called once per process; later calls answer from the first.
+pub fn cpu_backend() -> Result<String, String> {
+    use whisper_rs::whisper_rs_sys as sys;
+
+    fn cpu() -> Option<String> {
+        // SAFETY: a lookup in ggml's registry of devices, which ggml
+        // guards itself; the description is a C string ggml owns for the
+        // life of the process.
+        unsafe {
+            let device = sys::ggml_backend_dev_by_type(
+                sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_CPU,
+            );
+            if device.is_null() {
+                return None;
+            }
+            let description = sys::ggml_backend_dev_description(device);
+            Some(if description.is_null() {
+                "CPU".to_owned()
+            } else {
+                std::ffi::CStr::from_ptr(description)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        }
+    }
+
+    static LOADED: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    LOADED
+        .get_or_init(|| {
+            if let Some(cpu) = cpu() {
+                return Ok(cpu);
+            }
+            let program = std::env::current_exe()
+                .map_err(|error| format!("could not find the program's folder: {error}"))?;
+            let beside = program.parent().unwrap_or(std::path::Path::new("."));
+            let mut folders = vec![beside.to_path_buf(), beside.join("lib")];
+            if beside.file_name().is_some_and(|name| name == "deps")
+                && let Some(profile) = beside.parent()
+            {
+                folders.push(profile.to_path_buf());
+            }
+            for folder in &folders {
+                // ggml reads the path as UTF-8 on every platform.
+                let Some(text) = folder.to_str() else {
+                    continue;
+                };
+                let Ok(path) = std::ffi::CString::new(text) else {
+                    continue;
+                };
+                // SAFETY: a NUL-terminated path that outlives the call.
+                unsafe { sys::ggml_backend_load_all_from_path(path.as_ptr()) };
+                if let Some(cpu) = cpu() {
+                    log::info!(
+                        "whisper: CPU kernels loaded from {}: {cpu}",
+                        folder.display()
+                    );
+                    return Ok(cpu);
+                }
+            }
+            Err(format!(
+                "whisper's CPU kernels (ggml-cpu-*) are missing from {} - reinstall Concat",
+                folders[0].display()
+            ))
+        })
+        .clone()
+}
+
 fn model_file(dirs: &AppDirs, id: &str) -> Result<PathBuf, String> {
     // Ids come from our own table; anything else is a bug, not input.
     known(id).ok_or_else(|| format!("unknown model {id:?}"))?;
     Ok(models_dir(dirs)?.join(format!("ggml-{id}.bin")))
+}
+
+/// Silero VAD v6.2.0 in whisper.cpp's format, from ggml-org/whisper-vad
+/// (MIT; sha256 2aa269b7...6987). It tells whisper where the speech is, so
+/// whisper hears only that and times each caption from where its words
+/// begin. Without it a caption started where the one before had ended:
+/// the silence between them went to the next line, which came up seconds
+/// before anyone spoke (#438). Under a megabyte, so it ships inside the
+/// app rather than as a second download.
+const VAD_MODEL: &[u8] = include_bytes!("../assets/ggml-silero-v6.2.0.bin");
+
+/// The spans of `samples` (16 kHz mono) that are speech, in seconds, by
+/// Silero VAD. Empty when the model cannot be had or will not run: the
+/// captions then keep whisper's own times, as they always did.
+fn speech_spans(dirs: &AppDirs, samples: &[f32], threads: usize) -> Vec<(f64, f64)> {
+    let spans = vad_model(dirs).and_then(|path| {
+        let path = path
+            .to_str()
+            .ok_or_else(|| format!("{} is not a path whisper can open", path.display()))?
+            .to_owned();
+        let mut context_params = WhisperVadContextParams::new();
+        context_params.set_n_threads(threads as i32);
+        context_params.set_use_gpu(false);
+        let mut context = WhisperVadContext::new(&path, context_params)
+            .map_err(|error| format!("could not load {path}: {error}"))?;
+        let segments = context
+            .segments_from_samples(WhisperVadParams::new(), samples)
+            .map_err(|error| format!("voice detection failed: {error}"))?;
+        // Centiseconds, like whisper's own timestamps.
+        Ok(segments
+            .map(|span| (f64::from(span.start) / 100.0, f64::from(span.end) / 100.0))
+            .collect())
+    });
+    spans.unwrap_or_else(|error: String| {
+        log::warn!("transcribe: captions keep whisper's times: {error}");
+        Vec::new()
+    })
+}
+
+/// A caption's span drawn in to the speech it covers. Whisper starts a
+/// caption where the one before it ended, so the silence between two lines
+/// went to the second, which came up seconds before it was said (#438); the
+/// voice detector knows where the words begin and end. A caption over no
+/// detected speech - a whisper too quiet for the detector, say - keeps the
+/// times whisper gave it.
+fn on_speech(start: f64, end: f64, speech: &[(f64, f64)]) -> (f64, f64) {
+    let mut covered = speech
+        .iter()
+        .filter(|(from, to)| *from < end && *to > start);
+    let Some(&(first, mut last)) = covered.next() else {
+        return (start, end);
+    };
+    if let Some(&(_, to)) = covered.next_back() {
+        last = to;
+    }
+    (start.max(first), end.min(last))
+}
+
+/// The VAD model as a file whisper can open, written beside the
+/// transcription models the first time it is wanted.
+fn vad_model(dirs: &AppDirs) -> Result<PathBuf, String> {
+    let path = models_dir(dirs)?.join("ggml-silero-v6.2.0.bin");
+    let whole = std::fs::metadata(&path).is_ok_and(|meta| meta.len() == VAD_MODEL.len() as u64);
+    if !whole {
+        // Named for this process, so two windows writing it at once do
+        // not write into one file; whichever renames last wins, and both
+        // wrote the same bytes.
+        let part = path.with_extension(format!("part-{}", std::process::id()));
+        std::fs::write(&part, VAD_MODEL)
+            .and_then(|()| std::fs::rename(&part, &path))
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    }
+    Ok(path)
 }
 
 /// One model, as the settings panel shows it.
@@ -289,6 +449,18 @@ impl Transcriber {
         Ok(())
     }
 
+    /// What model `id` is called as a file, and every address a download
+    /// of it tries, in order: for a person whose network lets their
+    /// browser through and not Concat, who can fetch the first in the
+    /// browser and hand the file to [`concat_host::models::supply`] under
+    /// that name. `None` for a model Concat does not know.
+    pub fn model_sources(id: &str) -> Option<(String, Vec<String>)> {
+        known(id)?;
+        let file = model_archive(id);
+        let sources = concat_host::models::sources(&file, &model_upstream(id));
+        Some((file, sources))
+    }
+
     /// Asks the running download to stop. Idle is a harmless no-op.
     pub fn cancel_download(&self) {
         self.downloads.cancel();
@@ -373,6 +545,7 @@ impl Transcriber {
         if loaded.as_ref().map(|model| model.id.as_str()) != Some(request.model_id.as_str()) {
             // Load before overwriting: a failed load keeps the old model.
             progress(JobStage::Loading);
+            cpu_backend()?;
             let context =
                 WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
                     .map_err(|error| format!("could not load the model: {error}"))?;
@@ -386,8 +559,12 @@ impl Transcriber {
             .create_state()
             .map_err(|error| format!("could not start whisper: {error}"))?;
 
+        // Two hardware threads are left to the rest of the app: playback,
+        // the window and the decoders. On every one of a four-core
+        // machine's eight, whisper starved them, and the preview stuttered
+        // and its sound broke up for as long as a run went on (#388).
         let threads = std::thread::available_parallelism()
-            .map(|count| count.get().min(8))
+            .map(|count| count.get().saturating_sub(2).clamp(1, 8))
             .unwrap_or(4);
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(threads as i32);
@@ -435,9 +612,20 @@ impl Transcriber {
             });
         });
 
-        state
-            .full(params, &samples)
-            .map_err(|error| format!("transcription failed: {error}"))?;
+        // Where the speech is, for timing the captions; see `VAD_MODEL`.
+        // Without it the captions come out as whisper timed them.
+        let speech = speech_spans(dirs, &samples, threads);
+        let run = state.full(params, &samples);
+
+        // An abort ends whisper's run as an error of its own - "failed to
+        // encode", -6 - so a Cancel read as a failure, and the person was
+        // told transcription failed when they had stopped it (#388).
+        if let Err(error) = run {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("transcription cancelled".to_owned());
+            }
+            return Err(format!("transcription failed: {error}"));
+        }
         if cancel.load(Ordering::Relaxed) {
             return Err("transcription cancelled".to_owned());
         }
@@ -448,6 +636,7 @@ impl Transcriber {
                 // Whisper's timestamps are centiseconds.
                 let start = segment.start_timestamp() as f64 / 100.0;
                 let end = segment.end_timestamp() as f64 / 100.0;
+                let (start, end) = on_speech(start, end, &speech);
                 let text = segment.to_str_lossy().ok()?.trim().to_owned();
                 keep_segment(start, end, text)
             })
@@ -478,6 +667,57 @@ fn keep_segment(start: f64, end: f64, text: String) -> Option<Segment> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Prints the captions a downloaded model makes of a file, for timing
+    /// them by hand against the speech: `CONCAT_CAPTION_FILE=talk.wav
+    /// CONCAT_CAPTION_MODEL=base.en cargo test -p concat-speech --
+    /// --ignored --nocapture captions_of_a_file`.
+    #[test]
+    #[ignore = "needs a downloaded model and a file to caption"]
+    fn captions_of_a_file() {
+        let path = std::env::var("CONCAT_CAPTION_FILE").expect("CONCAT_CAPTION_FILE");
+        let model_id = std::env::var("CONCAT_CAPTION_MODEL").unwrap_or("base.en".to_owned());
+        let dirs = AppDirs::locate().expect("app dirs");
+        // Past the end is fine: the decoder stops where the sound does.
+        let window = 3600.0;
+        let segments = Transcriber::new()
+            .transcribe(
+                &dirs,
+                &TranscribeRequest {
+                    path,
+                    audio_stream: None,
+                    source_start: 0.0,
+                    window,
+                    model_id,
+                },
+                |_| {},
+            )
+            .expect("transcribes");
+        for segment in segments {
+            println!(
+                "{:7.2} {:7.2}  {}",
+                segment.start, segment.end, segment.text
+            );
+        }
+    }
+
+    /// The reporter's clip in #438: five lines, each after a silence.
+    /// Whisper started each where the last had ended; the speech says
+    /// where it starts.
+    #[test]
+    fn a_caption_starts_and_ends_with_the_speech_it_covers() {
+        let speech = [(3.07, 4.93), (14.08, 16.48), (25.09, 27.52)];
+        assert_eq!(on_speech(0.0, 7.0, &speech), (3.07, 4.93));
+        assert_eq!(on_speech(7.0, 18.0, &speech), (14.08, 16.48));
+        // A line whisper split in two keeps its split.
+        assert_eq!(on_speech(25.0, 26.0, &speech), (25.09, 26.0));
+        assert_eq!(on_speech(26.0, 30.0, &speech), (26.0, 27.52));
+        // Two spans under one caption: from the first to the last.
+        assert_eq!(on_speech(0.0, 20.0, &speech), (3.07, 16.48));
+        // Over no detected speech, or with no detector: whisper's times.
+        assert_eq!(on_speech(40.0, 45.0, &speech), (40.0, 45.0));
+        assert_eq!(on_speech(0.0, 7.0, &[]), (0.0, 7.0));
+    }
 
     #[test]
     fn stage_directions_and_degenerate_spans_are_not_captions() {

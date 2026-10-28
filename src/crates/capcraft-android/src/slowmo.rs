@@ -395,6 +395,7 @@ impl MobileSession {
                 item,
                 source_start: entry.get("sourceStart").and_then(Value::as_f64),
                 enhanced: false,
+                offset: 0.0,
             }])?;
             listener.on_done(Some(view));
             return Ok(());
@@ -444,6 +445,7 @@ impl MobileSession {
                                 item: info.to_new_media(),
                                 source_start: Some(0.0),
                                 enhanced: false,
+                                offset: 0.0,
                             },
                             Command::SetTimelineExtra {
                                 key: SMOOTHED.to_owned(),

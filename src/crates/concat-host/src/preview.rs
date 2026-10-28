@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The paused monitor's true frame.
 //!
@@ -54,6 +54,9 @@ pub struct FrameSpec {
     /// What the timeline is output in: an HDR one keeps its clips' light
     /// above white and is rolled off for the SDR screen.
     pub color_space: ColorSpace,
+    /// What shows where no picture covers the frame; see
+    /// `VideoSettings::canvas`.
+    pub canvas: [u8; 4],
 }
 
 impl FrameSpec {
@@ -91,6 +94,7 @@ struct PlanEntry {
     height: u32,
     rate: (i64, i64),
     color_space: ColorSpace,
+    canvas: [u8; 4],
     plan: Arc<concat_export::PreviewPlan>,
 }
 
@@ -245,6 +249,7 @@ impl Monitor {
             // layer of its own.
             let frame = sources.composite(&mut *gpu);
             let mut plan = concat_render::FramePlan::empty(spec.width, spec.height);
+            plan.canvas = spec.canvas;
             plan.layers.push(concat_render::PlannedLayer::picture(
                 concat_render::detached_clip(),
                 Arc::new(frame),
@@ -277,6 +282,7 @@ impl Monitor {
             && entry.height == spec.height
             && entry.rate == rate
             && entry.color_space == spec.color_space
+            && entry.canvas == spec.canvas
             && (Arc::ptr_eq(&entry.clips, &clips) || *entry.clips == *clips)
         {
             return Arc::clone(&entry.plan);
@@ -288,6 +294,7 @@ impl Monitor {
             rate.0,
             rate.1,
             spec.color_space,
+            spec.canvas,
         ));
         *slot = Some(PlanEntry {
             clips,
@@ -295,6 +302,7 @@ impl Monitor {
             height: spec.height,
             rate,
             color_space: spec.color_space,
+            canvas: spec.canvas,
             plan: Arc::clone(&plan),
         });
         plan
@@ -389,6 +397,17 @@ impl Monitor {
             1.0 / fps,
             moments,
         );
+    }
+
+    /// Forgets the kept plan, so the next frame builds it again: for when
+    /// something the plan read from the project folder - a stabilized
+    /// clip's measured movement - has changed under a clip list that has
+    /// not.
+    pub fn forget_plan(&self) {
+        *self
+            .plan
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Forgets every cached frame, reader and plan, for when the project

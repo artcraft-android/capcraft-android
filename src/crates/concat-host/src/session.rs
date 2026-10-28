@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The engine-owned editing session.
 //!
@@ -117,6 +117,11 @@ impl Session {
             }
             changed
         });
+        // 0.2.4's mask effects, retired with no stand-in on the chain,
+        // open as the clip's own mask (#239).
+        for old in editor.upgrade_mask_effects() {
+            upgraded.push((old, "mask".to_owned()));
+        }
         // Fields an earlier version wrote and this one does not read, off
         // the clips, with the clips named for the window to say so.
         let retired = editor.drop_retired_fields();
@@ -139,6 +144,7 @@ impl Session {
                 height: info.height,
                 rate_num: info.rate_num,
                 rate_den: info.rate_den,
+                canvas: info.canvas,
             },
         )
     }
@@ -177,6 +183,7 @@ impl Session {
             height: video.height,
             rate_num: video.rate_num,
             rate_den: video.rate_den,
+            canvas: video.canvas,
         }
     }
 
@@ -329,6 +336,7 @@ mod tests {
 
     fn settings() -> DocumentSettings {
         DocumentSettings {
+            canvas: [0, 0, 0, 255],
             name: "Test".to_owned(),
             width: 1920,
             height: 1080,
@@ -343,8 +351,16 @@ mod tests {
             std::env::temp_dir().join(format!("concat-session-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).expect("scratch dir");
-        let info = projects::create(&scratch.to_string_lossy(), "Fresh", 1920, 1080, 30, 1)
-            .expect("creates");
+        let info = projects::create(
+            &scratch.to_string_lossy(),
+            "Fresh",
+            1920,
+            1080,
+            30,
+            1,
+            [0, 0, 0, 255],
+        )
+        .expect("creates");
 
         let mut session = Session::open_info(&info).expect("opens the settings-only manifest");
         assert!(!session.can_undo());
@@ -359,6 +375,7 @@ mod tests {
         assert!(view.can_undo);
         session
             .set_video(VideoSettings {
+                canvas: [0, 0, 0, 255],
                 width: 1280,
                 height: 720,
                 rate_num: 25,

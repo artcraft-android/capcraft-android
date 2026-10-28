@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Planning and running the audio mix.
 //!
@@ -74,6 +74,46 @@ pub struct AudioClip {
     pub fade_out: f64,
     /// Extra FFmpeg audio filters, or empty. Validated, not trusted.
     pub filter_chain: String,
+}
+
+/// A treatment of the whole mix over a stretch of the timeline: a sound
+/// layer. Its chain hears only what plays inside its span, and what it
+/// gives back takes the untreated mix's place there by `strength`, ramped
+/// in and out by its fades - the reading a picture layer gets over the
+/// tracks beneath it, given to sound.
+///
+/// A bus over the sum and not the same chain copied onto every clip under
+/// it: a compressor or a limiter over the sum is a different sound from
+/// one on each part, and a reverb over the sum is one room rather than
+/// several.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioBus {
+    /// Where the span starts on the timeline, in seconds.
+    pub start: f64,
+    /// How long it runs, in seconds.
+    pub duration: f64,
+    /// The FFmpeg audio filters run over the mix. Validated, not trusted.
+    pub filter_chain: String,
+    /// How much of the treated sound replaces the untreated, `0..=1`: the
+    /// layer's wet and dry.
+    pub strength: f64,
+    /// Seconds over which the treatment comes in from the span's start.
+    pub fade_in: f64,
+    /// Seconds over which it goes out into the span's end.
+    pub fade_out: f64,
+}
+
+impl AudioBus {
+    /// Where the span ends on the timeline.
+    pub fn end(&self) -> f64 {
+        self.start + self.duration
+    }
+
+    /// Whether the bus changes anything: a chain to run, some strength to
+    /// run it at, and some time to run it for.
+    pub fn audible(&self) -> bool {
+        !self.filter_chain.is_empty() && self.strength > 0.0 && self.duration > 0.0
+    }
 }
 
 /// An FFmpeg `volume` expression for a gain that changes over a clip, or
@@ -210,21 +250,120 @@ pub fn tempo_stages(speed: f64) -> Vec<f64> {
 /// rather than treating silence as a stream. The caller decides membership
 /// by probing; this function decides what the mix means.
 pub fn mix_graph(clips: &[AudioClip]) -> Result<String> {
-    mix_graph_from(clips, &vec![0.0; clips.len()])
+    mix_graph_with(clips, &[])
 }
 
-/// [`mix_graph`] for inputs that did not land exactly on their in-point:
-/// `leads[N]` is how many seconds before its clip's in-point input `N`
-/// starts, which the graph cuts off the front. A container seek lands on
-/// the packet at or before the target - a whole AAC frame early, 21 ms -
-/// and `mix_to_file` measures the miss from the first decoded frame; on
-/// the continuous clock it stamps, the trim is then exact.
-fn mix_graph_from(clips: &[AudioClip], leads: &[f64]) -> Result<String> {
+/// [`mix_graph`] with sound layers over the mix: each bus treats the sum
+/// of every clip for its span, in the order given.
+pub fn mix_graph_with(clips: &[AudioClip], buses: &[AudioBus]) -> Result<String> {
+    let heard: Vec<Heard> = clips.iter().map(Heard::whole).collect();
+    mix_graph_from(clips, &heard, 0.0, buses)
+}
+
+/// How much of one clip an input of the mix carries, and how it landed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Heard {
+    /// Seconds into the clip's span where what is heard starts: zero for
+    /// the whole clip, more for one a window cuts into.
+    from: f64,
+    /// Seconds into the clip's span where it stops.
+    to: f64,
+    /// How many seconds before that point the input actually starts. A
+    /// container seek lands on the packet at or before the target - a
+    /// whole AAC frame early, 21 ms - and `run_mix` measures the miss from
+    /// the first decoded frame; on the continuous clock it stamps, the
+    /// graph's cut is then exact. A lead below zero is sound that starts
+    /// after that point - a file whose picture starts before its sound -
+    /// and that much silence goes in front.
+    lead: f64,
+}
+
+impl Heard {
+    /// All of `clip`, landed exactly.
+    fn whole(clip: &AudioClip) -> Heard {
+        Heard {
+            from: 0.0,
+            to: clip.duration,
+            lead: 0.0,
+        }
+    }
+
+    /// The part of `clip` inside the timeline's `[from, to)`, or None when
+    /// none of it is.
+    fn inside(clip: &AudioClip, from: f64, to: f64) -> Option<Heard> {
+        let start = (from - clip.start).max(0.0);
+        let end = (to - clip.start).min(clip.duration);
+        (end > start).then_some(Heard {
+            from: start,
+            to: end,
+            lead: 0.0,
+        })
+    }
+}
+
+/// The few milliseconds a bus's hard edges are softened over. Its chain is
+/// cut in and out of the mix where its span starts and ends, and an edge
+/// with no length at all is a click.
+const BUS_EDGE: f64 = 0.002;
+
+/// One bus's stage of the graph, from `[s{index}]` to `[s{index + 1}]`,
+/// with `origin` the timeline second the graph's clock starts at.
+///
+/// Three copies of the mix are summed: the mix itself, the mix taken away
+/// again by the bus's ramp and strength, and the chain's output given back
+/// by the same. Outside the span the second and third are silence - an
+/// `afade` silences what lies before a fade in and after a fade out - so
+/// the mix passes there sample for sample; inside it the treated sound has
+/// taken `strength` of the untreated one's place. The chain is fed only
+/// what plays inside the span, so an echo does not repeat what came before
+/// the layer, and what it rings on with past the span is cut at the end.
+fn bus_stage(index: usize, bus: &AudioBus, origin: f64) -> String {
+    let start = (bus.start - origin).max(0.0);
+    let end = start + bus.duration.max(0.0);
+    let edge = BUS_EDGE.min(bus.duration / 2.0).max(1e-4);
+    let ramp_in = bus.fade_in.clamp(edge, bus.duration.max(edge));
+    let ramp_out = bus.fade_out.clamp(edge, bus.duration.max(edge));
+    let strength = bus.strength.clamp(0.0, 1.0);
+    let gate = format!(
+        "afade=t=in:st={start:.6}:d={edge:.6},afade=t=out:st={:.6}:d={edge:.6}",
+        (end - edge).max(start)
+    );
+    let ramp = format!(
+        "afade=t=in:st={start:.6}:d={ramp_in:.6},afade=t=out:st={:.6}:d={ramp_out:.6}",
+        (end - ramp_out).max(start)
+    );
+    let chain = &bus.filter_chain;
+    let (here, next) = (format!("s{index}"), format!("s{}", index + 1));
+    // Restamped after the sum, as before the first stage: a chain's
+    // output need not stamp its frames the way its input did, and the
+    // next stage's fades are placed by the stamps.
+    format!(
+        "[{here}]asplit=3[{here}d][{here}u][{here}t];\
+         [{here}u]{ramp},volume=-{strength:.6}[{here}n];\
+         [{here}t]{gate},{chain},{ramp},volume={strength:.6}[{here}w];\
+         [{here}d][{here}n][{here}w]amix=inputs=3:normalize=0,aresample={MIX_RATE},asetpts=N/SR/TB[{next}]"
+    )
+}
+
+/// The graph for `clips`, each heard as `heard` says, on a clock that
+/// starts at the timeline's `origin` second, with `buses` over the sum.
+fn mix_graph_from(
+    clips: &[AudioClip],
+    heard: &[Heard],
+    origin: f64,
+    buses: &[AudioBus],
+) -> Result<String> {
     let mut chains: Vec<String> = Vec::new();
 
     for (index, clip) in clips.iter().enumerate() {
         validate_chain(&clip.filter_chain)?;
-        let delay_ms = (clip.start * 1000.0).round().max(0.0) as i64;
+        let heard = heard
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| Heard::whole(clip));
+        let delay_ms = ((clip.start + heard.from - origin) * 1000.0)
+            .round()
+            .max(0.0) as i64;
         let speed = clamp_speed(clip.speed);
 
         // Each input is cut to its in-point, restamped from zero, then delayed
@@ -238,9 +377,11 @@ fn mix_graph_from(clips: &[AudioClip], leads: &[f64]) -> Result<String> {
         // paused recordings) cannot park frames outside the mix, and the
         // out-point is a sample count too - it stops feeding the input at
         // `duration * speed` source seconds; see `MixInput::clip_samples`.
-        let lead = leads.get(index).copied().unwrap_or(0.0);
+        let lead = heard.lead;
         let mut stage = if lead > 0.0 {
             format!("[{index}:a]atrim=start={lead:.6},asetpts=PTS-STARTPTS")
+        } else if lead < -0.0005 {
+            format!("[{index}:a]adelay=delays={:.3}:all=1", -lead * 1000.0)
         } else {
             format!("[{index}:a]anull")
         };
@@ -248,6 +389,15 @@ fn mix_graph_from(clips: &[AudioClip], leads: &[f64]) -> Result<String> {
         for filter in speed_filters(speed, clip.preserve_pitch) {
             stage.push(',');
             stage.push_str(&filter);
+        }
+
+        // A clip a window cuts into is shaped on its own clock still: its
+        // gain ride and its fades are read from where the clip starts, so
+        // what is heard of it here is what the whole clip has at that
+        // moment. The stamps are moved on by what was cut, and back after.
+        let cut = heard.from > 0.0;
+        if cut {
+            stage.push_str(&format!(",asetpts=PTS-STARTPTS+{:.6}/TB", heard.from));
         }
 
         // Filters first: they are what the clip *is* now, and gain and fades
@@ -278,6 +428,9 @@ fn mix_graph_from(clips: &[AudioClip], leads: &[f64]) -> Result<String> {
                 clip.fade_out
             ));
         }
+        if cut {
+            stage.push_str(",asetpts=PTS-STARTPTS");
+        }
 
         stage.push_str(&format!(",adelay={delay_ms}:all=1[a{index}]"));
         chains.push(stage);
@@ -286,11 +439,13 @@ fn mix_graph_from(clips: &[AudioClip], leads: &[f64]) -> Result<String> {
     let inputs: String = (0..clips.len())
         .map(|index| format!("[a{index}]"))
         .collect();
-    let mix = if clips.len() == 1 {
+    let mix = match clips.len() {
+        // Nothing to hear: silence, for as long as it is read, so a window
+        // with no clip in it still comes out its length.
+        0 => format!("anullsrc=r={MIX_RATE}:cl=stereo[mixed]"),
         // amix with one input would still apply its normalisation curve.
-        format!("{inputs}anull[mixed]")
-    } else {
-        format!("{inputs}amix=inputs={}:normalize=0[mixed]", clips.len())
+        1 => format!("{inputs}anull[mixed]"),
+        count => format!("{inputs}amix=inputs={count}:normalize=0[mixed]"),
     };
 
     // The `aresample` is load-bearing, and not about sample rates.
@@ -321,7 +476,26 @@ fn mix_graph_from(clips: &[AudioClip], leads: &[f64]) -> Result<String> {
     // split makes - so the trim never saw the end come and the pad went on
     // forever: an export with a split clip never finished. `mix_to_file`
     // counts the samples it takes instead, on the clock it stamps itself.
-    chains.push(format!("{mix};[mixed]aresample={MIX_RATE},apad[out]"));
+    //
+    // The sound layers go between the two: over the sum, and before the
+    // pad, so a chain never runs over the silence the reader takes past
+    // the end. Their fades are placed by the stamps, so the mix is
+    // restamped from its own sample count first - `N/SR` is the graph's
+    // clock, which starts at `origin` - rather than trusting what `amix`
+    // and the resampler left on it.
+    let mut stages = String::new();
+    let mut count = 0;
+    for bus in buses.iter().filter(|bus| bus.audible()) {
+        validate_chain(&bus.filter_chain)?;
+        stages.push(';');
+        stages.push_str(&bus_stage(count, bus, origin));
+        count += 1;
+    }
+    chains.push(if count == 0 {
+        format!("{mix};[mixed]aresample={MIX_RATE},apad[out]")
+    } else {
+        format!("{mix};[mixed]aresample={MIX_RATE},asetpts=N/SR/TB[s0]{stages};[s{count}]apad[out]")
+    });
 
     Ok(chains.join(";"))
 }
@@ -337,6 +511,8 @@ struct MixInput {
     input: ffmpeg::format::context::Input,
     stream: usize,
     decoder: ffmpeg::codec::decoder::Audio,
+    /// A packet the codec refused while full; see [`crate::feed`].
+    held: crate::feed::Held<ffmpeg::Packet>,
     label: String,
     done: bool,
     /// Samples already sent to the graph for this clip.
@@ -351,63 +527,262 @@ impl MixInput {
         if self.done {
             return Ok(None);
         }
-        loop {
-            let mut frame = Audio::empty();
-            match self.decoder.receive_frame(&mut frame) {
-                Ok(()) => return Ok(Some(frame)),
-                Err(ffmpeg::Error::Eof) => {
-                    self.done = true;
-                    return Ok(None);
-                }
-                Err(error) if ffi::is_again(&error) => {}
-                Err(error) => return Err(ffi::fail("decode", &self.path, error)),
+        let read = || crate::feed::read_packet(&mut self.input, self.stream);
+        match crate::feed::next_frame(&mut self.decoder, &mut self.held, read) {
+            Ok(Some(mut frame)) => {
+                ffi::name_channels(&mut frame);
+                Ok(Some(frame))
             }
-            loop {
-                let mut packet = ffmpeg::Packet::empty();
-                match packet.read(&mut self.input) {
-                    Ok(()) => {
-                        if packet.stream() != self.stream {
-                            continue;
-                        }
-                        match self.decoder.send_packet(&packet) {
-                            Ok(()) => break,
-                            Err(error) if ffi::is_again(&error) => break,
-                            Err(error) => return Err(ffi::fail("send packet", &self.path, error)),
-                        }
-                    }
-                    Err(ffmpeg::Error::Eof) => {
-                        let _ = self.decoder.send_eof();
-                        break;
-                    }
-                    Err(error) => return Err(ffi::fail("read", &self.path, error)),
-                }
+            Ok(None) => {
+                self.done = true;
+                Ok(None)
             }
+            Err(stall) => Err(crate::feed::fail(stall, &self.path)),
         }
     }
 }
 
-/// Mixes `clips` into one AAC file at `destination`.
+/// The Opus encoder to mix into and the samples it takes: libopus where it
+/// is linked, which the desktops' builds and Homebrew carry, and FFmpeg's
+/// own otherwise, which every build has - a phone's included. A WebM takes
+/// Opus or Vorbis and nothing else, and Opus is the better of the two.
+fn opus_encoder() -> Result<(&'static str, Sample)> {
+    use ffmpeg::util::format::sample::Type;
+    if encoder::find_by_name("libopus").is_some() {
+        return Ok(("libopus", Sample::F32(Type::Packed)));
+    }
+    if encoder::find_by_name("opus").is_some() {
+        return Ok(("opus", Sample::F32(Type::Planar)));
+    }
+    Err(Error::Missing {
+        what: "encoder",
+        name: "opus".to_owned(),
+    })
+}
+
+/// Mixes `clips` into one audio file at `destination`: 16-bit PCM for a
+/// `.wav` destination (case-insensitive), Opus for a `.webm`, `.opus`,
+/// `.ogg` or `.mka` one, AAC otherwise, at 48 kHz stereo.
 ///
 /// Every clip's file must contain an audio stream; see [`mix_graph`].
 pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Result<()> {
+    mix_to_file_with(clips, &[], duration, destination)
+}
+
+/// [`mix_to_file`] with sound layers over the mix; see [`AudioBus`].
+pub fn mix_to_file_with(
+    clips: &[AudioClip],
+    buses: &[AudioBus],
+    duration: f64,
+    destination: &Path,
+) -> Result<()> {
+    let extension = destination
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+    let wav = extension.as_deref() == Some("wav");
+    let opus = matches!(extension.as_deref(), Some("webm" | "opus" | "ogg" | "mka"));
     ffi::init();
+    let (codec_name, mix_format) = if wav {
+        (
+            "pcm_s16le",
+            Sample::I16(ffmpeg::util::format::sample::Type::Packed),
+        )
+    } else if opus {
+        opus_encoder()?
+    } else {
+        ("aac", MIX_FORMAT)
+    };
     // A bad chain is refused before any file is opened.
-    for clip in clips {
-        validate_chain(&clip.filter_chain)?;
+    for chain in clips
+        .iter()
+        .map(|clip| &clip.filter_chain)
+        .chain(buses.iter().map(|bus| &bus.filter_chain))
+    {
+        validate_chain(chain)?;
     }
+
+    // The encoder, and the file it writes into.
+    let codec = encoder::find_by_name(codec_name).ok_or_else(|| Error::Missing {
+        what: "encoder",
+        name: codec_name.to_owned(),
+    })?;
+    let mut output = ffmpeg::format::output(destination)
+        .map_err(|error| ffi::fail("create", destination, error))?;
+    let global_header = output
+        .format()
+        .flags()
+        .contains(ffmpeg::format::Flags::GLOBAL_HEADER);
+    let mut audio = ffmpeg::codec::Context::new_with_codec(codec)
+        .encoder()
+        .audio()
+        .map_err(|error| ffi::fail("audio encoder", destination, error))?;
+    audio.set_rate(MIX_RATE as i32);
+    audio.set_format(mix_format);
+    audio.set_ch_layout(ChannelLayout::STEREO);
+    if !wav {
+        audio.set_bit_rate(192_000);
+    }
+    audio.set_time_base(ffmpeg::Rational::new(1, MIX_RATE as i32));
+    if global_header {
+        audio.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
+    }
+    // FFmpeg's own Opus encoder is still marked experimental, and opens
+    // only when told that is all right; libopus needs no such word.
+    if codec_name == "opus" {
+        audio.compliance(ffmpeg::codec::Compliance::Experimental);
+    }
+    let mut encoder = audio
+        .open()
+        .map_err(|error| ffi::fail("open encoder", destination, error))?;
+    // PCM accepts variable-size frames. Use blocks rather than one sample
+    // per packet; run_mix keeps the final block's exact sample count.
+    let frame_size = if wav {
+        1024
+    } else {
+        encoder.frame_size().max(1)
+    };
+    {
+        let mut stream = output
+            .add_stream(codec)
+            .map_err(|error| ffi::fail("add stream", destination, error))?;
+        stream.copy_parameters_from_context(&encoder);
+        stream.set_time_base(ffmpeg::Rational::new(1, MIX_RATE as i32));
+    }
+    output
+        .write_header()
+        .map_err(|error| ffi::fail("write header", destination, error))?;
+    let stream_time_base = output
+        .stream(0)
+        .map(|stream| stream.time_base())
+        .unwrap_or(ffmpeg::Rational::new(1, MIX_RATE as i32));
+
+    let encoder_time_base = ffmpeg::Rational::new(1, MIX_RATE as i32);
+    let drain = |encoder: &mut encoder::audio::Encoder,
+                 output: &mut ffmpeg::format::context::Output|
+     -> Result<()> {
+        loop {
+            let mut packet = ffmpeg::Packet::empty();
+            match encoder.receive_packet(&mut packet) {
+                Ok(()) => {
+                    packet.set_stream(0);
+                    packet.rescale_ts(encoder_time_base, stream_time_base);
+                    packet
+                        .write_interleaved(output)
+                        .map_err(|error| ffi::fail("write packet", destination, error))?;
+                }
+                Err(ffmpeg::Error::Eof) => return Ok(()),
+                Err(error) if ffi::is_again(&error) => return Ok(()),
+                Err(error) => return Err(ffi::fail("encode", destination, error)),
+            }
+        }
+    };
+
+    run_mix(
+        clips,
+        buses,
+        (0.0, duration),
+        mix_format.name(),
+        Some(frame_size),
+        destination,
+        |mixed| {
+            encoder
+                .send_frame(mixed)
+                .map_err(|error| ffi::fail("encode", destination, error))?;
+            drain(&mut encoder, &mut output)
+        },
+    )?;
+
+    // Flushed and closed whichever way the mix ended: an m4a without its
+    // trailer cannot be opened by the muxer.
+    encoder
+        .send_eof()
+        .map_err(|error| ffi::fail("encode", destination, error))?;
+    drain(&mut encoder, &mut output)?;
+    output
+        .write_trailer()
+        .map_err(|error| ffi::fail("write trailer", destination, error))
+}
+
+/// The mix of the timeline's `[from, to)` - every clip inside it, cut at
+/// its edges, with `buses` over the sum - as 16-bit stereo at
+/// [`MIX_RATE`], handed to `write` a frame's interleaved bytes at a time.
+///
+/// What a player that mixes clips itself plays where a sound layer runs:
+/// the layer is over the sum, which no one clip's sound can carry, so the
+/// span is mixed here, once, the way the export mixes it. A clip a window
+/// cuts into keeps its own clock (see `Heard`), so the window's sound is
+/// the export's sound over the same stretch.
+pub fn mix_pcm(
+    clips: &[AudioClip],
+    buses: &[AudioBus],
+    from: f64,
+    to: f64,
+    mut write: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    ffi::init();
+    for chain in clips
+        .iter()
+        .map(|clip| &clip.filter_chain)
+        .chain(buses.iter().map(|bus| &bus.filter_chain))
+    {
+        validate_chain(chain)?;
+    }
+    run_mix(
+        clips,
+        buses,
+        (from, to),
+        "s16",
+        None,
+        Path::new("the mix"),
+        |mixed| {
+            // Packed: one plane, two channels of two bytes a sample. The
+            // plane can be padded past the samples, so it is cut to them.
+            let bytes = mixed.samples() * 4;
+            let plane = mixed.data(0);
+            write(&plane[..bytes.min(plane.len())])
+        },
+    )
+}
+
+/// Opens the clips heard inside `window`, builds their graph and runs it,
+/// handing `take` every frame of the mix in `format` (stereo, at
+/// [`MIX_RATE`]) until the window's length has been taken. `frame_size`,
+/// when given, is what each frame is cut to - an encoder's frame.
+fn run_mix(
+    clips: &[AudioClip],
+    buses: &[AudioBus],
+    window: (f64, f64),
+    format: &str,
+    frame_size: Option<u32>,
+    destination: &Path,
+    mut take: impl FnMut(&Audio) -> Result<()>,
+) -> Result<()> {
+    let (from, to) = window;
     let missing = |name: &str| Error::Missing {
         what: "filter",
         name: name.to_owned(),
     };
 
+    // The clips with something inside the window, and how much of each.
+    let mut members: Vec<AudioClip> = Vec::new();
+    let mut heard: Vec<Heard> = Vec::new();
+    for clip in clips {
+        if let Some(part) = Heard::inside(clip, from, to) {
+            members.push(clip.clone());
+            heard.push(part);
+        }
+    }
+
     // Open every input first, and read one frame from each: the graph's
     // sources are described by what actually comes out of the decoders.
-    let mut inputs: Vec<MixInput> = Vec::with_capacity(clips.len());
-    let mut first_frames: Vec<Audio> = Vec::with_capacity(clips.len());
-    let mut leads: Vec<f64> = Vec::with_capacity(clips.len());
+    let mut inputs: Vec<MixInput> = Vec::with_capacity(members.len());
+    let mut first_frames: Vec<Audio> = Vec::with_capacity(members.len());
     let mut graph = filter::Graph::new();
-    for (index, clip) in clips.iter().enumerate() {
+    for (index, clip) in members.iter().enumerate() {
         let path = clip.path.as_path();
+        let speed = clamp_speed(clip.speed);
+        // Where in the source what is heard of the clip begins.
+        let in_point = clip.source_start + heard[index].from * speed;
         let mut input =
             ffmpeg::format::input(path).map_err(|error| ffi::fail("open", path, error))?;
         let stream_index =
@@ -418,26 +793,27 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
             })?;
         let stream = input.stream(stream_index).expect("just found");
         let time_base = stream.time_base();
-        // Where the stream's clock starts: taken off what is read, put
-        // back on the seek, so the in-point is measured from the sound's
-        // own first sample. See `ffi::start_of`.
-        let start = ffi::start_of(&stream).as_f64();
+        // Where the file's clock starts: taken off what is read, put back
+        // on the seek, so the in-point is measured from the same instant
+        // the picture's is. See `ffi::origin`.
+        let start = ffi::origin(&input).as_f64();
         let decoder = ffmpeg::codec::Context::from_parameters(stream.parameters())
             .and_then(|context| context.decoder().audio())
             .map_err(|error| ffi::fail("open decoder", path, error))?;
-        // Near the in-point: the packet at or before it. The graph cuts the
-        // rest, by the lead measured off the first frame below.
-        if clip.source_start > 0.0 {
-            let target =
-                ((clip.source_start + start) * f64::from(ffmpeg::sys::AV_TIME_BASE)) as i64;
-            let _ = input.seek(target, ..=target);
+        // Near the in-point: the packet of the sound at or before it, on the
+        // sound's own timestamps. The graph cuts the rest, by the lead
+        // measured off the first frame below.
+        if in_point > 0.0 {
+            let _ = ffi::seek_audio(&mut input, stream_index, in_point + start);
         }
+        ffi::read_only(&mut input, stream_index);
         let label = format!("{index}:a");
         let mut mix_input = MixInput {
             path: path.to_path_buf(),
             input,
             stream: stream_index,
             decoder,
+            held: None,
             label,
             done: false,
             samples_sent: 0,
@@ -448,14 +824,15 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
         })?;
         // How far before the in-point the seek landed, by the first frame's
         // own timestamp - the one place a source timestamp is read, and
-        // only to place the cut. A frame with none, or one past the
-        // in-point, means nothing to cut.
+        // only to place the cut. A frame with none means nothing to cut;
+        // one past the in-point is sound that starts after it, which is
+        // put that far in with silence, so it stays with its picture.
         let landed = first
             .timestamp()
             .and_then(|ticks| ffi::seconds(ticks, time_base))
-            .map_or(clip.source_start, |at| at.as_f64() - start);
-        let lead = (clip.source_start - landed).max(0.0);
-        leads.push(lead);
+            .map_or(in_point, |at| at.as_f64() - start);
+        let lead = in_point - landed;
+        heard[index].lead = lead;
         // Our continuous PTS: sample count from the start of this clip.
         first.set_pts(Some(0));
         // The out-point lives here, not in the filtergraph: how many source
@@ -463,10 +840,10 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
         // sped-up clip covers more source than its timeline length, hence
         // the speed factor. The first frame goes into the graph separately
         // below, so it counts towards the total.
+        let span = heard[index].to - heard[index].from;
         mix_input.samples_sent = first.samples() as i64;
-        mix_input.clip_samples = ((clip.duration * clamp_speed(clip.speed) + lead)
-            * f64::from(first.rate()))
-        .round() as i64;
+        mix_input.clip_samples =
+            ((span * speed + lead).max(0.0) * f64::from(first.rate())).round() as i64;
         // One sample per time-base tick: the PTS we stamp is a plain
         // running sample count, so the graph's clock is the sample clock.
         let args = format!(
@@ -494,10 +871,10 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
         )
         .map_err(|error| ffi::fail("buffer sink", destination, error))?;
 
-    // The plan's `[out]` lands on the encoder's own format before the sink.
-    let graph_spec = mix_graph_from(clips, &leads)?;
+    // The plan's `[out]` lands on the reader's own format before the sink.
+    let graph_spec = mix_graph_from(&members, &heard, from, buses)?;
     let spec = format!(
-        "{graph_spec};[out]aformat=sample_fmts=fltp:sample_rates={MIX_RATE}:channel_layouts=stereo[sink]"
+        "{graph_spec};[out]aformat=sample_fmts={format}:sample_rates={MIX_RATE}:channel_layouts=stereo[sink]"
     );
     let mut parser = graph
         .input("sink", 0)
@@ -513,80 +890,18 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
     graph
         .validate()
         .map_err(|error| ffi::fail("filter graph", destination, error))?;
-
-    // The encoder, and the file it writes into.
-    let codec = encoder::find_by_name("aac").ok_or_else(|| Error::Missing {
-        what: "encoder",
-        name: "aac".to_owned(),
-    })?;
-    let mut output = ffmpeg::format::output(destination)
-        .map_err(|error| ffi::fail("create", destination, error))?;
-    let global_header = output
-        .format()
-        .flags()
-        .contains(ffmpeg::format::Flags::GLOBAL_HEADER);
-    let mut audio = ffmpeg::codec::Context::new_with_codec(codec)
-        .encoder()
-        .audio()
-        .map_err(|error| ffi::fail("audio encoder", destination, error))?;
-    audio.set_rate(MIX_RATE as i32);
-    audio.set_format(MIX_FORMAT);
-    audio.set_ch_layout(ChannelLayout::STEREO);
-    audio.set_bit_rate(192_000);
-    audio.set_time_base(ffmpeg::Rational::new(1, MIX_RATE as i32));
-    if global_header {
-        audio.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
-    }
-    let mut encoder = audio
-        .open()
-        .map_err(|error| ffi::fail("open encoder", destination, error))?;
-    let frame_size = encoder.frame_size().max(1);
-    {
-        let mut stream = output
-            .add_stream(codec)
-            .map_err(|error| ffi::fail("add stream", destination, error))?;
-        stream.copy_parameters_from_context(&encoder);
-        stream.set_time_base(ffmpeg::Rational::new(1, MIX_RATE as i32));
-    }
-    output
-        .write_header()
-        .map_err(|error| ffi::fail("write header", destination, error))?;
-    let stream_time_base = output
-        .stream(0)
-        .map(|stream| stream.time_base())
-        .unwrap_or(ffmpeg::Rational::new(1, MIX_RATE as i32));
-    {
+    if let Some(frame_size) = frame_size {
         let mut sink = graph.get("sink").expect("the graph has a sink");
         sink.sink().set_frame_size(frame_size);
     }
 
-    let encoder_time_base = ffmpeg::Rational::new(1, MIX_RATE as i32);
     // Where the mix ends, in samples of our own clock. The graph pads
     // silence past the last clip for as long as it is asked, and its
     // timestamps are not to be trusted for the cut - `amix` drops them once
     // an input ends early - so the count of what has been taken is the
     // whole of the decision, and the last frame is shortened to land on it.
-    let total_samples = (duration.max(0.0) * f64::from(MIX_RATE)).round() as i64;
+    let total_samples = ((to - from).max(0.0) * f64::from(MIX_RATE)).round() as i64;
     let mut written_samples: i64 = 0;
-    let drain = |encoder: &mut encoder::audio::Encoder,
-                 output: &mut ffmpeg::format::context::Output|
-     -> Result<()> {
-        loop {
-            let mut packet = ffmpeg::Packet::empty();
-            match encoder.receive_packet(&mut packet) {
-                Ok(()) => {
-                    packet.set_stream(0);
-                    packet.rescale_ts(encoder_time_base, stream_time_base);
-                    packet
-                        .write_interleaved(output)
-                        .map_err(|error| ffi::fail("write packet", destination, error))?;
-                }
-                Err(ffmpeg::Error::Eof) => return Ok(()),
-                Err(error) if ffi::is_again(&error) => return Ok(()),
-                Err(error) => return Err(ffi::fail("encode", destination, error)),
-            }
-        }
-    };
 
     // Feed the sources round-robin and drain the sink after every push, so
     // no input runs ahead of the others by more than a frame: what a filter
@@ -617,18 +932,14 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
                     }
                     mixed.set_pts(Some(written_samples));
                     written_samples += mixed.samples() as i64;
-                    encoder
-                        .send_frame(&mixed)
-                        .map_err(|error| ffi::fail("encode", destination, error))?;
-                    drain(&mut encoder, &mut output)?;
+                    take(&mixed)?;
                     if written_samples >= total_samples {
                         break 'mix;
                     }
                 }
                 // The graph ran dry before the timeline's end: nothing left
-                // to pad from. Break, do not return: the finalisation below
-                // this loop flushes the encoder and writes the trailer, and
-                // an m4a without its trailer cannot be opened by the muxer.
+                // to pad from. Break, do not return: the caller still has
+                // its encoder to flush and its trailer to write.
                 Err(ffmpeg::Error::Eof) => break 'mix,
                 Err(error) if ffi::is_again(&error) => break,
                 Err(error) => return Err(ffi::fail("filter output", destination, error)),
@@ -683,14 +994,7 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
             }
         }
     }
-
-    encoder
-        .send_eof()
-        .map_err(|error| ffi::fail("encode", destination, error))?;
-    drain(&mut encoder, &mut output)?;
-    output
-        .write_trailer()
-        .map_err(|error| ffi::fail("write trailer", destination, error))
+    Ok(())
 }
 
 /// Joins an already-encoded video file and audio file into `output`.
@@ -725,6 +1029,12 @@ pub fn mux(video: &Path, audio: &Path, output: &Path) -> Result<()> {
             .map_err(|error| ffi::fail("add stream", output, error))?;
         stream.set_parameters(video_stream.parameters());
         stream.set_time_base(video_tb);
+        // A WebM's alpha layer is in the packets, but the track only says
+        // it has one in its header: without the word a reader takes the
+        // picture for opaque and never opens the decoder that reads it.
+        if let Some(mode) = video_stream.metadata().get("alpha_mode") {
+            stream.metadata_mut().set("alpha_mode", mode);
+        }
     }
     {
         let mut stream = out
@@ -733,7 +1043,15 @@ pub fn mux(video: &Path, audio: &Path, output: &Path) -> Result<()> {
         stream.set_parameters(audio_stream.parameters());
         stream.set_time_base(audio_tb);
     }
-    out.write_header_with(ffmpeg::dict! { "movflags" => "+faststart" })
+    // The index up front, as the picture's own file had it - but not for
+    // ProRes, where moving it writes gigabytes a minute again for a file
+    // an editor reads whole.
+    let header = if video_stream.parameters().id() == ffmpeg::codec::Id::PRORES {
+        ffmpeg::Dictionary::new()
+    } else {
+        ffmpeg::dict! { "movflags" => "+faststart" }
+    };
+    out.write_header_with(header)
         .map_err(|error| ffi::fail("write header", output, error))?;
     let out_video_tb = out
         .stream(0)
@@ -995,7 +1313,10 @@ mod tests {
 
     #[test]
     fn an_input_that_landed_early_is_cut_to_its_in_point() {
-        let graph = mix_graph_from(&[clip("a.mp4"), clip("b.mp4")], &[0.0213, 0.0]).expect("valid");
+        let clips = [clip("a.mp4"), clip("b.mp4")];
+        let mut heard: Vec<Heard> = clips.iter().map(Heard::whole).collect();
+        heard[0].lead = 0.0213;
+        let graph = mix_graph_from(&clips, &heard, 0.0, &[]).expect("valid");
         assert!(
             graph.contains("[0:a]atrim=start=0.021300,asetpts=PTS-STARTPTS,"),
             "graph was: {graph}"
@@ -1160,6 +1481,54 @@ mod tests {
         );
     }
 
+    /// The export's mix keeps a file's sound with its picture whichever
+    /// starts first: each fixture sounds a tone half a second after its
+    /// first frame, and so does its clip in the mix, whole or cut 0.2 s in
+    /// (#457).
+    #[test]
+    fn the_mix_keeps_sound_with_its_picture_whichever_starts_first() {
+        use crate::{AudioDecoder, AudioOptions, SampleFormat};
+        let output =
+            std::env::temp_dir().join(format!("concat-mix-origin-{}.m4a", std::process::id()));
+        for fixture in ["picture-starts-late.mov", "sound-starts-late.mov"] {
+            for (source_start, want) in [(0.0, 0.5), (0.2, 0.3)] {
+                let source = format!("{}/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
+                let piece = AudioClip {
+                    duration: 1.0,
+                    source_start,
+                    ..clip(&source)
+                };
+                mix_to_file(&[piece], 1.0, &output).expect("mixes");
+                let options = AudioOptions {
+                    rate: 8_000,
+                    channels: 1,
+                    format: SampleFormat::F32,
+                    ..AudioOptions::default()
+                };
+                let mut decoder = AudioDecoder::open(&output, &options).expect("opens the mix");
+                let mut samples: Vec<f32> = Vec::new();
+                while let Some(frame) = decoder.next_frame().expect("decodes") {
+                    let bytes = &frame.data(0)[..frame.samples() * 4];
+                    samples.extend(
+                        bytes
+                            .chunks_exact(4)
+                            .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]])),
+                    );
+                }
+                let onset = samples
+                    .iter()
+                    .position(|sample| sample.abs() > 0.05)
+                    .expect("the tone is in the mix") as f64
+                    / 8_000.0;
+                assert!(
+                    (onset - want).abs() < 0.015,
+                    "{fixture} cut {source_start} s in: the tone is at {onset:.3} s, not {want}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&output);
+    }
+
     /// A trimmed clip's mix ends when the timeline does. Two pieces of one
     /// file, the second cut in at two seconds, mixed to sixteen: the mix
     /// must come out, and be sixteen seconds long.
@@ -1202,6 +1571,411 @@ mod tests {
         assert!(
             (seconds - 16.0).abs() < 0.1,
             "the mix is {seconds}s, not 16s"
+        );
+    }
+
+    fn bus(start: f64, duration: f64, chain: &str) -> AudioBus {
+        AudioBus {
+            start,
+            duration,
+            filter_chain: chain.to_owned(),
+            strength: 1.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_bus_runs_over_the_sum_between_the_resampler_and_the_pad() {
+        let graph = mix_graph_with(
+            &[clip("a.mp4"), clip("b.mp4")],
+            &[bus(1.0, 2.0, "lowpass=f=300")],
+        )
+        .expect("valid");
+        let mixed = graph
+            .find("[mixed]aresample=48000,asetpts=N/SR/TB[s0]")
+            .expect("into the bus");
+        let chain = graph.find("lowpass=f=300").expect("the chain");
+        let pad = graph.find("[s1]apad[out]").expect("out of the bus");
+        assert!(mixed < chain && chain < pad, "graph was: {graph}");
+        // Fed only what plays inside its span, and given back there.
+        assert!(
+            graph.contains(
+                "afade=t=in:st=1.000000:d=0.002000,afade=t=out:st=2.998000:d=0.002000,lowpass"
+            ),
+            "graph was: {graph}"
+        );
+        assert!(
+            graph.contains("amix=inputs=3:normalize=0"),
+            "graph was: {graph}"
+        );
+    }
+
+    #[test]
+    fn a_bus_with_nothing_to_do_leaves_the_graph_as_it_was() {
+        let plain = mix_graph(&[clip("a.mp4")]).expect("valid");
+        let mut idle = bus(0.0, 1.0, "lowpass=f=300");
+        idle.strength = 0.0;
+        for buses in [vec![idle], vec![bus(0.0, 1.0, "")]] {
+            assert_eq!(
+                mix_graph_with(&[clip("a.mp4")], &buses).expect("valid"),
+                plain
+            );
+        }
+    }
+
+    #[test]
+    fn a_bus_chain_that_escapes_its_slot_is_refused() {
+        assert!(matches!(
+            mix_graph_with(&[clip("a.mp4")], &[bus(0.0, 1.0, "anull[x]")]),
+            Err(Error::InvalidFilterChain { .. })
+        ));
+    }
+
+    /// A clip a window cuts into keeps its own clock: its fades are read
+    /// from where it starts, the stamps moved on by what was cut.
+    #[test]
+    fn a_clip_cut_by_a_window_is_shaped_on_its_own_clock() {
+        let mut shaped = clip("a.mp4");
+        shaped.start = 1.0;
+        shaped.fade_in = 0.5;
+        let heard = Heard::inside(&shaped, 1.25, 4.0).expect("inside");
+        assert_eq!((heard.from, heard.to), (0.25, 2.0));
+        let graph = mix_graph_from(&[shaped], &[heard], 1.25, &[]).expect("valid");
+        assert!(
+            graph.contains("asetpts=PTS-STARTPTS+0.250000/TB,afade=t=in:st=0:d=0.5000,asetpts=PTS-STARTPTS,adelay=0:all=1"),
+            "graph was: {graph}"
+        );
+        assert!(Heard::inside(&clip("a.mp4"), 2.0, 3.0).is_none());
+    }
+
+    /// A 440 Hz tone at half scale, stereo 16-bit, as a WAV of `seconds`.
+    fn tone_wav(path: &Path, seconds: f64) {
+        let count = (seconds * f64::from(MIX_RATE)) as usize;
+        let mut data = Vec::with_capacity(count * 4);
+        for index in 0..count {
+            let t = index as f64 / f64::from(MIX_RATE);
+            let value = (0.5 * (2.0 * std::f64::consts::PI * 440.0 * t).sin() * 32767.0) as i16;
+            data.extend_from_slice(&value.to_le_bytes());
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut bytes = Vec::with_capacity(44 + data.len());
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&MIX_RATE.to_le_bytes());
+        bytes.extend_from_slice(&(MIX_RATE * 4).to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&data);
+        std::fs::write(path, bytes).expect("writes the wav");
+    }
+
+    #[test]
+    fn saving_audio_as_wav_writes_pcm_that_decodes_with_the_expected_samples() {
+        use crate::{AudioDecoder, AudioOptions};
+
+        let dir = std::env::temp_dir().join(format!("concat-save-wav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates a folder");
+        let source = dir.join("tone.wav");
+        tone_wav(&source, 1.0);
+        let video = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("sound-starts-late.mov");
+        // A partial final encoder block must not add or discard samples.
+        let duration = 6007.0 / f64::from(MIX_RATE);
+        for (input, extension) in [(&source, "wav"), (&video, "WAV")] {
+            let piece = AudioClip {
+                path: input.clone(),
+                source_start: 0.6,
+                duration,
+                volume: 0.5,
+                fade_in: 0.02,
+                fade_out: 0.03,
+                ..clip("")
+            };
+            let clips = [piece];
+            let output = dir.join(format!("saved.{extension}"));
+            mix_to_file(&clips, duration, &output).expect("saves the WAV");
+            {
+                let input = ffmpeg::format::input(&output).expect("opens the saved file");
+                let stream = input
+                    .streams()
+                    .best(ffmpeg::media::Type::Audio)
+                    .expect("has audio");
+                assert_eq!(stream.parameters().id(), ffmpeg::codec::Id::PCM_S16LE);
+            }
+            let bytes = std::fs::read(&output).expect("reads the WAV");
+            assert_eq!(&bytes[..4], b"RIFF");
+            assert_eq!(&bytes[8..12], b"WAVE");
+            let mut decoder = AudioDecoder::open(&output, &AudioOptions::default())
+                .expect("Concat opens the saved WAV");
+            let mut actual = Vec::new();
+            while let Some(samples) = decoder.next_i16().expect("Concat decodes the WAV") {
+                actual.extend(samples);
+            }
+            assert_eq!(actual.len(), 6007 * 2, "exact stereo sample count");
+            assert!(actual.iter().any(|sample| i32::from(*sample).abs() > 1000));
+
+            let mut expected = Vec::new();
+            mix_pcm(&clips, &[], 0.0, duration, |chunk| {
+                expected.extend_from_slice(chunk);
+                Ok(())
+            })
+            .expect("mixes the reference PCM");
+            let expected: Vec<i16> = expected
+                .chunks_exact(2)
+                .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+                .collect();
+            assert_eq!(actual.len(), expected.len());
+            assert!(
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .all(|(a, b)| { (i32::from(*a) - i32::from(*b)).abs() <= 2 }),
+                "the saved audio preserves the cut, gain and fades"
+            );
+        }
+        std::fs::remove_dir_all(dir).expect("removes test files");
+    }
+
+    /// An overlay with alpha and its sound, joined the way an export joins
+    /// them: a ProRes picture with AAC in a .mov, a VP9 one with Opus in a
+    /// .webm, the only sound a WebM takes besides Vorbis. The joined WebM
+    /// still says it has an alpha layer, so the import reads it with the
+    /// decoder that keeps it.
+    #[test]
+    fn an_overlay_with_alpha_takes_its_sound_in_its_own_container() {
+        use crate::decode::{DecodeOptions, Decoder, FrameSource};
+        use crate::{AudioDecoder, AudioOptions, EncodeOptions, Encoder, FrameSink, VideoCodec};
+        use concat_core::frame::Frame;
+        use concat_core::time::FrameRate;
+
+        let dir = std::env::temp_dir().join(format!("concat-alpha-mux-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates a folder");
+        let tone = dir.join("tone.wav");
+        tone_wav(&tone, 1.0);
+        for codec in [VideoCodec::ProRes4444, VideoCodec::Vp9Alpha] {
+            if !codec.available() {
+                eprintln!("{} not in the linked FFmpeg; skipped", codec.label());
+                continue;
+            }
+            let container = codec.container();
+            let webm = container == "webm";
+            let video = dir.join(format!("picture.{container}"));
+            let sound = dir.join(if webm { "sound.webm" } else { "sound.m4a" });
+            let output = dir.join(format!("joined.{container}"));
+
+            // A second of a frame clear on its right half.
+            let mut frame = Frame::transparent(64, 64);
+            for y in 0..64 {
+                for x in 0..32 {
+                    frame.set_pixel(x, y, [200, 40, 40, 255]);
+                }
+            }
+            let options = EncodeOptions {
+                codec,
+                preset: "ultrafast".to_owned(),
+                hardware: false,
+                ..EncodeOptions::default()
+            };
+            let mut encoder =
+                Encoder::create(&video, 64, 64, FrameRate::THIRTY, &options).expect("opens");
+            for _ in 0..30 {
+                encoder.write_frame(&frame).expect("writes");
+            }
+            encoder.finish().expect("finishes");
+            let piece = AudioClip {
+                path: tone.clone(),
+                duration: 1.0,
+                ..clip("")
+            };
+            mix_to_file(&[piece], 1.0, &sound).expect("mixes");
+            mux(&video, &sound, &output).expect("muxes");
+
+            let counts = packets_of(&output);
+            assert_eq!(counts[0], 30, "{}: every picture packet", codec.label());
+            {
+                let input = ffmpeg::format::input(&output).expect("opens");
+                let picture = input
+                    .streams()
+                    .best(ffmpeg::media::Type::Video)
+                    .expect("video");
+                if webm {
+                    assert_eq!(
+                        picture.metadata().get("alpha_mode"),
+                        Some("1"),
+                        "the joined track still says it has alpha"
+                    );
+                }
+                let heard = input
+                    .streams()
+                    .best(ffmpeg::media::Type::Audio)
+                    .expect("audio");
+                let wanted = if webm {
+                    ffmpeg::codec::Id::OPUS
+                } else {
+                    ffmpeg::codec::Id::AAC
+                };
+                assert_eq!(heard.parameters().id(), wanted, "{}", codec.label());
+            }
+            let mut decoder =
+                Decoder::open(&output, &DecodeOptions::default().in_software()).expect("opens");
+            let back = decoder.next_frame().expect("decodes").expect("a frame");
+            let [.., opaque] = back.pixel(16, 32).expect("inside");
+            let [.., clear] = back.pixel(48, 32).expect("inside");
+            assert!(opaque > 250, "{}: opaque came back {opaque}", codec.label());
+            assert!(clear < 8, "{}: clear came back {clear}", codec.label());
+            let mut sound = AudioDecoder::open(&output, &AudioOptions::default()).expect("opens");
+            let mut audible = false;
+            while let Some(samples) = sound.next_i16().expect("decodes") {
+                audible |= samples.iter().any(|sample| i32::from(*sample).abs() > 1000);
+            }
+            assert!(audible, "{}: the tone is heard", codec.label());
+        }
+        std::fs::remove_dir_all(dir).expect("removes test files");
+    }
+
+    #[test]
+    fn saving_to_m4a_keeps_aac_encoding_and_audible_samples() {
+        use crate::{AudioDecoder, AudioOptions};
+
+        let dir = std::env::temp_dir().join(format!("concat-save-aac-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates a folder");
+        let source = dir.join("tone.wav");
+        tone_wav(&source, 0.25);
+        let piece = AudioClip {
+            path: source,
+            duration: 0.25,
+            ..clip("")
+        };
+        let output = dir.join("saved.m4a");
+        mix_to_file(&[piece], 0.25, &output).expect("saves AAC");
+        {
+            let input = ffmpeg::format::input(&output).expect("opens the saved file");
+            let stream = input
+                .streams()
+                .best(ffmpeg::media::Type::Audio)
+                .expect("has audio");
+            assert_eq!(stream.parameters().id(), ffmpeg::codec::Id::AAC);
+        }
+        {
+            let mut decoder =
+                AudioDecoder::open(&output, &AudioOptions::default()).expect("opens the saved AAC");
+            let mut audible = false;
+            while let Some(samples) = decoder.next_i16().expect("decodes AAC") {
+                audible |= samples.iter().any(|sample| i32::from(*sample).abs() > 1000);
+            }
+            assert!(audible);
+        }
+        std::fs::remove_dir_all(dir).expect("removes test files");
+    }
+
+    /// The left channel of `mix_pcm` over `[from, to)`.
+    fn left(clips: &[AudioClip], buses: &[AudioBus], from: f64, to: f64) -> Vec<i16> {
+        let mut bytes = Vec::new();
+        mix_pcm(clips, buses, from, to, |chunk| {
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        })
+        .expect("mixes");
+        bytes
+            .chunks_exact(4)
+            .map(|frame| i16::from_le_bytes([frame[0], frame[1]]))
+            .collect()
+    }
+
+    /// The loudest sample difference between `a` and `b` over seconds
+    /// `[from, to)` of both.
+    fn worst(a: &[i16], b: &[i16], from: f64, to: f64) -> i32 {
+        let at = |seconds: f64| (seconds * f64::from(MIX_RATE)) as usize;
+        (at(from)..at(to).min(a.len()).min(b.len()))
+            .map(|index| (i32::from(a[index]) - i32::from(b[index])).abs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// A sound layer changes the mix over its span and nowhere else, and a
+    /// window of the mix - what playback plays where a layer runs - is the
+    /// whole mix over the same stretch.
+    #[test]
+    fn a_bus_treats_its_span_alone_and_a_window_of_it_is_the_whole_mix_there() {
+        let dir = std::env::temp_dir().join(format!("concat-bus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a folder");
+        let source = dir.join("tone.wav");
+        tone_wav(&source, 4.0);
+        let mut tone = clip("tone.wav");
+        tone.path = source.clone();
+        tone.duration = 4.0;
+        let clips = [tone];
+        // A low-pass far under the tone all but takes it away.
+        let buses = [bus(1.0, 2.0, "lowpass=f=60,lowpass=f=60")];
+
+        let plain = left(&clips, &[], 0.0, 4.0);
+        let treated = left(&clips, &buses, 0.0, 4.0);
+        let window = left(&clips, &buses, 0.5, 3.5);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(plain.len(), 4 * MIX_RATE as usize);
+        assert_eq!(treated.len(), plain.len());
+        assert_eq!(window.len(), 3 * MIX_RATE as usize);
+        // Untouched before the span and after it, sample for sample.
+        assert_eq!(worst(&plain, &treated, 0.0, 0.999), 0);
+        assert_eq!(worst(&plain, &treated, 3.001, 4.0), 0);
+        // Inside it the tone is all but gone.
+        let peak = |samples: &[i16], from: f64, to: f64| {
+            let at = |seconds: f64| (seconds * f64::from(MIX_RATE)) as usize;
+            samples[at(from)..at(to)]
+                .iter()
+                .map(|sample| i32::from(*sample).abs())
+                .max()
+                .unwrap_or(0)
+        };
+        assert!(
+            peak(&plain, 1.2, 2.8) > 15_000,
+            "the tone is there untreated"
+        );
+        assert!(
+            peak(&treated, 1.2, 2.8) < 3_000,
+            "the tone came through at {}",
+            peak(&treated, 1.2, 2.8)
+        );
+        // The window is the whole mix from half a second on.
+        let offset = (0.5 * f64::from(MIX_RATE)) as usize;
+        let difference = worst(&treated[offset..], &window, 0.0, 3.0);
+        assert!(difference <= 1, "the window differs by {difference}");
+    }
+
+    /// A clip trimmed into a Program Stream mixes from its first sample,
+    /// not from behind the in-point. The fixture's sound is interleaved
+    /// behind its picture, and the mix's seek used to be made on the
+    /// picture's timestamps, forward: it landed past the in-point and the
+    /// overshoot went in as silence in front of the clip. The tone has
+    /// sounded from half a second in, so a cut at 3.5 s is inside it.
+    #[test]
+    fn a_trimmed_program_stream_clip_mixes_from_its_first_sample() {
+        let path = format!(
+            "{}/fixtures/sound-behind-the-picture.mpg",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut piece = clip(&path);
+        piece.duration = 0.6;
+        piece.source_start = 3.5;
+        let mixed = left(&[piece], &[], 0.0, 0.6);
+        assert_eq!(mixed.len(), (0.6 * f64::from(MIX_RATE)) as usize);
+        let first = mixed
+            .iter()
+            .position(|sample| i32::from(*sample).abs() > 1_500)
+            .expect("the tone is in the mix");
+        assert!(
+            first < 48 * 30,
+            "the tone starts {} samples in, not at once",
+            first
         );
     }
 

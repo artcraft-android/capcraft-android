@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Asking libavformat what is inside a file.
 
@@ -20,13 +20,22 @@ pub struct VideoStream {
     pub index: u32,
     /// Codec short name, for example `h264`.
     pub codec: String,
-    /// Displayed width in pixels: the coded width, swapped with the height
-    /// when the stream carries a quarter-turn display rotation.
+    /// Displayed width in pixels: the coded width stretched to square
+    /// pixels where the stream's are not (HDV, DV), then swapped with the
+    /// height when the stream carries a quarter-turn display rotation.
     pub width: u32,
     /// Displayed height in pixels; see [`VideoStream::width`].
     pub height: u32,
     /// Average frame rate, exact.
     pub frame_rate: FrameRate,
+    /// The rate one frame can follow another at: the frame rate for a
+    /// constant-rate stream. A variable-rate one - a screen recording, a
+    /// phone clip - runs at its capture rate while the picture moves and
+    /// holds still between, so its average is well under the rate its
+    /// frames come at while they come; its cadence is the grid its
+    /// timestamps sit on, where that is a rate a camera or a screen records
+    /// at. What a reader indexes frames by, so no two land on one slot.
+    pub cadence: FrameRate,
     /// The levels the stream says its numbers span, or `None` where it
     /// says nothing - which a player then takes for video range. What a
     /// person compares the picture against when it looks washed out.
@@ -91,7 +100,9 @@ impl MediaInfo {
 pub fn probe(path: impl AsRef<Path>) -> Result<MediaInfo> {
     ffi::init();
     let path = path.as_ref();
-    let input = ffmpeg::format::input(path).map_err(|error| ffi::fail("open", path, error))?;
+    // An SVG is probed as its drawing, and described as itself; see svg.rs.
+    let drawn = crate::svg::readable(path)?;
+    let input = ffmpeg::format::input(&drawn).map_err(|error| ffi::fail("open", path, error))?;
 
     let duration = input.duration();
     let duration =
@@ -190,13 +201,19 @@ fn video_stream(stream: &ffmpeg::format::stream::Stream<'_>, path: &Path) -> Res
             detail: "video stream has no usable size".to_owned(),
         });
     }
-    let (width, height) = ffi::displayed(width, height, ffi::rotation(stream));
+    let (width, height) = ffi::displayed(
+        width,
+        height,
+        ffi::sample_aspect(stream),
+        ffi::rotation(stream),
+    );
 
     let frame_rate = pick_rate(rational(stream.avg_frame_rate()), rational(stream.rate()))
         .ok_or_else(|| Error::Probe {
             path: path.to_path_buf(),
             detail: "video stream has no usable frame rate".to_owned(),
         })?;
+    let cadence = pick_cadence(frame_rate, rational(stream.rate()));
 
     // SAFETY: the parameters are live for as long as `stream` is, and the
     // range, the transfer and the primaries are plain fields libavformat
@@ -220,6 +237,7 @@ fn video_stream(stream: &ffmpeg::format::stream::Stream<'_>, path: &Path) -> Res
         width,
         height,
         frame_rate: FrameRate::new(frame_rate),
+        cadence: FrameRate::new(cadence),
         color_range: ColorRange::from_ffmpeg(ffmpeg::color::Range::from(range)),
         signal,
     })
@@ -252,7 +270,19 @@ fn pick_rate(average: Option<Rational>, guess: Option<Rational>) -> Option<Ratio
     let usable = |rate: &Option<Rational>| {
         rate.filter(|rate| FrameRate::checked(rate.numerator(), rate.denominator()).is_some())
     };
-    match (usable(&average), usable(&guess)) {
+    // An average the frame arithmetic cannot count in is still the only
+    // statement a variable stream makes about its pace. Rounded to the
+    // closest rate it can count in, it is kept: one screen recording's
+    // average of 764460000/12487247 over 138 seconds came out as
+    // 61219/1000, where taking the base rate instead - its timestamp grid,
+    // 90000/1 - wrote all 8494 frames into a proxy 0.094 seconds long, and
+    // Half and Quarter previews held one frame (#394).
+    let average = usable(&average).or_else(|| {
+        average
+            .and_then(|rate| FrameRate::approximated(rate.as_f64()))
+            .map(|rate| rate.fps())
+    });
+    match (average, usable(&guess)) {
         (Some(average), Some(base)) => {
             let (a, b) = (average.as_f64(), base.as_f64());
             let close = ((a - b) / b).abs() <= 0.02;
@@ -263,9 +293,46 @@ fn pick_rate(average: Option<Rational>, guess: Option<Rational>) -> Option<Ratio
     }
 }
 
+/// The rate a stream's frames come at while they come; see
+/// [`VideoStream::cadence`].
+///
+/// `rate` is what [`pick_rate`] chose. Where the timestamp grid beside it
+/// is faster by more than the two percent `pick_rate` forgives - the
+/// stream is variable - and is itself a rate a picture is captured at, no
+/// faster than 240 fps, the grid is the cadence: a screen recording at 60
+/// whose still stretches bring the average to 23. A grid past that is a
+/// clock's denominator - 90000 for #394's recording - and says nothing
+/// about the frames, so the rate stands.
+fn pick_cadence(rate: Rational, grid: Option<Rational>) -> Rational {
+    grid.filter(|grid| FrameRate::checked(grid.numerator(), grid.denominator()).is_some())
+        .filter(|grid| grid.as_f64() <= 240.0 && grid.as_f64() > rate.as_f64() * 1.02)
+        .unwrap_or(rate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A variable-rate stream's frames are indexed at the grid they come
+    /// on, not its average; a grid that is a clock's denominator, or a
+    /// constant stream, keeps the rate.
+    #[test]
+    fn a_variable_stream_is_paced_by_its_timestamp_grid() {
+        let sixty = Rational::from_int(60);
+        let average = Rational::new(4620, 179);
+        assert_eq!(pick_cadence(average, Some(sixty)), sixty);
+        assert_eq!(
+            pick_cadence(average, Some(Rational::from_int(90_000))),
+            average
+        );
+        let thirty = Rational::from_int(30);
+        assert_eq!(pick_cadence(thirty, Some(thirty)), thirty);
+        assert_eq!(pick_cadence(thirty, None), thirty);
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/vfr-still-screen.mp4");
+        let video = probe(path).expect("probes").video.expect("a picture");
+        assert!(video.frame_rate.fps().as_f64() < 10.0, "the average is low");
+        assert_eq!(video.cadence, FrameRate::THIRTY);
+    }
 
     #[test]
     fn falls_back_when_avg_frame_rate_is_zero() {
@@ -318,6 +385,24 @@ mod tests {
         assert_eq!(pick_rate(negative, thirty), thirty);
     }
 
+    /// A variable-rate recording's average is a fraction whose terms are
+    /// past what a document's rates carry, and the rate beside it in the
+    /// container is the timestamp grid. Keeping the grid gave a 138-second
+    /// screen recording a 90000-fps proxy - 8494 frames in 0.094 seconds -
+    /// and a Half or Quarter preview that held a single frame (#394). The
+    /// average is kept, rounded to the closest rate that fits.
+    #[test]
+    fn a_heavy_average_keeps_its_pace_rather_than_the_timestamp_grid() {
+        let average = Some(Rational::new(764_460_000, 12_487_247));
+        let grid = Some(Rational::from_int(90_000));
+        let picked = pick_rate(average, grid).expect("a rate");
+        assert!(
+            (picked.as_f64() - 61.219_258).abs() < 0.001,
+            "{picked:?} is not the pace the recording was made at"
+        );
+        assert_ne!(picked, Rational::from_int(90_000));
+    }
+
     #[test]
     fn a_missing_file_is_an_error_not_a_panic() {
         assert!(probe("does-not-exist.mp4").is_err());
@@ -342,6 +427,7 @@ mod tests {
             color_range: crate::ColorRange::Limited,
             hardware: false,
             threads: 0,
+            software_only: false,
         };
         let rate = FrameRate::from_int(25);
         for (name, hdr, want) in [

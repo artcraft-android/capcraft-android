@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The CPU compositor, kept for the tests alone: the reference the GPU
 //! compositor's parity suite holds it to, obvious and dependency-free. It
@@ -15,6 +15,7 @@
 use std::borrow::Cow;
 
 use concat_core::frame::{BYTES_PER_PIXEL, Frame};
+use concat_core::mask::{self, MaskUniform};
 use concat_core::shader::{ShaderPass, TransitionPass};
 use concat_core::timeline::Blend;
 
@@ -47,6 +48,7 @@ impl Compositor for CpuCompositor {
         // besides its effects, which are the GPU's alone and are held to
         // their packages' probes instead.
         let mut ground = Frame::black(plan.width, plan.height);
+        ground.fill(plan.canvas);
         let next = 0;
         for layer in &plan.layers[next..] {
             draw(&mut ground, plan, layer);
@@ -96,6 +98,7 @@ fn draw(output: &mut Frame, plan: &FramePlan, layer: &PlannedLayer) {
     let weigh = Weighing {
         shading: layer.shading(),
         mask: layer.mask.as_deref(),
+        shape: layer.shape_uniform(&geometry),
         opacity,
         blend: layer.blend,
     };
@@ -134,6 +137,7 @@ fn prepare(source: &Frame, geometry: &Geometry, flip_h: bool, flip_v: bool) -> F
 struct Weighing<'a> {
     shading: Shading,
     mask: Option<&'a Frame>,
+    shape: MaskUniform,
     opacity: f32,
     blend: Blend,
 }
@@ -154,19 +158,26 @@ impl Weighing<'_> {
             );
             alpha *= sample_bilinear(mask, mx, my)[3] / 255.0;
         }
+        alpha *= mask::coverage(&self.shape, u, v);
         if alpha <= 0.0 {
             return;
         }
         // In linear light, as the GPU blends: the layer's colour and the
         // ground decoded from their stored gamma, weighed, and encoded back.
+        // The ground is weighed by its own coverage, which is all of it
+        // unless the canvas is see-through (#456): the GPU blends over
+        // premultiplied colour, so this mixes over the premultiplied
+        // ground and divides the coverage that results back out.
+        let coverage = f32::from(under[3]) / 255.0;
+        let covered = alpha + coverage * (1.0 - alpha);
         for channel in 0..3 {
             let colour = self.shading.colour(channel, linear(sample[channel]));
-            let ground = linear(f32::from(under[channel]));
-            under[channel] = encoded(mix(self.blend, colour, ground, alpha))
+            let ground = linear(f32::from(under[channel])) * coverage;
+            under[channel] = encoded(mix(self.blend, colour, ground, alpha) / covered)
                 .round()
                 .clamp(0.0, 255.0) as u8;
         }
-        under[3] = 255;
+        under[3] = (covered * 255.0).round().clamp(0.0, 255.0) as u8;
     }
 }
 
@@ -407,6 +418,69 @@ fn blend_aligned(output: &mut Frame, picture: &Frame, geometry: &Geometry, weigh
 
 #[cfg(test)]
 mod tests {
+    /// A frame with nothing on it is the canvas, and a picture that does
+    /// not cover the frame sits on the canvas, not on black (#456).
+    #[test]
+    fn the_canvas_shows_where_no_picture_covers_the_frame() {
+        use crate::Compositor;
+        use crate::plan::{FramePlan, PlannedLayer, detached_clip};
+        let gap = FramePlan {
+            canvas: [0, 177, 64, 255],
+            ..FramePlan::empty(8, 4)
+        };
+        let frame = super::CpuCompositor.render(&gap);
+        assert!(
+            frame
+                .pixels()
+                .chunks_exact(4)
+                .all(|p| p == [0, 177, 64, 255])
+        );
+
+        let mut half = concat_core::Frame::black(4, 4);
+        half.fill([255, 255, 255, 255]);
+        let plan = FramePlan {
+            layers: vec![PlannedLayer::picture(
+                detached_clip(),
+                std::sync::Arc::new(half),
+            )],
+            ..gap
+        };
+        let frame = super::CpuCompositor.render(&plan);
+        // Fitted into an 8x4 frame, the 4x4 square leaves the sides bare.
+        assert_eq!(frame.pixel(0, 2), Some([0, 177, 64, 255]));
+        assert_eq!(frame.pixel(4, 2), Some([255, 255, 255, 255]));
+    }
+
+    /// On a see-through canvas the frame keeps its alpha: clear where
+    /// nothing covers it, opaque under an opaque picture, and as covered
+    /// as a half-faded picture is, in that picture's own colour (#456).
+    #[test]
+    fn a_see_through_canvas_keeps_the_alpha_of_what_covers_it() {
+        use crate::Compositor;
+        use crate::plan::{FramePlan, PlannedLayer, detached_clip};
+        let mut square = concat_core::Frame::black(4, 4);
+        square.fill([200, 40, 40, 255]);
+        let square = std::sync::Arc::new(square);
+        let plan = FramePlan {
+            canvas: [0, 0, 0, 0],
+            layers: vec![PlannedLayer::picture(detached_clip(), square.clone())],
+            ..FramePlan::empty(8, 4)
+        };
+        let frame = super::CpuCompositor.render(&plan);
+        assert_eq!(frame.pixel(0, 2).map(|p| p[3]), Some(0));
+        assert_eq!(frame.pixel(4, 2), Some([200, 40, 40, 255]));
+
+        let mut faded = PlannedLayer::picture(detached_clip(), square);
+        faded.opacity = 0.5;
+        let frame = super::CpuCompositor.render(&FramePlan {
+            layers: vec![faded],
+            ..plan
+        });
+        let pixel = frame.pixel(4, 2).expect("a pixel");
+        assert!(pixel[3].abs_diff(128) <= 1, "{pixel:?}");
+        assert!(pixel[0].abs_diff(200) <= 1 && pixel[1].abs_diff(40) <= 1, "{pixel:?}");
+    }
+
     #[test]
     fn lighten_and_darken_weigh_the_layer_in_by_its_alpha() {
         use super::{Blend, mix};
