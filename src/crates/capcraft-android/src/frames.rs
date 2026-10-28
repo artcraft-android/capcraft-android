@@ -163,10 +163,28 @@ pub struct FontFace {
     pub path: String,
 }
 
+/// The faces [`font_faces`] found, once worked out: the lock is held while
+/// they are, so two pickers opening together do not write the files at once.
+static FACES: std::sync::Mutex<Option<Vec<FontFace>>> = std::sync::Mutex::new(None);
+
 /// The faces the engine sets titles in, each family once, in the engine's
-/// order. The files are written to the cache the first time.
+/// order. The files are written to the cache the first time, and the list
+/// is worked out once a process.
+///
+/// A file is never rewritten in place: its names are read through a memory
+/// map, as the picker's typefaces read it, and a file cut short under a map
+/// ends the process (SIGBUS) - which two pickers opening at once did, one
+/// rewriting a face the other was reading, once the engine's faces changed
+/// and the cached files no longer matched. A new file is written beside the
+/// old and renamed over it, so a map of the old one reads on undisturbed.
 #[uniffi::export]
 pub fn font_faces() -> Result<Vec<FontFace>, MobileError> {
+    let mut found = FACES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(faces) = found.as_ref() {
+        return Ok(faces.clone());
+    }
     let folder = crate::context()?.cache.join("fonts");
     std::fs::create_dir_all(&folder)
         .map_err(|error| format!("could not create {}: {error}", folder.display()))?;
@@ -175,7 +193,9 @@ pub fn font_faces() -> Result<Vec<FontFace>, MobileError> {
         let file = folder.join(format!("face-{index}.ttf"));
         let fresh = std::fs::metadata(&file).is_ok_and(|meta| meta.len() == bytes.len() as u64);
         if !fresh {
-            std::fs::write(&file, bytes)
+            let part = folder.join(format!("face-{index}.ttf.part"));
+            std::fs::write(&part, bytes)
+                .and_then(|()| std::fs::rename(&part, &file))
                 .map_err(|error| format!("could not write {}: {error}", file.display()))?;
         }
         for family in concat_text::families_in(&file) {
@@ -187,5 +207,6 @@ pub fn font_faces() -> Result<Vec<FontFace>, MobileError> {
             }
         }
     }
+    *found = Some(faces.clone());
     Ok(faces)
 }
