@@ -890,6 +890,39 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
         edit { applyBatch(batch.toString()) }
     }
 
+    // the captions as SubRip, between being written and the user saying where they go
+    private var captionsOut: String? = null
+
+    /**
+     * The timeline's captions written as SubRip; [save] then asks where, from a name made as an
+     * export's is. A timeline with no captions says so instead.
+     */
+    fun exportCaptions(save: (String) -> Unit) {
+        val s = session ?: return
+        viewModelScope.launch {
+            val result = withContext(Threads.commands) { runCatching { s.captionsSrt() } }
+            result.onSuccess { text ->
+                captionsOut = text
+                save("CapCraft_" + java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date()) + ".srt")
+            }.onFailure { fail(it) }
+        }
+    }
+
+    /** Writes the captions [exportCaptions] made to the file the user chose. */
+    fun saveCaptions(uri: Uri) {
+        val text = captionsOut ?: return
+        captionsOut = null
+        viewModelScope.launch {
+            val result = withContext(Threads.commands) {
+                runCatching {
+                    getApplication<Application>().contentResolver.openOutputStream(uri, "wt")?.use { it.write(text.toByteArray(Charsets.UTF_8)) }
+                        ?: error("Could not write the file.")
+                }
+            }
+            result.onSuccess { message = "Captions saved" }.onFailure { fail(it) }
+        }
+    }
+
     /** Reads a SubRip or WebVTT file and places its captions on a text row. */
     fun importCaptions(uri: Uri) {
         val s = session ?: return

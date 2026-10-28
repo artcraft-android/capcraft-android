@@ -101,6 +101,8 @@ class Pickers(
     val video: (onPicked: (Uri) -> Unit) -> Unit,
     /** A caption file, through the system's document picker. */
     val captions: (onPicked: (Uri) -> Unit) -> Unit,
+    /** Where a SubRip file of the captions goes, through the system's save dialog, starting from a name. */
+    val saveCaptions: (name: String, onPicked: (Uri) -> Unit) -> Unit,
 )
 
 @Composable
@@ -110,6 +112,9 @@ fun rememberPickers(): Pickers {
     }
     val captions = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { PickerCallbacks.captions?.invoke(it) }
+    }
+    val saveCaptions = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/x-subrip")) { uri ->
+        uri?.let { PickerCallbacks.saveCaptions?.invoke(it) }
     }
     return Pickers(
         // pictures and videos come through the app's own picker
@@ -122,6 +127,7 @@ fun rememberPickers(): Pickers {
             PickerCallbacks.captions = cb
             captions.launch(arrayOf("application/x-subrip", "text/vtt", "text/plain", "application/octet-stream"))
         },
+        saveCaptions = { name, cb -> PickerCallbacks.saveCaptions = cb; saveCaptions.launch(name) },
     )
 }
 
@@ -129,6 +135,7 @@ fun rememberPickers(): Pickers {
 private object PickerCallbacks {
     var audio: ((Uri) -> Unit)? = null
     var captions: ((Uri) -> Unit)? = null
+    var saveCaptions: ((Uri) -> Unit)? = null
 }
 
 @Composable
@@ -315,6 +322,7 @@ private fun groupTools(vm: EditorViewModel, id: String, pickers: Pickers): List<
         Tool("captiontemplates", "Caption templates", LucideIcons.LayoutTemplate) { vm.panel = Panel.CaptionTemplates },
         Tool("autolyrics", "Auto lyrics", LucideIcons.Music) { vm.panel = Panel.Lyrics },
         Tool("importcaptions", "Import captions", LucideIcons.FolderOpen) { pickers.captions { vm.importCaptions(it) } },
+        Tool("exportcaptions", "Export captions", LucideIcons.Download) { vm.exportCaptions { name -> pickers.saveCaptions(name) { vm.saveCaptions(it) } } },
     )
     else -> emptyList()
 }

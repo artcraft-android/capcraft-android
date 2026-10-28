@@ -177,6 +177,43 @@ fn a_first_clip_gives_the_project_its_frame_and_cuts_close_up() {
     delete_project(made.path).expect("deleted");
 }
 
+/// The timeline's captions written as SubRip (issue #10): with none, the
+/// busiest row of titles stands in; with captions, they alone are written,
+/// in the order they play, and the SubRip reader reads them back as they
+/// were. A timeline with no titles has nothing to write.
+#[test]
+fn captions_are_written_as_subrip() {
+    start();
+    let made = create_project("Subtitles".to_owned(), 1080, 1920, 30).expect("made");
+    let session = MobileSession::open(made.path.clone()).expect("opens");
+    assert!(session.captions_srt().is_err(), "nothing to write yet");
+    session
+        .add_text(
+            20_000_000,
+            2_000_000,
+            r#"{"content":"A title card"}"#.to_owned(),
+        )
+        .expect("a title");
+    let alone =
+        concat_project::srt::parse(&session.captions_srt().expect("the title")).expect("SubRip");
+    let words: Vec<_> = alone.iter().map(|cue| cue.text.as_str()).collect();
+    assert_eq!(words, ["A title card"]);
+
+    session
+        .enter_captions("First line\nSecond line here".to_owned(), 1_000_000)
+        .expect("captions");
+    let written = session.captions_srt().expect("written");
+    assert!(written.starts_with("1\n00:00:01,000 --> "), "{written}");
+    let cues = concat_project::srt::parse(&written).expect("SubRip again");
+    let words: Vec<_> = cues.iter().map(|cue| cue.text.as_str()).collect();
+    assert_eq!(words, ["First line", "Second line here"], "{written}");
+    assert!(
+        cues[0].end <= cues[1].start && cues[1].start < cues[1].end,
+        "{written}"
+    );
+    delete_project(made.path).expect("deleted");
+}
+
 /// The mean over every pixel's colour channels of `channel(a, b)`.
 fn mean_channels(a: &crate::Picture, b: &crate::Picture, channel: impl Fn(u8, u8) -> i32) -> f64 {
     let pixels = a.rgba.chunks_exact(4).zip(b.rgba.chunks_exact(4));

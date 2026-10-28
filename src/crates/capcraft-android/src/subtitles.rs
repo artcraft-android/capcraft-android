@@ -2,7 +2,11 @@
 // SPDX-FileCopyrightText: 2026 CapCraft contributors
 
 //! Caption files: SubRip (`.srt`) and WebVTT (`.vtt`) read into titles on a
-//! text row, the way auto captions are placed.
+//! text row, the way auto captions are placed, and the timeline's captions
+//! written out as SubRip.
+
+use concat_project::model::ClipKind;
+use concat_project::srt;
 
 use crate::MobileError;
 use crate::session::{MobileSession, TimelineView};
@@ -22,6 +26,42 @@ impl MobileSession {
             ));
         }
         self.place_captions(&cues, false)
+    }
+
+    /// The timeline's captions as a SubRip file's text, in the order they
+    /// play: the titles Auto captions, Auto lyrics, Enter captions or a
+    /// caption file made; with none of those, the row with the most titles
+    /// (see `concat_project::srt::busiest_title_lane`).
+    pub fn captions_srt(&self) -> Result<String, MobileError> {
+        let cues = self.with_session(|session| {
+            let timeline = session.project().active();
+            let ids = crate::speech::caption_ids(timeline);
+            if ids.is_empty() {
+                return Ok(srt::busiest_title_lane(timeline)
+                    .map(|lane| srt::title_cues(timeline, Some(&lane)))
+                    .unwrap_or_default());
+            }
+            let mut cues: Vec<srt::Cue> = timeline
+                .clips
+                .iter()
+                .filter(|clip| clip.kind == ClipKind::Text && ids.contains(&clip.id))
+                .filter_map(|clip| {
+                    Some(srt::Cue {
+                        start: clip.start,
+                        end: clip.start + clip.duration,
+                        text: clip.text.as_ref()?.content.clone(),
+                    })
+                })
+                .collect();
+            cues.sort_by(|a, b| a.start.total_cmp(&b.start));
+            Ok(cues)
+        })?;
+        if cues.is_empty() {
+            return Err(MobileError::Failed(
+                "There are no captions to export.".to_owned(),
+            ));
+        }
+        Ok(srt::write(&cues))
     }
 }
 
