@@ -47,6 +47,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.artcraftandroid.capcraft.core.ClipView
 import io.github.artcraftandroid.capcraft.core.PackageInfo
 import io.github.artcraftandroid.capcraft.core.RowKind
 import io.github.artcraftandroid.capcraft.core.packages
@@ -604,28 +605,35 @@ private fun linkParams(vm: EditorViewModel, clipId: String?, pkg: String): JSONO
 
 /**
  * [chain] with the Adjust links set to [adjust] and [plus] (none where empty), the engine's first
- * and CapCraft's straight after, the chain's other links as they were.
+ * and CapCraft's straight after, the chain's other links as they were. With [layer] the engine's
+ * link stays even with nothing set: an adjustment layer is known by it, and one left with only
+ * CapCraft's was no longer taken for one, so the next move started another layer.
  */
-private fun withAdjust(chain: JSONArray, adjust: JSONObject, plus: JSONObject): JSONArray {
+private fun withAdjust(chain: JSONArray, adjust: JSONObject, plus: JSONObject, layer: Boolean = false): JSONArray {
     val next = JSONArray()
     var placed = false
+    fun place() {
+        if (adjust.length() > 0 || layer) next.put(JSONObject().put("id", ADJUST).put("params", adjust))
+        if (plus.length() > 0) next.put(JSONObject().put("id", PLUS).put("params", plus))
+        placed = true
+    }
     for (i in 0 until chain.length()) {
         val link = chain.getJSONObject(i)
         when (link.optString("id")) {
-            ADJUST, PLUS -> if (!placed) {
-                if (adjust.length() > 0) next.put(JSONObject().put("id", ADJUST).put("params", adjust))
-                if (plus.length() > 0) next.put(JSONObject().put("id", PLUS).put("params", plus))
-                placed = true
-            }
+            ADJUST, PLUS -> if (!placed) place()
             else -> next.put(link)
         }
     }
-    if (!placed) {
-        if (adjust.length() > 0) next.put(JSONObject().put("id", ADJUST).put("params", adjust))
-        if (plus.length() > 0) next.put(JSONObject().put("id", PLUS).put("params", plus))
-    }
+    if (!placed) place()
     return next
 }
+
+/**
+ * Whether Adjust works on [clip]: a video, a picture, or an adjustment layer - one made with the
+ * engine's Adjust, or one an earlier build left with only CapCraft's.
+ */
+private fun takesAdjust(clip: ClipView?): Boolean =
+    clip != null && (clip.kind == "video" || clip.kind == "image" || (clip.kind == "layer" && (clip.effectId == ADJUST || clip.effectId == PLUS)))
 
 /** The Presets tab: the adjustments kept with Save preset, put on the selected clip by a tap. */
 @Composable
@@ -633,7 +641,7 @@ private fun ColumnScope.PresetsContent(vm: EditorViewModel) {
     val context = vm.getApplication<android.app.Application>()
     var items by remember { mutableStateOf(AdjustPresets.all(context)) }
     val clip = vm.selectedClip
-    val visual = clip != null && (clip.kind == "video" || clip.kind == "image" || (clip.kind == "layer" && clip.effectId == ADJUST))
+    val visual = takesAdjust(clip)
     fun apply(params: JSONObject) {
         val c = clip?.takeIf { visual }
         if (c == null) {
@@ -643,7 +651,7 @@ private fun ColumnScope.PresetsContent(vm: EditorViewModel) {
         val adjust = JSONObject(params.toString()).apply { remove(PRESET_PLUS) }
         val plus = params.optJSONObject(PRESET_PLUS)?.let { JSONObject(it.toString()) } ?: JSONObject()
         val chain = vm.clipJson(c.id)?.optJSONArray("videoEffects") ?: JSONArray()
-        vm.patch(c.id, JSONObject().put("videoEffects", withAdjust(chain, adjust, plus)))
+        vm.patch(c.id, JSONObject().put("videoEffects", withAdjust(chain, adjust, plus, layer = c.kind == "layer")))
     }
     if (items.isEmpty()) {
         Text(
@@ -696,7 +704,7 @@ private fun ColumnScope.AdjustContent(vm: EditorViewModel) {
     var which by remember { mutableIntStateOf(0) }
     var sheet by remember { mutableStateOf<String?>(null) }
     val clip = vm.selectedClip
-    val visual = clip != null && (clip.kind == "video" || clip.kind == "image" || (clip.kind == "layer" && clip.effectId == ADJUST))
+    val visual = takesAdjust(clip)
     val target = if (visual) clip else null
     val adjust = remember(target?.json) { linkParams(vm, target?.id, ADJUST) }
     val plus = remember(target?.json) { linkParams(vm, target?.id, PLUS) }
@@ -713,13 +721,18 @@ private fun ColumnScope.AdjustContent(vm: EditorViewModel) {
     var reading by remember { mutableStateOf(false) }
     fun paramsOf(k: Knob) = if (k.pkg == PLUS) plus else adjust
     var value by remember(target?.id, which) { mutableFloatStateOf(paramsOf(knob).optDouble(knob.key, knob.default.toDouble()).toFloat()) }
+    // an adjustment layer asked for and not yet selected: a drag's next moves come before it is there
+    var layerAsked by remember(target?.id) { mutableStateOf(false) }
 
     /** Sets knobs of [pkg] (null clears one) on the selected picture, or starts an adjustment layer when there is none. */
     fun setKeys(pkg: String, values: Map<String, Double?>, gesture: String?) {
         val c = target
         if (c == null) {
-            // nothing to adjust: an adjustment layer at the playhead, which the next move edits
-            vm.addLayer(ADJUST, "Adjust")
+            // nothing to adjust: one adjustment layer at the playhead, which the next move edits
+            if (!layerAsked) {
+                layerAsked = true
+                vm.addLayer(ADJUST, "Adjust")
+            }
             return
         }
         val chain = vm.clipJson(c.id)?.optJSONArray("videoEffects") ?: JSONArray()
@@ -727,13 +740,13 @@ private fun ColumnScope.AdjustContent(vm: EditorViewModel) {
         val b = linkParams(vm, c.id, PLUS)
         val into = if (pkg == PLUS) b else a
         values.forEach { (key, v) -> if (v == null) into.remove(key) else into.put(key, v) }
-        vm.patch(c.id, JSONObject().put("videoEffects", withAdjust(chain, a, b)), gesture)
+        vm.patch(c.id, JSONObject().put("videoEffects", withAdjust(chain, a, b, layer = c.kind == "layer")), gesture)
     }
 
     fun reset() {
         val c = target ?: return
         val chain = vm.clipJson(c.id)?.optJSONArray("videoEffects") ?: return
-        vm.patch(c.id, JSONObject().put("videoEffects", withAdjust(chain, JSONObject(), JSONObject())))
+        vm.patch(c.id, JSONObject().put("videoEffects", withAdjust(chain, JSONObject(), JSONObject(), layer = c.kind == "layer")))
         value = knob.default
     }
 
