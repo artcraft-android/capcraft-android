@@ -14,17 +14,26 @@
 # first.
 set -euo pipefail
 
-target=${1:?target triple: aarch64-linux-android or aarch64-apple-ios}
+target=${1:?target triple: aarch64-linux-android, x86_64-linux-android or aarch64-apple-ios}
 workspace=$(cd "$(dirname "$0")/.." && pwd)
 ffmpeg=$workspace/vendor/ffmpeg/$target
 [ -d "$ffmpeg/lib" ] || { echo "no FFmpeg for $target: run scripts/ffmpeg-mobile.sh $target" >&2; exit 1; }
 echo "export FFMPEG_DIR='$ffmpeg'"
 
 case "$target" in
-  aarch64-linux-android)
-    sherpa=$workspace/vendor/sherpa-onnx/jniLibs/arm64-v8a
+  aarch64-linux-android|x86_64-linux-android)
+    abi=arm64-v8a
+    [ "$target" = x86_64-linux-android ] && abi=x86_64
+    sherpa=$workspace/vendor/sherpa-onnx/jniLibs/$abi
     [ -d "$sherpa" ] || { echo "no sherpa-onnx for $target: run scripts/sherpa-mobile.sh $target" >&2; exit 1; }
     echo "export SHERPA_ONNX_LIB_DIR='$sherpa'"
+    # The emulator's x86_64 build: ort publishes no ONNX Runtime for it,
+    # and sherpa-onnx's own (1.27, which serves the API ort asks for) is
+    # beside it, so ort links that one, and the APK carries it with the
+    # rest of the folder.
+    if [ "$target" = x86_64-linux-android ]; then
+      echo "export ORT_LIB_LOCATION='$sherpa' ORT_PREFER_DYNAMIC_LINK=1"
+    fi
 
     sdk=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}
     ndk=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-$(ls -d "$sdk"/ndk/* 2>/dev/null | sort -V | tail -1 || true)}}
@@ -36,7 +45,7 @@ case "$target" in
     # bindgen reads FFmpeg's headers with its own libclang, which knows
     # nothing of the NDK until told where the sysroot is.
     host_tag=$(ls "$ndk/toolchains/llvm/prebuilt" | head -1)
-    echo "export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android='--sysroot=$ndk/toolchains/llvm/prebuilt/$host_tag/sysroot'"
+    echo "export BINDGEN_EXTRA_CLANG_ARGS_${target//-/_}='--sysroot=$ndk/toolchains/llvm/prebuilt/$host_tag/sysroot'"
     # Slint's backend compiles a Java helper against the SDK platform's
     # android.jar. cargo-ndk names the NDK API level as ANDROID_PLATFORM,
     # which is also the name the lookup reads for the SDK platform, and the
@@ -52,12 +61,20 @@ case "$target" in
     # archive under that name, on the search path, is what the linker finds
     # instead, and it contributes exactly what the missing library would
     # have. The ar magic alone is a well-formed archive with no members.
+    #
+    # Every library the APK carries is linked for 16 KB pages, as FFmpeg's
+    # already is (ffmpeg-mobile.sh): a phone whose kernel uses them refuses
+    # a library aligned to 4 KB, and v0.2.8's libconcat_android.so was.
+    # One RUSTFLAGS for both: cargo reads it whole and ignores the
+    # target's own flags when it is set.
+    rustflags='-C link-arg=-Wl,-z,max-page-size=16384'
     if [ "$(uname -s)" = Darwin ]; then
       shim=$workspace/vendor/shim/$target
       mkdir -p "$shim"
       printf '!<arch>\n' > "$shim/libggml-blas.a"
-      echo "export RUSTFLAGS='-L native=$shim'"
+      rustflags="$rustflags -L native=$shim"
     fi
+    echo "export RUSTFLAGS='$rustflags'"
     ;;
   aarch64-apple-ios)
     sherpa=$workspace/vendor/sherpa-onnx/ios/lib

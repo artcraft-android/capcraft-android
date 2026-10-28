@@ -3,10 +3,10 @@ Copyright (c) 2026 ArtCraft Team and the CapCraft contributors.
 
 This repository holds the Android app and the parts of Concat (https://github.com/jub0t/concat) it
 builds: the engine crates under src/crates/ and the phone build scripts under src/scripts/.
-Concat is copyright Jareer and the Concat contributors. CapCraft and Concat are licensed under the
-GNU Affero General Public License, version 3 or (at your option) any later version (LICENSE), with
-Concat's plugin exception (LICENSE-EXCEPTIONS.md). CapCraft is a modified build of Concat's engine,
-shipped under its own name and icon as Concat's trademark policy asks.
+Concat is copyright Jareer Abdullah and the Concat contributors. CapCraft and Concat are licensed
+under the GNU Affero General Public License, version 3 or (at your option) any later version
+(LICENSE). CapCraft is a modified build of Concat's engine, shipped under its own name and icon as
+Concat's trademark policy asks.
 
 Third-party material
 
