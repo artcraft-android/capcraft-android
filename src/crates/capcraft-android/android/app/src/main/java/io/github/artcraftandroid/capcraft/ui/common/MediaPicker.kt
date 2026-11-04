@@ -134,6 +134,17 @@ private fun canRead(context: Context): Boolean = permissions().any {
     ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
 }
 
+/**
+ * Whether the user let the app see only the photos and videos they chose (Android 14 on): the grid
+ * then holds those alone, the ones picked for earlier projects, until they choose more.
+ */
+private fun limited(context: Context): Boolean {
+    if (Build.VERSION.SDK_INT < 34) return false
+    fun granted(permission: String) = ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+    return granted(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED) &&
+        !granted(Manifest.permission.READ_MEDIA_VIDEO) && !granted(Manifest.permission.READ_MEDIA_IMAGES)
+}
+
 /** The phone's videos and pictures, newest first. */
 private fun loadMedia(context: Context): List<Item> {
     val out = ArrayList<Item>()
@@ -234,7 +245,14 @@ private fun MediaPickerPage(req: MediaRequest, onClose: () -> Unit, onDone: (Lis
     var tab by remember { mutableIntStateOf(0) }
     var album by remember { mutableStateOf<Long?>(null) }
     var albums by remember { mutableStateOf(false) }
-    val all by produceState<List<Item>?>(null) { value = withContext(Dispatchers.IO) { runCatching { loadMedia(context) }.getOrDefault(emptyList()) } }
+    // read again once the user has chosen more of their media, or let the app see all of it
+    var reads by remember { mutableIntStateOf(0) }
+    var partial by remember { mutableStateOf(limited(context)) }
+    val more = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        partial = limited(context)
+        reads++
+    }
+    val all by produceState<List<Item>?>(null, reads) { value = withContext(Dispatchers.IO) { runCatching { loadMedia(context) }.getOrDefault(emptyList()) } }
     val chosen = remember { mutableStateListOf<Item>() }
     // what the open project holds already, marked on its tiles
     val imported = remember { MediaPick.project?.let { io.github.artcraftandroid.capcraft.engine.Media.imported(it) }.orEmpty() }
@@ -286,6 +304,23 @@ private fun MediaPickerPage(req: MediaRequest, onClose: () -> Unit, onDone: (Lis
                     )
                     if (i == tab) Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(2.dp).background(Palette.Accent))
                 }
+            }
+        }
+        if (partial) {
+            Row(
+                Modifier.fillMaxWidth().background(Color(0xFF1C1C1C)).padding(start = 16.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "CapCraft can see only the photos and videos you chose",
+                    style = Type.Small.copy(color = Palette.TextSecondary),
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    "Manage",
+                    style = Type.Small.copy(color = Palette.Accent, fontWeight = FontWeight.SemiBold),
+                    modifier = Modifier.clickable { more.launch(permissions()) }.padding(horizontal = 10.dp, vertical = 8.dp),
+                )
             }
         }
         Box(Modifier.fillMaxWidth().weight(1f)) {
