@@ -387,6 +387,23 @@ fun Timeline(vm: EditorViewModel, modifier: Modifier) {
                         var trimDelta = 0L
                         var snapped: Long? = null
                         var lifted = false
+                        // where the finger is across: an edge held against the side of the screen runs the timeline on
+                        var fingerX = down.position.x
+                        /** The trimmed edge drawn [trimDelta] from where it was, or on what it snaps to within [threshold]. */
+                        fun showTrim(threshold: Long) {
+                            val (id, head) = handle!!
+                            val clip = vm.clip(id)
+                            if (clip != null) trimDelta = trimDelta.coerceIn(trimRange(clip, head))
+                            var shown = trimDelta
+                            if (clip != null) {
+                                val origin = if (head) clip.startUs else clip.startUs + clip.durationUs
+                                val target = snapTarget(origin + trimDelta, snapTargets(currentRows.value, id, vm.playhead) + vm.allBeatTimes(), threshold)
+                                if (target != null) shown = (target - origin).coerceIn(trimRange(clip, head))
+                                if (target != snapped && target != null) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                snapped = target
+                            }
+                            trim = Triple(id, head, shown)
+                        }
                         // A press held on a clip without moving picks it up.
                         if (under != null) {
                             val held = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
@@ -417,7 +434,30 @@ fun Timeline(vm: EditorViewModel, modifier: Modifier) {
                             }
                         }
                         while (!lifted) {
-                            val event = awaitPointerEvent()
+                            // An edge dragged to the side of the screen would stop there with the timeline: held
+                            // within this of either side, the timeline scrolls on under it and the edge goes with it,
+                            // so an image is drawn out to a long sound's end in one drag.
+                            val edgeZone = 40 * dp
+                            val atSide = mode == 3 && (fingerX < edgeZone || fingerX > size.width - edgeZone)
+                            val event = if (atSide) withTimeoutOrNull(16L) { awaitPointerEvent() } else awaitPointerEvent()
+                            if (event == null) {
+                                val pxPerUs = Track.DP_PER_SECOND * dp * zoom / 1_000_000f
+                                // faster the nearer the side, up to about a screen's width a second
+                                val depth = if (fingerX < edgeZone) (edgeZone - fingerX) / edgeZone else (fingerX - (size.width - edgeZone)) / edgeZone
+                                val stepPx = (4 + 12 * depth.coerceIn(0f, 1f)) * dp * (if (fingerX < edgeZone) -1 else 1)
+                                // no further than the edge may go: at its limit the timeline stops too
+                                val (id, head) = handle!!
+                                val step = vm.clip(id)?.let { clip ->
+                                    (trimDelta + (stepPx / pxPerUs).toLong()).coerceIn(trimRange(clip, head)) - trimDelta
+                                } ?: 0L
+                                if (step != 0L) {
+                                    val before = vm.playhead
+                                    vm.scrub(before + step)
+                                    trimDelta += vm.playhead - before
+                                    showTrim((8 * dp / pxPerUs).toLong())
+                                }
+                                continue
+                            }
                             val pressed = event.changes.filter { it.pressed }
                             if (pressed.isEmpty()) break
                             if (pressed.size >= 2 && mode != 3 && mode != 5) {
@@ -437,6 +477,7 @@ fun Timeline(vm: EditorViewModel, modifier: Modifier) {
                             }
                             val change = event.changes.first()
                             val delta = change.positionChange()
+                            fingerX = change.position.x
                             moved += delta
                             tracker.addPosition(change.uptimeMillis, change.position)
                             val pxPerUs = Track.DP_PER_SECOND * dp * zoom / 1_000_000f
@@ -448,18 +489,8 @@ fun Timeline(vm: EditorViewModel, modifier: Modifier) {
                                 }
                                 1 -> vm.scrub(vm.playhead - (delta.x / pxPerUs).toLong())
                                 3 -> {
-                                    val (id, head) = handle!!
-                                    val clip = vm.clip(id)
                                     trimDelta += (delta.x / pxPerUs).toLong()
-                                    var shown = trimDelta
-                                    if (clip != null) {
-                                        val origin = if (head) clip.startUs else clip.startUs + clip.durationUs
-                                        val target = snapTarget(origin + trimDelta, snapTargets(currentRows.value, id, vm.playhead) + vm.allBeatTimes(), threshold)
-                                        if (target != null) shown = target - origin
-                                        if (target != snapped && target != null) haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        snapped = target
-                                    }
-                                    trim = Triple(id, head, shown)
+                                    showTrim(threshold)
                                 }
                                 4 -> {
                                     val l = Layout(size.width.toFloat(), size.height.toFloat(), dp, vm.playhead, pxPerUs, vScroll, currentRows.value, openKinds(vm))
@@ -646,6 +677,28 @@ fun Timeline(vm: EditorViewModel, modifier: Modifier) {
 
 /** A clip being dragged: where it was picked up, how far it has moved, and how far it is drawn moved (snapped). */
 private data class Drag(val clipId: String, val row: Int, val dx: Float, val dy: Float, val shownDx: Float = dx)
+
+/**
+ * How far a trimmed edge may go from where it was: never past the clip's other end (a tenth of a
+ * second short of it), and for a file's clip never past the file's ends; a still or a title stretches
+ * as far as it is drawn.
+ */
+private fun trimRange(clip: ClipView, head: Boolean): LongRange {
+    val file = clip.kind == "video" || clip.kind == "audio"
+    val speed = clip.speed.takeIf { it > 0 } ?: 1.0
+    val least = 100_000L
+    return if (head) {
+        val earliest = if (file) -(clip.sourceStartUs / speed).toLong() else -clip.startUs
+        earliest..(clip.durationUs - least).coerceAtLeast(earliest)
+    } else {
+        val latest = if (file && clip.mediaDurationUs > 0) {
+            ((clip.mediaDurationUs - clip.sourceStartUs) / speed).toLong() - clip.durationUs
+        } else {
+            Long.MAX_VALUE / 4
+        }
+        (least - clip.durationUs).coerceAtMost(latest)..latest
+    }
+}
 
 /** Times a moving edge snaps to: the playhead and every other clip's ends. */
 private fun snapTargets(rows: List<RowView>, except: String, playhead: Long): List<Long> =
