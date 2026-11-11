@@ -186,7 +186,8 @@ pub fn sweep(project: &Path, keep: &HashSet<PathBuf>) -> usize {
 }
 
 /// Writes the proxy of `source`, read as `range`, at `size` to `target`:
-/// H.264, a fast preset, two threads, in software, into a temporary name
+/// H.264, a fast preset, two threads, in software (decoded on the chip on
+/// a phone), into a temporary name
 /// that is moved into place only when whole, so a copy that is there is a
 /// copy that is complete. The copy is tagged video range and converted to
 /// match, so it is read as it is and needs no correction of its own. An
@@ -213,12 +214,19 @@ pub fn write(
     // Written beside the target under a name the muxer still knows the
     // format of, and moved into place only when whole.
     let partial = target.with_extension("part.mp4");
-    let options = DecodeOptions::default()
+    // On a phone the chip decodes, where it has a seat free, and hands a
+    // ten-bit picture back in eight, which is all an SDR copy keeps: a 4K
+    // ten-bit file was read at 51 frames a second that way and 17 on the
+    // cores. Two threads where the cores do it after all.
+    let mut options = DecodeOptions::default()
         .scaled_to(width, height)
-        .in_software()
         .threaded(2)
         .in_range(range)
-        .deep(hdr);
+        .deep(hdr)
+        .eight_bit(true);
+    if !cfg!(target_os = "android") {
+        options = options.in_software();
+    }
     let mut decoder = Decoder::open(source, &options).map_err(|error| error.to_string())?;
     let encoding = EncodeOptions {
         codec: if hdr {

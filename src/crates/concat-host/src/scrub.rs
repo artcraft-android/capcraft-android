@@ -176,8 +176,10 @@ pub fn sweep(project: &Path, keep: &HashSet<PathBuf>) -> usize {
 /// sixty-frame file comes out at fifteen and a variable-rate one at an
 /// even pace. In software: on a phone on every core, as its pictures are too
 /// small to be given one of the chip's few decoders (see
-/// `concat_media::hardware`); elsewhere on two threads, as a proxy is, so
-/// the machine stays usable. Returns the frames written.
+/// `concat_media::hardware`) - but for a ten-bit file, which the chip reads,
+/// in eight bits, several times faster than the cores do; elsewhere on two
+/// threads, as a proxy is, so the machine stays usable. Returns the frames
+/// written.
 pub fn write(
     source: &str,
     target: &Path,
@@ -198,7 +200,8 @@ pub fn write(
     let partial = target.with_extension("part.mov");
     let mut options = DecodeOptions::default()
         .scaled_to(width, height)
-        .in_range(range);
+        .in_range(range)
+        .eight_bit(true);
     if !cfg!(target_os = "android") {
         options = options.in_software().threaded(2);
     }
