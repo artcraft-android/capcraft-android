@@ -226,6 +226,10 @@ struct SourceKey {
     /// (see [`DecodeOptions::deep`]) - a different picture from the
     /// tone-mapped eight bits.
     deep: bool,
+    /// Read by a reader that lets the chip hand back eight bits (see
+    /// [`DecodeOptions::eight_bit`]): a picture a few levels off the one
+    /// read in full, so the playhead at rest never takes it for its own.
+    eight: bool,
 }
 
 /// A treated frame's identity: the source frame and what was done to it.
@@ -416,6 +420,7 @@ impl Reader {
         pre: Option<&str>,
         range: Option<ColorRange>,
         deep: bool,
+        eight: bool,
         rate: FrameRate,
         still: bool,
         index: i64,
@@ -427,7 +432,8 @@ impl Reader {
             .starting_at(rate.time_of_frame(index))
             .scaled_to(width, height)
             .in_range(range)
-            .deep(deep);
+            .deep(deep)
+            .eight_bit(eight);
         if still {
             // One frame, served for every time, and never sought: a seek
             // on a single-image JPEG leaves FFmpeg's image demuxer with
@@ -507,6 +513,8 @@ struct MediaFacts {
     /// The picture's displayed size, for a file with one: what the levels
     /// are halvings of.
     size: Option<(u32, u32)>,
+    /// More than eight bits a sample; see [`probe::VideoStream::deep`].
+    deep: bool,
 }
 
 impl MediaFacts {
@@ -534,6 +542,7 @@ type ReaderKey = (
     Option<String>,
     Option<String>,
     Option<ColorRange>,
+    bool,
     bool,
 );
 
@@ -768,6 +777,7 @@ impl ReaderPool {
                     still: true,
                     frames: None,
                     size: None,
+                    deep: false,
                 }),
             );
         }
@@ -928,6 +938,17 @@ impl ReaderPool {
         // here is FFmpeg, which takes eight bits.
         let deep =
             request.deep && request.any_size && request.pre.is_none() && request.chain.is_none();
+        // A moving picture of a ten-bit file whose stand-in is not written
+        // yet is read off a phone's chip in eight bits, three times as
+        // fast as in ten: the stand-in it asked for would have been eight
+        // bits too. Only there, and only for a deep file: anywhere else
+        // the reader is the same one, and a second key would only open it
+        // twice.
+        let eight = cfg!(target_os = "android")
+            && facts.deep
+            && !deep
+            && (request.proxy || request.scrub)
+            && path == request.path;
         Ok((
             facts,
             SourceKey {
@@ -937,6 +958,7 @@ impl ReaderPool {
                 index,
                 range,
                 deep,
+                eight,
             },
         ))
     }
@@ -1026,6 +1048,7 @@ impl ReaderPool {
             index,
             range,
             deep: deep && chain.is_none() && pre.is_none(),
+            eight: false,
         };
         if chain.is_none() && pre.is_none() {
             return self.source_frame(&facts, &source_key);
@@ -1055,7 +1078,9 @@ impl ReaderPool {
             self.remember_treated(key, Arc::clone(&frame));
             return Ok(frame);
         }
-        let shared = self.reader(path, width, height, chain, pre, range, false, &facts, index)?;
+        let shared = self.reader(
+            path, width, height, chain, pre, range, false, false, &facts, index,
+        )?;
         let mut reader = shared.lock().map_err(|_| crate::error::Error::NoFrame {
             path: path.to_path_buf(),
         })?;
@@ -1091,7 +1116,8 @@ impl ReaderPool {
             return Ok(frame);
         }
         let shared = self.reader(
-            path, key.width, key.height, None, None, key.range, key.deep, facts, key.index,
+            path, key.width, key.height, None, None, key.range, key.deep, key.eight, facts,
+            key.index,
         )?;
         let mut reader = shared.lock().map_err(|_| crate::error::Error::NoFrame {
             path: path.to_path_buf(),
@@ -1230,6 +1256,7 @@ impl ReaderPool {
                     still: true,
                     frames: None,
                     size: None,
+                    deep: false,
                 }
             } else {
                 let info = probe::probe(path)?;
@@ -1258,6 +1285,7 @@ impl ReaderPool {
                     still: false,
                     frames,
                     size,
+                    deep: info.video.as_ref().is_some_and(|video| video.deep),
                 }
             }
         };
@@ -1283,6 +1311,7 @@ impl ReaderPool {
         pre: Option<&str>,
         range: Option<ColorRange>,
         deep: bool,
+        eight: bool,
         facts: &MediaFacts,
         target: i64,
     ) -> Result<Arc<Mutex<Reader>>> {
@@ -1294,6 +1323,7 @@ impl ReaderPool {
             pre.map(str::to_owned),
             range,
             deep,
+            eight,
         );
         {
             let mut readers = self
@@ -1318,6 +1348,7 @@ impl ReaderPool {
             pre,
             range,
             deep,
+            eight,
             facts.rate,
             facts.still,
             target,
@@ -1476,6 +1507,7 @@ pub(crate) mod tests {
             index,
             range: None,
             deep: false,
+            eight: false,
         };
         cache.insert(key(0), Arc::new(Frame::black(2, 2)));
         cache.insert(key(1), Arc::new(Frame::black(2, 2)));
@@ -1536,6 +1568,7 @@ pub(crate) mod tests {
                 index: 0,
                 range: None,
                 deep: false,
+                eight: false,
             },
             Arc::new(Frame::black(2, 2)),
         );
