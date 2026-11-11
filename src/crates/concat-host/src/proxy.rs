@@ -72,6 +72,9 @@ pub fn path_for(
     if hdr {
         "hdr".hash(&mut hasher);
     }
+    // A keyframe every second, where earlier builds wrote one every two
+    // or left it to the encoder: those copies are written again.
+    "keyframes-1s".hash(&mut hasher);
     if let Ok(modified) = meta.modified()
         && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
     {
@@ -247,6 +250,7 @@ pub fn write(
         hardware: hdr,
         threads: 2,
         software_only: false,
+        keyframe_seconds: 1,
     };
     let mut encoder = if hdr {
         Encoder::create_hdr(&partial, width, height, rate, &encoding, signal)
@@ -279,6 +283,53 @@ pub fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A proxy has a keyframe every second: a play starts anywhere, and
+    /// its first frame is decoded from the keyframe before it.
+    #[test]
+    fn a_proxy_has_a_keyframe_every_second() {
+        use concat_core::frame::Frame;
+        use concat_core::time::{FrameRate, Rational};
+        use concat_media::SeekableSource;
+        let dir = std::env::temp_dir().join(format!("concat-proxy-gop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("clip.mp4");
+        {
+            let mut encoder = Encoder::create(
+                &media,
+                640,
+                360,
+                FrameRate::THIRTY,
+                &EncodeOptions::default(),
+            )
+            .expect("encodes");
+            // One slow ramp, so no scene cut asks for a keyframe of its own.
+            for index in 0..120u32 {
+                let mut frame = Frame::black(640, 360);
+                frame.fill([(index + 60) as u8, 90, 90, 255]);
+                encoder.write_frame(&frame).expect("writes");
+            }
+            encoder.finish().expect("finishes");
+        }
+        let target = dir.join("proxy.mp4");
+        write(&media.to_string_lossy(), &target, (320, 180), None).expect("writes the proxy");
+        let mut decoder =
+            Decoder::open(&target, &DecodeOptions::default().nearest_keyframes()).expect("opens");
+        for second in 1..4 {
+            let asked = f64::from(second) + 0.9;
+            decoder
+                .seek(Rational::approximate(asked).expect("a time"))
+                .expect("seeks");
+            decoder.next_frame().expect("decodes").expect("a frame");
+            let landed = decoder.position().expect("a stamp").as_f64();
+            assert!(
+                landed > asked - 1.0 - 0.05 && landed <= asked,
+                "the keyframe before {asked} s is at {landed} s"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// An HDR file's proxy keeps its signal: HEVC, HLG as the file is,
     /// its grey coming back as the same signal - under a name of its own,

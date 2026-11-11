@@ -368,11 +368,9 @@ enum Access {
     Seek,
 }
 
-fn plan_access(current_next: Option<i64>, target: i64) -> Access {
+fn plan_access(current_next: Option<i64>, target: i64, roll: i64) -> Access {
     match current_next {
-        Some(next) if target >= next && target - next <= ROLL_FORWARD_FRAMES => {
-            Access::Roll(target - next)
-        }
+        Some(next) if target >= next && target - next <= roll => Access::Roll(target - next),
         _ => Access::Seek,
     }
 }
@@ -383,8 +381,8 @@ fn plan_access(current_next: Option<i64>, target: i64) -> Access {
 /// frame k often claims after k+1 has already moved the reader's aim, and
 /// treating k as a seek opened a second and a third reader for plain
 /// playback of one file.
-fn claim_cost(aim: i64, target: i64) -> Option<i64> {
-    match plan_access(Some(aim), target) {
+fn claim_cost(aim: i64, target: i64, roll: i64) -> Option<i64> {
+    match plan_access(Some(aim), target, roll) {
         Access::Roll(frames) => Some(frames),
         Access::Seek if target < aim && aim - target <= i64::from(crate::prefetch::AHEAD) => {
             Some(aim - target)
@@ -398,6 +396,12 @@ fn claim_cost(aim: i64, target: i64) -> Option<i64> {
 /// at rest - and not one a `deep` reader would keep deep.
 fn squeezes(facts: &MediaFacts, deep: bool, screen: bool) -> bool {
     facts.deep && screen && !(deep && facts.wide)
+}
+
+/// A proxy's roll: the frames of one second, the distance between its
+/// keyframes, and never more than any file's.
+fn proxy_roll(rate: FrameRate) -> i64 {
+    (rate.fps().as_f64().round() as i64).clamp(1, ROLL_FORWARD_FRAMES)
 }
 
 /// An even size no smaller than two on a side: what the scaler and the
@@ -544,6 +548,12 @@ struct MediaFacts {
     /// ten-bit file - a camera's log profile - comes out of every reader
     /// in eight bits.
     wide: bool,
+    /// How many frames ahead of a reader a frame is rolled to rather than
+    /// sought: [`ROLL_FORWARD_FRAMES`], or a second's worth for a proxy,
+    /// which has a keyframe every second - past that a seek is the
+    /// shorter walk, and rolling two seconds of it held up the first
+    /// frame of a play by a third of a second.
+    roll: i64,
 }
 
 impl MediaFacts {
@@ -605,7 +615,7 @@ impl Readers {
     /// roll - or a few frames behind, or, when none is and the key already
     /// holds [`READERS_PER_KEY`], its coldest, which will seek. Made the
     /// most recent and aimed at `target`. `None` means open another.
-    fn claim(&mut self, key: &ReaderKey, target: i64) -> Option<Arc<Mutex<Reader>>> {
+    fn claim(&mut self, key: &ReaderKey, target: i64, roll: i64) -> Option<Arc<Mutex<Reader>>> {
         let mine = || {
             self.warm
                 .iter()
@@ -613,7 +623,7 @@ impl Readers {
                 .filter(|(_, warm)| &warm.key == key)
         };
         let near = mine()
-            .filter_map(|(at, warm)| Some((claim_cost(warm.aim, target)?, at)))
+            .filter_map(|(at, warm)| Some((claim_cost(warm.aim, target, roll)?, at)))
             .min()
             .map(|(_, at)| at);
         // At the cap the coldest seeks, as the one reader always did: a
@@ -808,6 +818,7 @@ impl ReaderPool {
                     size: None,
                     deep: false,
                     wide: false,
+                    roll: ROLL_FORWARD_FRAMES,
                 }),
             );
         }
@@ -825,6 +836,13 @@ impl ReaderPool {
         if let Ok(mut proxies) = self.proxies.lock() {
             proxies.insert(original.to_path_buf(), proxy);
         }
+    }
+
+    /// Whether `path` is a proxy some file was given.
+    fn is_proxy(&self, path: &Path) -> bool {
+        self.proxies
+            .lock()
+            .is_ok_and(|proxies| proxies.values().any(|proxy| proxy == path))
     }
 
     /// The proxy adopted for `original`, if one was.
@@ -1188,7 +1206,7 @@ impl ReaderPool {
     ) -> Result<Option<Arc<Frame>>> {
         let rate = facts.rate;
         let next = (reader.next_index != i64::MIN).then_some(reader.next_index);
-        if !facts.still && plan_access(next, target) == Access::Seek {
+        if !facts.still && plan_access(next, target, facts.roll) == Access::Seek {
             reader.seek(rate, target)?;
         }
 
@@ -1294,6 +1312,7 @@ impl ReaderPool {
                     size: None,
                     deep: false,
                     wide: false,
+                    roll: ROLL_FORWARD_FRAMES,
                 }
             } else {
                 let info = probe::probe(path)?;
@@ -1327,6 +1346,11 @@ impl ReaderPool {
                         .video
                         .as_ref()
                         .is_some_and(|video| video.signal != concat_core::frame::Signal::Sdr),
+                    roll: if self.is_proxy(path) {
+                        proxy_roll(rate)
+                    } else {
+                        ROLL_FORWARD_FRAMES
+                    },
                 }
             }
         };
@@ -1373,7 +1397,7 @@ impl ReaderPool {
                 .map_err(|_| crate::error::Error::NoFrame {
                     path: path.to_path_buf(),
                 })?;
-            if let Some(reader) = readers.claim(&key, target) {
+            if let Some(reader) = readers.claim(&key, target, facts.roll) {
                 return Ok(reader);
             }
         }
@@ -1400,7 +1424,7 @@ impl ReaderPool {
             .map_err(|_| crate::error::Error::NoFrame {
                 path: path.to_path_buf(),
             })?;
-        if let Some(reader) = readers.claim(&key, target) {
+        if let Some(reader) = readers.claim(&key, target, facts.roll) {
             // Someone else opened a reader for this ground meanwhile, or
             // filled the key; theirs wins.
             return Ok(reader);
@@ -1461,6 +1485,7 @@ pub(crate) mod tests {
             size: Some((3840, 2160)),
             deep,
             wide,
+            roll: ROLL_FORWARD_FRAMES,
         };
         let log = facts(true, false);
         assert!(squeezes(&log, true, true), "a deep request of a log file");
@@ -1475,25 +1500,45 @@ pub(crate) mod tests {
     #[test]
     fn the_access_policy_rolls_forward_and_seeks_backward() {
         assert_eq!(
-            plan_access(Some(10), 10),
+            plan_access(Some(10), 10, ROLL_FORWARD_FRAMES),
             Access::Roll(0),
             "the very next frame"
         );
         assert_eq!(
-            plan_access(Some(10), 30),
+            plan_access(Some(10), 30, ROLL_FORWARD_FRAMES),
             Access::Roll(20),
             "a short hop ahead"
         );
-        assert_eq!(plan_access(Some(10), 9), Access::Seek, "behind means seek");
         assert_eq!(
-            plan_access(Some(10), 10 + ROLL_FORWARD_FRAMES + 1),
+            plan_access(Some(10), 9, ROLL_FORWARD_FRAMES),
+            Access::Seek,
+            "behind means seek"
+        );
+        assert_eq!(
+            plan_access(Some(10), 10 + ROLL_FORWARD_FRAMES + 1, ROLL_FORWARD_FRAMES),
             Access::Seek,
             "too far ahead means seek"
         );
         assert_eq!(
-            plan_access(None, 5),
+            plan_access(None, 5, ROLL_FORWARD_FRAMES),
             Access::Seek,
             "unknown position means seek"
+        );
+    }
+
+    /// A proxy is rolled a second ahead and sought past that: its
+    /// keyframes are a second apart, so the seek is the shorter walk.
+    #[test]
+    fn a_proxy_is_sought_past_a_second_ahead() {
+        let roll = proxy_roll(FrameRate::THIRTY);
+        assert_eq!(roll, 30);
+        assert_eq!(plan_access(Some(10), 40, roll), Access::Roll(30));
+        assert_eq!(plan_access(Some(10), 41, roll), Access::Seek);
+        assert_eq!(claim_cost(10, 41, roll), None, "another reader, or a seek");
+        assert_eq!(
+            proxy_roll(FrameRate::new(Rational::from_int(120))),
+            ROLL_FORWARD_FRAMES,
+            "never further than any file"
         );
     }
 
@@ -1502,16 +1547,27 @@ pub(crate) mod tests {
     /// further behind is a seek, which another reader may serve better.
     #[test]
     fn a_reader_serves_a_frame_just_behind_it_as_well_as_one_ahead() {
-        assert_eq!(claim_cost(10, 12), Some(2), "just ahead rolls");
         assert_eq!(
-            claim_cost(10, 9),
+            claim_cost(10, 12, ROLL_FORWARD_FRAMES),
+            Some(2),
+            "just ahead rolls"
+        );
+        assert_eq!(
+            claim_cost(10, 9, ROLL_FORWARD_FRAMES),
             Some(1),
             "one behind: its neighbour won the race"
         );
         let ahead = i64::from(crate::prefetch::AHEAD);
-        assert_eq!(claim_cost(10 + ahead, 10), Some(ahead));
-        assert_eq!(claim_cost(11 + ahead, 10), None, "further behind seeks");
-        assert_eq!(claim_cost(10, 10 + ROLL_FORWARD_FRAMES + 1), None);
+        assert_eq!(claim_cost(10 + ahead, 10, ROLL_FORWARD_FRAMES), Some(ahead));
+        assert_eq!(
+            claim_cost(11 + ahead, 10, ROLL_FORWARD_FRAMES),
+            None,
+            "further behind seeks"
+        );
+        assert_eq!(
+            claim_cost(10, 10 + ROLL_FORWARD_FRAMES + 1, ROLL_FORWARD_FRAMES),
+            None
+        );
     }
 
     /// Playing through a variable-rate recording's still stretch shows the

@@ -1796,6 +1796,7 @@ fn render_picture(
         hardware: true,
         threads: 0,
         software_only: false,
+        keyframe_seconds: 0,
     };
     // An HDR file comes out of the compositor as its signal, sixteen bits a
     // channel; anything else, SDR - an HDR timeline's tone-mapped.

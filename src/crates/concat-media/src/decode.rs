@@ -2045,6 +2045,7 @@ mod tests {
             hardware: false,
             threads: 0,
             software_only: false,
+            keyframe_seconds: 0,
         };
         let mut encoder = Encoder::create_tagged(
             &path,

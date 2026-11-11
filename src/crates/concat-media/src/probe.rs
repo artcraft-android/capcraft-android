@@ -436,6 +436,7 @@ mod tests {
             hardware: false,
             threads: 0,
             software_only: false,
+            keyframe_seconds: 0,
         };
         let rate = FrameRate::from_int(25);
         for (name, hdr, want) in [

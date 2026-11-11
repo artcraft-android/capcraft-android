@@ -76,6 +76,7 @@ fn shoot(path: &Path) {
         hardware: false,
         threads: 0,
         software_only: false,
+        keyframe_seconds: 0,
     };
     let mut encoder = Encoder::create(path, WIDTH, HEIGHT, FrameRate::THIRTY, &options)
         .expect("the linked FFmpeg encodes");

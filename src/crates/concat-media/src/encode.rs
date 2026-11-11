@@ -362,6 +362,10 @@ pub struct EncodeOptions {
     /// For an export going again after the hardware encoder stopped taking
     /// frames part way through (see [`Error::Stalled`]); off otherwise.
     pub software_only: bool,
+    /// Seconds between keyframes, or zero for the encoder's own spacing.
+    /// One for a proxy: a play starts wherever the playhead is, and its
+    /// first frame is decoded from the keyframe before it.
+    pub keyframe_seconds: u32,
 }
 
 impl Default for EncodeOptions {
@@ -377,6 +381,7 @@ impl Default for EncodeOptions {
             hardware: true,
             threads: 0,
             software_only: false,
+            keyframe_seconds: 0,
         }
     }
 }
@@ -887,6 +892,9 @@ fn open_video(
         // Two seconds between keyframes, where MediaCodec's own default
         // is one per second rounded from a GOP of twelve frames.
         video.set_gop((fps.round().max(1.0) * 2.0) as u32);
+    }
+    if options.keyframe_seconds > 0 {
+        video.set_gop((fps.round().max(1.0) as u32) * options.keyframe_seconds);
     }
     // An average, on the context as well as in each encoder's own words:
     // the AV1 encoders read the target and the ceiling from there.
@@ -2284,6 +2292,7 @@ mod tests {
             hardware: false,
             threads: 0,
             software_only: false,
+            keyframe_seconds: 0,
         };
         let rate = FrameRate::new(concat_core::time::Rational::new(25, 1));
         const FRAMES: u32 = 150;
@@ -2431,6 +2440,7 @@ mod tests {
     fn a_stalled_chip_is_passed_over_for_the_cpu() {
         let cpu = EncodeOptions {
             software_only: true,
+            keyframe_seconds: 0,
             ..EncodeOptions::default()
         };
         let asked = |name: &'static str, options: &EncodeOptions| -> Vec<Attempt> {
@@ -2505,6 +2515,7 @@ mod tests {
         let options = EncodeOptions {
             preset: "ultrafast".to_owned(),
             software_only: true,
+            keyframe_seconds: 0,
             ..EncodeOptions::default()
         };
         let mut encoder = Encoder::create(&path, 64, 64, FrameRate::THIRTY, &options)
@@ -2791,6 +2802,7 @@ mod tests {
                     hardware: true,
                     threads: 0,
                     software_only: false,
+                    keyframe_seconds: 0,
                 };
                 let mut encoder = Encoder::create(&path, 64, 64, FrameRate::THIRTY, &options)
                     .unwrap_or_else(|error| panic!("{} {ten_bit}: {error}", codec.label()));
@@ -2836,6 +2848,7 @@ mod tests {
             hardware: true,
             threads: 0,
             software_only: false,
+            keyframe_seconds: 0,
         };
         let refused = std::env::temp_dir().join("concat-encode-hdr-h264.mp4");
         assert!(

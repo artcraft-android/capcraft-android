@@ -419,6 +419,7 @@ fn footage(
             hardware: false,
             threads: 2,
             software_only: false,
+            keyframe_seconds: 0,
         },
     )
     .map_err(|error| error.to_string())?;
