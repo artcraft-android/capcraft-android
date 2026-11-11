@@ -882,6 +882,7 @@ impl MobileSession {
             moving: motion == Motion::Playing,
             proxy,
             scrub: motion == Motion::Scrubbing,
+            paused: motion == Motion::Still,
             color_space,
             canvas: settings.canvas,
         };
@@ -890,15 +891,25 @@ impl MobileSession {
             .frame(Arc::clone(&clips), &settings, spec)
             .map_err(MobileError::Failed)?;
         // A drag goes either way, and its next instant is a cheap read of
-        // the scrub copy: nothing is decoded ahead of it.
+        // the scrub copy: nothing is decoded ahead of it. At rest, what is
+        // decoded ahead is what a play pressed next will ask for first -
+        // the proxy's frames from here on - so its reader is open and on
+        // the spot by then: bringing it there took the first third of a
+        // second of every play.
         let ahead = match motion {
-            Motion::Playing => concat_media::prefetch::AHEAD,
-            Motion::Still => 2,
-            Motion::Scrubbing => 0,
+            Motion::Playing => Some(spec),
+            Motion::Still => Some(FrameSpec {
+                proxy: true,
+                paused: false,
+                ..spec
+            }),
+            Motion::Scrubbing => None,
         };
-        if ahead > 0 {
+        if let Some(spec) = ahead {
             let monitor = context.monitor.clone();
-            std::thread::spawn(move || monitor.prefetch(clips, &settings, spec, ahead));
+            std::thread::spawn(move || {
+                monitor.prefetch(clips, &settings, spec, concat_media::prefetch::AHEAD)
+            });
         }
         Ok(Picture {
             width,
@@ -1387,6 +1398,7 @@ impl MobileSession {
             moving: false,
             proxy: false,
             scrub: false,
+            paused: false,
             color_space,
             canvas: settings.canvas,
         };

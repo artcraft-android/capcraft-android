@@ -91,6 +91,11 @@ pub struct FrameRequest {
     /// the file: for a playhead being dragged. See
     /// [`ReaderPool::adopt_scrub`].
     pub scrub: bool,
+    /// The file itself, for a playhead at rest on a screen: the original
+    /// as ever, except that a phone's chip may hand a ten-bit picture back
+    /// in eight, a few levels off and several times sooner. Never set for
+    /// an export.
+    pub paused: bool,
     /// The levels the file is read as, over its own tag; `None` reads the
     /// tag. See [`DecodeOptions::color_range`]. Never applied to a proxy:
     /// a proxy was written from the corrected picture and tagged true.
@@ -123,6 +128,7 @@ impl FrameRequest {
             chain: None,
             proxy: false,
             scrub: false,
+            paused: false,
             range: None,
             any_size: false,
             deep: false,
@@ -191,19 +197,30 @@ impl FrameRequest {
         self
     }
 
+    /// Reads the file for a playhead at rest on a screen. See
+    /// [`FrameRequest::paused`].
+    pub fn for_pause(mut self, paused: bool) -> Self {
+        self.paused = paused;
+        self
+    }
+
     /// Reads the copy `reading` names where the file has one.
     pub fn reading(self, reading: Reading) -> Self {
         self.from_proxy(reading == Reading::Proxy)
             .for_scrub(reading == Reading::Scrub)
+            .for_pause(reading == Reading::Paused)
     }
 }
 
 /// Which copy of a file a frame is read from.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Reading {
-    /// The file itself: the paused monitor and the export.
+    /// The file itself, to the bit: the export.
     #[default]
     Original,
+    /// The file itself for a playhead at rest on a screen; see
+    /// [`FrameRequest::paused`].
+    Paused,
     /// Its proxy where it has one: a picture that is playing.
     Proxy,
     /// Its scrub copy, else its proxy: a playhead being dragged.
@@ -376,6 +393,13 @@ fn claim_cost(aim: i64, target: i64) -> Option<i64> {
     }
 }
 
+/// Whether a phone reads the file of `facts` in eight bits off its chip: a
+/// ten-bit file, asked for by a `screen` - a moving picture or a playhead
+/// at rest - and not one a `deep` reader would keep deep.
+fn squeezes(facts: &MediaFacts, deep: bool, screen: bool) -> bool {
+    facts.deep && screen && !(deep && facts.wide)
+}
+
 /// An even size no smaller than two on a side: what the scaler and the
 /// codecs are happiest with.
 fn even(width: u32, height: u32) -> (u32, u32) {
@@ -432,7 +456,8 @@ impl Reader {
             .starting_at(rate.time_of_frame(index))
             .scaled_to(width, height)
             .in_range(range)
-            .deep(deep)
+            // An eight-bit reader is of a file no reader keeps deep.
+            .deep(deep && !eight)
             .eight_bit(eight);
         if still {
             // One frame, served for every time, and never sought: a seek
@@ -515,6 +540,10 @@ struct MediaFacts {
     size: Option<(u32, u32)>,
     /// More than eight bits a sample; see [`probe::VideoStream::deep`].
     deep: bool,
+    /// A wide or HDR signal, which a deep reader keeps deep. Any other
+    /// ten-bit file - a camera's log profile - comes out of every reader
+    /// in eight bits.
+    wide: bool,
 }
 
 impl MediaFacts {
@@ -778,6 +807,7 @@ impl ReaderPool {
                     frames: None,
                     size: None,
                     deep: false,
+                    wide: false,
                 }),
             );
         }
@@ -941,14 +971,20 @@ impl ReaderPool {
         // A moving picture of a ten-bit file whose stand-in is not written
         // yet is read off a phone's chip in eight bits, three times as
         // fast as in ten: the stand-in it asked for would have been eight
-        // bits too. Only there, and only for a deep file: anywhere else
-        // the reader is the same one, and a second key would only open it
-        // twice.
+        // bits too. So is the picture of a playhead at rest, which in ten
+        // bits was a second in coming and held up the play pressed after
+        // it. Only there, and only for a deep file: anywhere else the
+        // reader is the same one, and a second key would only open it
+        // twice. A deep request keeps a wide file's ten bits; of any other
+        // file it gets eight whoever reads it, so it does not stand in the
+        // way.
         let eight = cfg!(target_os = "android")
-            && facts.deep
-            && !deep
-            && (request.proxy || request.scrub)
-            && path == request.path;
+            && path == request.path
+            && squeezes(
+                &facts,
+                deep,
+                request.proxy || request.scrub || request.paused,
+            );
         Ok((
             facts,
             SourceKey {
@@ -1257,6 +1293,7 @@ impl ReaderPool {
                     frames: None,
                     size: None,
                     deep: false,
+                    wide: false,
                 }
             } else {
                 let info = probe::probe(path)?;
@@ -1286,6 +1323,10 @@ impl ReaderPool {
                     frames,
                     size,
                     deep: info.video.as_ref().is_some_and(|video| video.deep),
+                    wide: info
+                        .video
+                        .as_ref()
+                        .is_some_and(|video| video.signal != concat_core::frame::Signal::Sdr),
                 }
             }
         };
@@ -1406,6 +1447,30 @@ impl ReaderPool {
 pub(crate) mod tests {
     use super::*;
     use crate::encode::{EncodeOptions, Encoder, FrameSink};
+
+    /// A camera's log file is read in eight bits for a screen, deep
+    /// request or not, since no reader keeps it deep; an HDR file keeps
+    /// its ten bits for a deep request; and nothing is squeezed for an
+    /// export or out of an eight-bit file.
+    #[test]
+    fn a_ten_bit_file_is_squeezed_for_a_screen_only() {
+        let facts = |deep, wide| MediaFacts {
+            rate: FrameRate::THIRTY,
+            still: false,
+            frames: None,
+            size: Some((3840, 2160)),
+            deep,
+            wide,
+        };
+        let log = facts(true, false);
+        assert!(squeezes(&log, true, true), "a deep request of a log file");
+        assert!(squeezes(&log, false, true));
+        assert!(!squeezes(&log, true, false), "an export");
+        let hdr = facts(true, true);
+        assert!(!squeezes(&hdr, true, true), "an HDR file read deep");
+        assert!(squeezes(&hdr, false, true), "an HDR file in eight bits");
+        assert!(!squeezes(&facts(false, false), false, true), "eight bits");
+    }
 
     #[test]
     fn the_access_policy_rolls_forward_and_seeks_backward() {

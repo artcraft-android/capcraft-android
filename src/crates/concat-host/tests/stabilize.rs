@@ -299,6 +299,7 @@ fn a_shaky_shot_is_measured_and_held_still() {
                     moving: false,
                     proxy: false,
                     scrub: false,
+                    paused: false,
                     color_space: ColorSpace::default(),
                 },
             )

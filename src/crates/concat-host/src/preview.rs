@@ -51,6 +51,10 @@ pub struct FrameSpec {
     /// has one, else its proxy - any instant one decode away, the picture
     /// coarse until the drag stops and the paused monitor asks for the file.
     pub scrub: bool,
+    /// The playhead is at rest on a screen: the file itself is read, as a
+    /// phone's chip hands it back soonest. Not for a frame that is kept -
+    /// a GIF's, an export's.
+    pub paused: bool,
     /// What the timeline is output in: an HDR one keeps its clips' light
     /// above white and is rolled off for the SDR screen.
     pub color_space: ColorSpace,
@@ -66,6 +70,8 @@ impl FrameSpec {
             concat_media::Reading::Scrub
         } else if self.proxy {
             concat_media::Reading::Proxy
+        } else if self.paused {
+            concat_media::Reading::Paused
         } else {
             concat_media::Reading::Original
         }

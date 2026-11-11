@@ -402,7 +402,7 @@ private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageB
         } else {
             suspend fun show(at: Long, motion: Motion) {
                 val started = System.nanoTime()
-                val pic = withContext(Threads.preview) {
+                val pic = withContext(if (motion == Motion.STILL) Threads.rest else Threads.preview) {
                     runCatching { s.frame(at, width.toUInt(), height.toUInt(), motion) }.getOrNull()
                 } ?: return
                 if (motion == Motion.SCRUBBING) meter.add(started)
