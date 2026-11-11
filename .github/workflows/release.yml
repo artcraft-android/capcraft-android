@@ -86,7 +86,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: src/vendor/ffmpeg/aarch64-linux-android
-          key: ffmpeg-aarch64-linux-android-${{ env.NDK_VERSION }}-${{ hashFiles('src/scripts/ffmpeg-mobile.sh') }}
+          key: ffmpeg-aarch64-linux-android-${{ env.NDK_VERSION }}-${{ hashFiles('src/scripts/ffmpeg-mobile.sh', 'src/scripts/ffmpeg-patches/**') }}
       - name: FFmpeg for Android
         if: steps.ffmpeg.outputs.cache-hit != 'true'
         run: src/scripts/ffmpeg-mobile.sh aarch64-linux-android

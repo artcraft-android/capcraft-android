@@ -1,0 +1,132 @@
+diff --color -u -r a/libavcodec/mediacodec_sw_buffer.c b/libavcodec/mediacodec_sw_buffer.c
+--- a/libavcodec/mediacodec_sw_buffer.c	2023-11-10 06:38:51
++++ b/libavcodec/mediacodec_sw_buffer.c	2026-11-11 20:01:07
+@@ -177,6 +177,54 @@
+ }
+ 
+ 
++/**
++ * P010: the layout of YUV420SemiPlanar with every sample in two bytes,
++ * little-endian, the ten bits in the high end - AV_PIX_FMT_P010 as it is.
++ * The stride is in bytes; a decoder that reports it in samples is caught
++ * by a stride too short to hold a row.
++ */
++void ff_mediacodec_sw_buffer_copy_p010(AVCodecContext *avctx,
++                                       MediaCodecDecContext *s,
++                                       uint8_t *data,
++                                       size_t size,
++                                       FFAMediaCodecBufferInfo *info,
++                                       AVFrame *frame)
++{
++    int i;
++    int stride = s->stride < avctx->width * 2 ? s->stride * 2 : s->stride;
++
++    for (i = 0; i < 2; i++) {
++        int j, height;
++        int width = FFMIN(frame->linesize[i], FFALIGN(avctx->width, 2) * 2);
++        uint8_t *src = data + info->offset;
++        uint8_t *dst = frame->data[i];
++
++        if (i == 0) {
++            height = avctx->height;
++            width  = FFMIN(frame->linesize[i], avctx->width * 2);
++        } else {
++            height = avctx->height / 2;
++            src += s->slice_height * stride;
++        }
++        src += (s->crop_top >> i) * stride;
++        src += s->crop_left * 2;
++
++        if ((src - data) + (size_t)(height - 1) * stride + width > size) {
++            av_log(avctx, AV_LOG_ERROR, "P010 buffer is shorter than its picture\n");
++            return;
++        }
++
++        if (frame->linesize[i] == stride) {
++            memcpy(dst, src, (size_t)(height - 1) * stride + width);
++        } else {
++            for (j = 0; j < height; j++) {
++                memcpy(dst, src, width);
++                src += stride;
++                dst += frame->linesize[i];
++            }
++        }
++    }
++}
+ 
+ void ff_mediacodec_sw_buffer_copy_yuv420_packed_semi_planar(AVCodecContext *avctx,
+                                                             MediaCodecDecContext *s,
+diff --color -u -r a/libavcodec/mediacodec_sw_buffer.h b/libavcodec/mediacodec_sw_buffer.h
+--- a/libavcodec/mediacodec_sw_buffer.h	2023-11-10 06:38:51
++++ b/libavcodec/mediacodec_sw_buffer.h	2026-11-11 20:01:07
+@@ -45,6 +45,13 @@
+                                                      FFAMediaCodecBufferInfo *info,
+                                                      AVFrame *frame);
+ 
++void ff_mediacodec_sw_buffer_copy_p010(AVCodecContext *avctx,
++                                       MediaCodecDecContext *s,
++                                       uint8_t *data,
++                                       size_t size,
++                                       FFAMediaCodecBufferInfo *info,
++                                       AVFrame *frame);
++
+ void ff_mediacodec_sw_buffer_copy_yuv420_packed_semi_planar(AVCodecContext *avctx,
+                                                      MediaCodecDecContext *s,
+                                                      uint8_t *data,
+diff --color -u -r a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+--- a/libavcodec/mediacodecdec.c	2026-03-17 01:13:04
++++ b/libavcodec/mediacodecdec.c	2026-11-11 20:01:07
+@@ -31,6 +31,7 @@
+ #include "libavutil/opt.h"
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/pixfmt.h"
++#include "libavutil/pixdesc.h"
+ #include "libavutil/internal.h"
+ 
+ #include "avcodec.h"
+@@ -434,6 +435,16 @@
+     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+         ff_AMediaFormat_setInt32(format, "width", avctx->width);
+         ff_AMediaFormat_setInt32(format, "height", avctx->height);
++        {
++            /* A stream deeper than eight bits is asked for as P010. Without
++             * the request an Android 13+ decoder squeezes it to eight bits
++             * on the way to a ByteBuffer, and older ones pick for themselves.
++             * A decoder that has no P010 answers with its own format, which
++             * is mapped (or refused) as before. Ignored with a surface. */
++            const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(avctx->pix_fmt);
++            if (desc && desc->comp[0].depth > 8)
++                ff_AMediaFormat_setInt32(format, "color-format", 54 /* COLOR_FormatYUVP010 */);
++        }
+     } else {
+         ff_AMediaFormat_setInt32(format, "channel-count", avctx->ch_layout.nb_channels);
+         ff_AMediaFormat_setInt32(format, "sample-rate", avctx->sample_rate);
+diff --color -u -r a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+--- a/libavcodec/mediacodecdec_common.c	2026-03-17 01:13:04
++++ b/libavcodec/mediacodecdec_common.c	2026-11-11 20:01:07
+@@ -192,6 +192,7 @@
+     COLOR_FormatYUV420Planar                              = 0x13,
+     COLOR_FormatYUV420SemiPlanar                          = 0x15,
+     COLOR_FormatYCbYCr                                    = 0x19,
++    COLOR_FormatYUVP010                                   = 0x36,
+     COLOR_FormatAndroidOpaque                             = 0x7F000789,
+     COLOR_QCOM_FormatYUV420SemiPlanar                     = 0x7fa30c00,
+     COLOR_QCOM_FormatYUV420SemiPlanar32m                  = 0x7fa30c04,
+@@ -209,6 +210,7 @@
+ 
+     { COLOR_FormatYUV420Planar,                              AV_PIX_FMT_YUV420P },
+     { COLOR_FormatYUV420SemiPlanar,                          AV_PIX_FMT_NV12    },
++    { COLOR_FormatYUVP010,                                   AV_PIX_FMT_P010    },
+     { COLOR_QCOM_FormatYUV420SemiPlanar,                     AV_PIX_FMT_NV12    },
+     { COLOR_QCOM_FormatYUV420SemiPlanar32m,                  AV_PIX_FMT_NV12    },
+     { COLOR_QCOM_FormatYUV420PackedSemiPlanar64x32Tile2m8ka, AV_PIX_FMT_NV12    },
+@@ -493,6 +495,9 @@
+     case COLOR_QCOM_FormatYUV420SemiPlanar:
+     case COLOR_QCOM_FormatYUV420SemiPlanar32m:
+         ff_mediacodec_sw_buffer_copy_yuv420_semi_planar(avctx, s, data, size, info, frame);
++        break;
++    case COLOR_FormatYUVP010:
++        ff_mediacodec_sw_buffer_copy_p010(avctx, s, data, size, info, frame);
+         break;
+     case COLOR_TI_FormatYUV420PackedSemiPlanar:
+     case COLOR_TI_FormatYUV420PackedSemiPlanarInterlaced:
