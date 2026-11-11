@@ -411,6 +411,11 @@ pub fn filmstrip(path: &str, count: u32, height: u32) -> Result<Frame, String> {
 /// nearest picture before it, or the first one after when there is none
 /// before. The strip was a black canvas the frames were painted onto, and
 /// a cut that landed wholly on a hole was a clip with a black body.
+///
+/// A file with a scrub copy or a proxy has its strip read from that: a cut
+/// asks for the strip of each piece it leaves, and a strip of a few seconds
+/// is a pass over every frame of them, which on a 4K file is seconds of
+/// every core just as the cut is played back.
 pub fn filmstrip_between(
     path: &str,
     from: f64,
@@ -418,6 +423,27 @@ pub fn filmstrip_between(
     count: u32,
     height: u32,
 ) -> Result<Frame, String> {
+    if let Some(copy) = stand_in(path)
+        && let Ok(strip) = strip_of(&copy.to_string_lossy(), from, to, count, height)
+    {
+        return Ok(strip);
+    }
+    strip_of(path, from, to, count, height)
+}
+
+/// The small copy of `path` a thumbnail is read from, where the reader
+/// pool knows one that is still on disk: the scrub copy, whose every frame
+/// is a picture of its own, or else the proxy.
+fn stand_in(path: &str) -> Option<PathBuf> {
+    let pool = crate::scheduler().pool();
+    let original = Path::new(path);
+    pool.scrub_of(original)
+        .filter(|copy| copy.is_file())
+        .or_else(|| pool.proxy_of(original).filter(|copy| copy.is_file()))
+}
+
+/// [`filmstrip_between`], of the file `path` itself.
+fn strip_of(path: &str, from: f64, to: f64, count: u32, height: u32) -> Result<Frame, String> {
     let count = count.clamp(1, 60);
     let height = height.clamp(16, 240);
 
@@ -879,6 +905,23 @@ fn poster_moments(project: &str) -> Result<Vec<(String, f64)>, String> {
 /// One frame of `path` at `seconds`, scaled to `width` across with the
 /// height following the picture's shape.
 pub fn still_at(path: &str, seconds: f64, width: u32) -> Result<Frame, String> {
+    // The proxy has the file's own frames at a quarter of the size: where
+    // it is wide enough, the walk from the keyframe is made there.
+    let pool = crate::scheduler().pool();
+    if let Some(proxy) = pool.proxy_of(Path::new(path))
+        && concat_media::probe(&proxy)
+            .ok()
+            .and_then(|info| info.video)
+            .is_some_and(|video| video.width >= width)
+        && let Ok(frame) = still_of(&proxy.to_string_lossy(), seconds, width)
+    {
+        return Ok(frame);
+    }
+    still_of(path, seconds, width)
+}
+
+/// [`still_at`], of the file `path` itself.
+fn still_of(path: &str, seconds: f64, width: u32) -> Result<Frame, String> {
     let info = concat_media::probe(path).map_err(describe)?;
     let video = info.require_video().map_err(describe)?;
     let height = ((f64::from(width) * f64::from(video.height) / f64::from(video.width)).round()
@@ -1236,6 +1279,62 @@ mod tests {
             tiles_in_their_slices(&strip, count).expect("tiles from their own slices");
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A clip of one colour, two seconds of it.
+    fn plain(path: &Path, colour: [u8; 4]) {
+        use concat_core::time::FrameRate;
+        use concat_media::{EncodeOptions, Encoder, FrameSink};
+
+        let mut encoder =
+            Encoder::create(path, 64, 32, FrameRate::THIRTY, &EncodeOptions::default())
+                .expect("encodes");
+        let mut frame = Frame::black(64, 32);
+        frame.fill(colour);
+        for _ in 0..60 {
+            encoder.write_frame(&frame).expect("writes");
+        }
+        encoder.finish().expect("finishes");
+    }
+
+    /// A file's strip is read from its scrub copy and its still from its
+    /// proxy while the reader pool knows them, and from the file itself
+    /// once the copy is gone from the disk.
+    #[test]
+    fn thumbnails_are_read_from_a_files_copies() {
+        let dir = std::env::temp_dir().join(format!("concat-thumb-copies-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (file, scrub, proxy) = (dir.join("a.mp4"), dir.join("s.mp4"), dir.join("p.mp4"));
+        plain(&file, [200, 20, 20, 255]);
+        plain(&scrub, [20, 200, 20, 255]);
+        plain(&proxy, [20, 20, 200, 255]);
+        let name = file.to_string_lossy().into_owned();
+        let strongest = |frame: &Frame| {
+            let pixel = frame.pixel(8, 8).expect("in bounds");
+            (0..3).max_by_key(|channel| pixel[*channel]).expect("three")
+        };
+
+        let pool = crate::scheduler().pool();
+        pool.adopt_scrub(&file, scrub.clone());
+        pool.adopt_proxy(&file, proxy.clone());
+        let strip = filmstrip_between(&name, 0.0, 2.0, 2, 32).expect("strips");
+        assert_eq!(strongest(&strip), 1, "the strip is the scrub copy's green");
+        let still = still_at(&name, 1.0, 32).expect("still");
+        assert_eq!(strongest(&still), 2, "the still is the proxy's blue");
+        // Wider than the proxy: the file's own picture.
+        let wide = still_at(&name, 1.0, 128).expect("still");
+        assert_eq!(strongest(&wide), 0, "a wide still is the file's red");
+
+        std::fs::remove_file(&scrub).expect("removes");
+        let strip = filmstrip_between(&name, 0.0, 2.0, 2, 32).expect("strips");
+        assert_eq!(strongest(&strip), 2, "no scrub copy: the proxy's blue");
+        std::fs::remove_file(&proxy).expect("removes");
+        let strip = filmstrip_between(&name, 0.0, 2.0, 2, 32).expect("strips");
+        assert_eq!(strongest(&strip), 0, "no copy at all: the file's red");
+        let still = still_at(&name, 1.0, 32).expect("still");
+        assert_eq!(strongest(&still), 0, "no proxy: the file's red");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
