@@ -27,8 +27,8 @@ class CapCraftApplication : Application() {
                 Os.setenv("TMPDIR", cacheDir.absolutePath, true)
                 Os.setenv("HOME", filesDir.absolutePath, true)
                 File(cacheDir, "exports").mkdirs()
-                init(filesDir.absolutePath, cacheDir.absolutePath)
                 NativeContext.start(this@CapCraftApplication)
+                init(filesDir.absolutePath, cacheDir.absolutePath)
                 engineLoaded = true
             }
         }

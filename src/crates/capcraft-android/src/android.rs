@@ -47,7 +47,19 @@ pub unsafe extern "system" fn Java_io_github_artcraftandroid_capcraft_NativeCont
     context: jobject,
 ) {
     static DONE: std::sync::Once = std::sync::Once::new();
-    let vm = VM.load(Ordering::Acquire);
+    let mut vm = VM.load(Ordering::Acquire);
+    if vm.is_null() && !env.is_null() {
+        // SAFETY: `env` is the calling thread's valid JNI environment.
+        unsafe {
+            if let Some(get_java_vm) = (**env).GetJavaVM {
+                let mut queried: *mut JavaVM = std::ptr::null_mut();
+                if get_java_vm(env, &mut queried) == 0 && !queried.is_null() {
+                    VM.store(queried, Ordering::Release);
+                    vm = queried;
+                }
+            }
+        }
+    }
     if vm.is_null() || env.is_null() || context.is_null() {
         log::warn!("android: no Java VM or context to hand to the engine");
         return;
