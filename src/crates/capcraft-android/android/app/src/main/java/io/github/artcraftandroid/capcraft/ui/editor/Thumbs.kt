@@ -10,8 +10,10 @@ import io.github.artcraftandroid.capcraft.engine.Threads
 import io.github.artcraftandroid.capcraft.engine.toBitmap
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * The timeline's pictures and waveforms, made off the main thread and kept in memory. A miss starts
@@ -35,7 +37,7 @@ object Thumbs {
                 runCatching { filmstrip(path, fromUs, toUs, count.toUInt(), height.toUInt()).toBitmap() }
                     .getOrNull()?.let { strips.put(key, it) }
                 pending.remove(key)
-                version.intValue++
+                withContext(Dispatchers.Main) { version.intValue++ }
             }
         }
         return null
@@ -49,7 +51,7 @@ object Thumbs {
             scope.launch {
                 runCatching { still(path, atUs, width.toUInt()).toBitmap() }.getOrNull()?.let { strips.put(key, it) }
                 pending.remove(key)
-                version.intValue++
+                withContext(Dispatchers.Main) { version.intValue++ }
             }
         }
         return null
@@ -64,7 +66,7 @@ object Thumbs {
                 runCatching { waveform(path, project, fromUs, toUs, buckets.toUInt()).toFloatArray() }
                     .getOrNull()?.let { waves.put(key, it) }
                 pending.remove(key)
-                version.intValue++
+                withContext(Dispatchers.Main) { version.intValue++ }
             }
         }
         return null
