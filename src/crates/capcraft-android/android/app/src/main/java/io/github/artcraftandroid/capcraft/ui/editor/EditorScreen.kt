@@ -81,7 +81,15 @@ import kotlin.math.roundToInt
 @Composable
 fun EditorScreen(path: String, incoming: List<Uri>, then: String? = null, close: () -> Unit) {
     val app = LocalContext.current.applicationContext as Application
-    val vm: EditorViewModel = viewModel(key = path, factory = EditorViewModel.Factory(app, path))
+    val storeOwner = remember(path) {
+        object : androidx.lifecycle.ViewModelStoreOwner {
+            override val viewModelStore = androidx.lifecycle.ViewModelStore()
+        }
+    }
+    androidx.compose.runtime.DisposableEffect(storeOwner) {
+        onDispose { storeOwner.viewModelStore.clear() }
+    }
+    val vm: EditorViewModel = viewModel(viewModelStoreOwner = storeOwner, key = path, factory = EditorViewModel.Factory(app, path))
     val scope = rememberCoroutineScope()
     var exporting by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { vm.open(incoming, then) }

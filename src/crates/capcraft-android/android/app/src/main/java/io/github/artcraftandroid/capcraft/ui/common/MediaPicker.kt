@@ -107,6 +107,11 @@ object MediaPick {
     ) {
         request = MediaRequest(kinds, multiple, onCancel, onPicked, onCollage)
     }
+
+    /** Gives back cached grid thumbnails when the picker closes or memory runs low. */
+    fun trim(clearAll: Boolean = false) {
+        if (clearAll) thumbs.evictAll() else thumbs.trimToSize(8 * 1024 * 1024)
+    }
 }
 
 /** A video or picture on the phone. */
@@ -115,7 +120,7 @@ private class Item(val uri: Uri, val video: Boolean, val durationMs: Long, val b
 /** An album: its id (null for all of them), name, how many it holds, and its newest item. */
 private class Album(val id: Long?, val name: String, val count: Int, val cover: Item)
 
-private val thumbs = object : LruCache<String, Bitmap>(48 * 1024 * 1024) {
+private val thumbs = object : LruCache<String, Bitmap>(24 * 1024 * 1024) {
     override fun sizeOf(key: String, value: Bitmap) = value.byteCount
 }
 
@@ -203,6 +208,7 @@ fun MediaPickerHost() {
     var allowed by remember(req) { mutableStateOf(canRead(context)) }
     fun finish(uris: List<Uri>) {
         MediaPick.request = null
+        MediaPick.trim()
         if (uris.isEmpty()) req.onCancel() else req.onPicked(uris)
     }
     val many = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(50)) { finish(it) }
@@ -223,6 +229,7 @@ fun MediaPickerHost() {
     if (allowed) {
         MediaPickerPage(req, onClose = { finish(emptyList()) }, onDone = ::finish) { uris ->
             MediaPick.request = null
+            MediaPick.trim()
             req.onCollage?.invoke(uris)
         }
     }

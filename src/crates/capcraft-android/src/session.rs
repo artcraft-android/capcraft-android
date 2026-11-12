@@ -1176,7 +1176,9 @@ impl MobileSession {
         };
         if ahead > 0 {
             let monitor = context.monitor.clone();
-            std::thread::spawn(move || monitor.prefetch(clips, &settings, spec, ahead));
+            let _ = context
+                .prefetch
+                .try_send(Box::new(move || monitor.prefetch(clips, &settings, spec, ahead)));
         }
         Ok(Picture {
             width,

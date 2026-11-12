@@ -22,11 +22,21 @@ import kotlinx.coroutines.withContext
 object Thumbs {
     val version = mutableIntStateOf(0)
     private val scope = CoroutineScope(SupervisorJob() + Threads.thumbnails)
-    private val strips = object : LruCache<String, Bitmap>(64 * 1024 * 1024) {
+    private val strips = object : LruCache<String, Bitmap>(32 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap) = value.byteCount
     }
     private val waves = LruCache<String, FloatArray>(256)
     private val pending = ConcurrentHashMap.newKeySet<String>()
+
+    /** Gives back cached strips and waveforms when memory runs low or a project closes. */
+    fun trim(clearAll: Boolean = false) {
+        if (clearAll) {
+            strips.evictAll()
+            waves.evictAll()
+        } else {
+            strips.trimToSize(strips.maxSize() / 2)
+        }
+    }
 
     /** A strip of [count] frames of [path] between two source times, [height] pixels tall. */
     fun strip(path: String, fromUs: Long, toUs: Long, count: Int, height: Int): Bitmap? {

@@ -101,6 +101,10 @@ pub(crate) struct Context {
     pub titles: Titles,
     /// The monitor: decoded frames stay warm between scrubs.
     pub monitor: concat_host::preview::Monitor,
+    /// Hands decode-ahead work to one background thread instead of spawning a
+    /// fresh OS thread per frame; a full single-slot channel drops the older
+    /// tick because the next frame supersedes it.
+    pub prefetch: std::sync::mpsc::SyncSender<Box<dyn FnOnce() + Send>>,
     /// The one export that may run at a time.
     pub exporter: concat_host::export::Exporter,
     /// Sound, once started.
@@ -156,12 +160,21 @@ pub fn init(files_dir: String, cache_dir: String) -> Result<(), MobileError> {
     // the looks imported before, beside the built-in filters
     looks::install(&dirs);
     let titles = Titles::new(&dirs);
+    let (prefetch, prefetch_rx) = std::sync::mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(1);
+    let _ = std::thread::Builder::new()
+        .name("capcraft-prefetch".to_owned())
+        .spawn(move || {
+            while let Ok(job) = prefetch_rx.recv() {
+                job();
+            }
+        });
     let _ = CONTEXT.set(Context {
         dirs,
         projects,
         cache,
         titles,
         monitor: concat_host::preview::Monitor::new(),
+        prefetch,
         exporter: concat_host::export::Exporter::new(),
         playback: Mutex::new(None),
     });
