@@ -229,7 +229,8 @@ private fun SettingSlider(title: String, hint: String, labels: List<String>, pos
                     drawLine(if (tx <= x) Palette.Accent else Color(0xFF5A5A5A), Offset(tx, y - 5.dp.toPx()), Offset(tx, y + 5.dp.toPx()), 2.dp.toPx())
                 }
                 drawLine(Palette.Accent, Offset(0f, y), Offset(x, y), 2.dp.toPx(), StrokeCap.Round)
-                drawCircle(Color.White, 11.dp.toPx(), Offset(x.coerceIn(11.dp.toPx(), size.width - 11.dp.toPx()), y))
+                val r = 11.dp.toPx()
+                drawCircle(Color.White, r, Offset(x.coerceIn(r, (size.width - r).coerceAtLeast(r)), y))
             }
         }
         Spacer(Modifier.height(6.dp))

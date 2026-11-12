@@ -737,6 +737,7 @@ private fun dropClip(vm: EditorViewModel, rows: List<RowView>, d: Drag, pxPerUs:
         if (index != from) vm.edit { reorderMain(clip.id, index.toUInt()) }
         return
     }
+    if (rows.size <= 1) return
     // rows of the same kind the finger passed over
     val step = (Track.ROW + Track.GAP) * dp
     val target = (d.row + (d.dy / step).roundToInt()).coerceIn(1, rows.size - 1)

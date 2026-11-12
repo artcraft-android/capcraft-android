@@ -138,16 +138,20 @@ fun SpeedCurveEditor(vm: EditorViewModel, clip: ClipView, start: List<Pair<Doubl
                         onDragCancel = { dragging = -1; vm.endGesture() },
                     ) { change, _ ->
                         val i = dragging
-                        if (i < 0) return@detectDragGestures
-                        val w = size.width.toFloat()
-                        val h = size.height.toFloat()
-                        val p = change.position
                         val now = latest
+                        if (i !in now.indices) return@detectDragGestures
+                        val w = size.width.toFloat().coerceAtLeast(1f)
+                        val h = size.height.toFloat().coerceAtLeast(1f)
+                        val p = change.position
                         // the ends stay at the clip's ends; the others stay between their neighbours
                         val at = when (i) {
                             0 -> 0.0
                             now.size - 1 -> 1.0
-                            else -> (p.x / w).toDouble().coerceIn(now[i - 1].first + 0.02, now[i + 1].first - 0.02)
+                            else -> {
+                                val lo = now[i - 1].first + 0.02
+                                val hi = now[i + 1].first - 0.02
+                                if (lo <= hi) (p.x / w).toDouble().coerceIn(lo, hi) else (now[i - 1].first + now[i + 1].first) / 2.0
+                            }
                         }
                         var speed = yToSpeed(1 - (p.y / h).toDouble())
                         if (abs(speed - 1.0) < 0.06) speed = 1.0
