@@ -269,14 +269,36 @@ fn separable(blend: Blend, s: f32, d: f32) -> f32 {
     }
 }
 
+/// Reads one texel of `source` in `0..=255`, scaling sixteen-bit channels
+/// down cleanly when a deep frame reaches the CPU fallback.
+#[inline]
+fn texel_level(source: &Frame, x: usize, y: usize) -> [f32; 4] {
+    let bpp = source.bytes_per_pixel();
+    let stride = source.width() as usize * bpp;
+    let at = y * stride + x * bpp;
+    let pixels = source.pixels();
+    if bpp == 8 {
+        let ch = |c: usize| {
+            u16::from_le_bytes([pixels[at + c * 2], pixels[at + c * 2 + 1]]) as f32
+                * (255.0 / 65535.0)
+        };
+        [ch(0), ch(1), ch(2), ch(3)]
+    } else {
+        [
+            f32::from(pixels[at]),
+            f32::from(pixels[at + 1]),
+            f32::from(pixels[at + 2]),
+            f32::from(pixels[at + 3]),
+        ]
+    }
+}
+
 /// `source` at texel coordinate `sx`, `sy` - its centre at `.0` - sampled
 /// bilinearly with the edge texels clamped, the way the GPU's sampler
 /// reads it. Straight colour and alpha in `0..=255`.
 pub(crate) fn sample_bilinear(source: &Frame, sx: f32, sy: f32) -> [f32; 4] {
     let width = source.width() as usize;
     let height = source.height() as usize;
-    let stride = width * BYTES_PER_PIXEL;
-    let pixels = source.pixels();
     let x0 = (sx.floor().max(0.0) as usize).min(width - 1);
     let y0 = (sy.floor().max(0.0) as usize).min(height - 1);
     let x1 = (x0 + 1).min(width - 1);
@@ -290,9 +312,9 @@ pub(crate) fn sample_bilinear(source: &Frame, sx: f32, sy: f32) -> [f32; 4] {
         (x0, y1, (1.0 - fx) * fy),
         (x1, y1, fx * fy),
     ] {
-        let at = corner_y * stride + corner_x * BYTES_PER_PIXEL;
+        let texel = texel_level(source, corner_x, corner_y);
         for channel in 0..4 {
-            sample[channel] += f32::from(pixels[at + channel]) * weight;
+            sample[channel] += texel[channel] * weight;
         }
     }
     sample
@@ -383,34 +405,20 @@ fn blend_aligned(output: &mut Frame, picture: &Frame, geometry: &Geometry, weigh
     let Some((dst_y, src_y, rows)) = overlap(y, picture.height(), output.height()) else {
         return;
     };
-    let src_stride = picture.width() as usize * BYTES_PER_PIXEL;
     let dst_stride = output.width() as usize * BYTES_PER_PIXEL;
     let span = columns as usize * BYTES_PER_PIXEL;
     let (fitted_w, fitted_h) = (picture.width() as f32, picture.height() as f32);
 
-    let src_pixels = picture.pixels();
     let dst_pixels = output.pixels_mut();
 
     for row in 0..rows as usize {
-        let src_offset = (src_y as usize + row) * src_stride + src_x as usize * BYTES_PER_PIXEL;
         let dst_offset = (dst_y as usize + row) * dst_stride + dst_x as usize * BYTES_PER_PIXEL;
         let v = (src_y as f32 + row as f32 + 0.5) / fitted_h;
-
-        let src_row = &src_pixels[src_offset..src_offset + span];
         let dst_row = &mut dst_pixels[dst_offset..dst_offset + span];
 
-        for (column, (src_pixel, dst_pixel)) in src_row
-            .chunks_exact(BYTES_PER_PIXEL)
-            .zip(dst_row.chunks_exact_mut(BYTES_PER_PIXEL))
-            .enumerate()
-        {
+        for (column, dst_pixel) in dst_row.chunks_exact_mut(BYTES_PER_PIXEL).enumerate() {
             let u = (src_x as f32 + column as f32 + 0.5) / fitted_w;
-            let sample = [
-                f32::from(src_pixel[0]),
-                f32::from(src_pixel[1]),
-                f32::from(src_pixel[2]),
-                f32::from(src_pixel[3]),
-            ];
+            let sample = texel_level(picture, src_x as usize + column, src_y as usize + row);
             weigh.blend_into(dst_pixel, sample, u, v);
         }
     }
@@ -418,6 +426,32 @@ fn blend_aligned(output: &mut Frame, picture: &Frame, geometry: &Geometry, weigh
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sixteen_bit_frames_blend_at_their_true_stride() {
+        use crate::Compositor;
+        use crate::plan::{FramePlan, PlannedLayer, detached_clip};
+        use concat_core::frame::{Frame, Signal};
+        use std::sync::Arc;
+
+        let mut raw = Vec::with_capacity(4 * 4 * 8);
+        for _ in 0..(4 * 4) {
+            raw.extend_from_slice(&51400u16.to_le_bytes()); // ~200
+            raw.extend_from_slice(&25700u16.to_le_bytes()); // ~100
+            raw.extend_from_slice(&12850u16.to_le_bytes()); // ~50
+            raw.extend_from_slice(&65535u16.to_le_bytes()); // 255
+        }
+        let deep = Frame::from_rgba64(4, 4, raw, Signal::SdrWide).expect("deep frame");
+        let plan = FramePlan {
+            layers: vec![PlannedLayer::picture(detached_clip(), Arc::new(deep))],
+            ..FramePlan::empty(4, 4)
+        };
+        let out = super::CpuCompositor.render(&plan);
+        let px = out.pixel(3, 3).expect("bottom-right pixel");
+        assert!(
+            px[0].abs_diff(200) <= 2 && px[1].abs_diff(100) <= 2 && px[2].abs_diff(50) <= 2,
+            "{px:?}"
+        );
+    }
     /// A frame with nothing on it is the canvas, and a picture that does
     /// not cover the frame sits on the canvas, not on black (#456).
     #[test]
@@ -478,7 +512,10 @@ mod tests {
         });
         let pixel = frame.pixel(4, 2).expect("a pixel");
         assert!(pixel[3].abs_diff(128) <= 1, "{pixel:?}");
-        assert!(pixel[0].abs_diff(200) <= 1 && pixel[1].abs_diff(40) <= 1, "{pixel:?}");
+        assert!(
+            pixel[0].abs_diff(200) <= 1 && pixel[1].abs_diff(40) <= 1,
+            "{pixel:?}"
+        );
     }
 
     #[test]
