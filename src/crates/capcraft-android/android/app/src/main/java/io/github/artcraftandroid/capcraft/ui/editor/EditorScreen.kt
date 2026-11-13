@@ -1,6 +1,8 @@
 package io.github.artcraftandroid.capcraft.ui.editor
 
+import android.app.Activity
 import android.app.Application
+import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.SystemClock
@@ -13,6 +15,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.displayCutoutPadding
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -80,11 +83,20 @@ import kotlin.math.roundToInt
 
 @Composable
 fun EditorScreen(path: String, incoming: List<Uri>, then: String? = null, close: () -> Unit) {
-    val app = LocalContext.current.applicationContext as Application
+    val context = LocalContext.current
+    val app = context.applicationContext as Application
     val vm: EditorViewModel = viewModel(key = path, factory = EditorViewModel.Factory(app, path))
     val scope = rememberCoroutineScope()
     var exporting by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { vm.open(incoming, then) }
+    // Allow automatic rotation inside the editor and restore portrait on exit.
+    androidx.compose.runtime.DisposableEffect(context) {
+        val activity = context as? Activity
+        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+        onDispose {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        }
+    }
     // the picker marks what this project holds already
     androidx.compose.runtime.DisposableEffect(path) {
         io.github.artcraftandroid.capcraft.ui.common.MediaPick.project = path
@@ -152,32 +164,71 @@ fun EditorScreen(path: String, incoming: List<Uri>, then: String? = null, close:
     // how far above the screen's foot the preview ends: a notice shows just above it, as the reference's do
     var belowPreview by remember { mutableStateOf(0f) }
     val density = androidx.compose.ui.platform.LocalDensity.current
-    Box(Modifier.fillMaxSize().background(Palette.EditorTop)) {
-        Column(Modifier.fillMaxSize().statusBarsPadding()) {
-            TopBar(vm = vm, onClose = ::leave, onExport = ::export)
+    val activity = context as? Activity
+    fun toggleOrientation() {
+        val act = activity ?: return
+        act.requestedOrientation = if (vm.landscape) {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
+    }
+    BoxWithConstraints(Modifier.fillMaxSize().background(Palette.EditorTop)) {
+        val isLandscape = maxWidth > maxHeight
+        vm.landscape = isLandscape
+        val framePadding = if (isLandscape) Modifier.statusBarsPadding().displayCutoutPadding() else Modifier.statusBarsPadding()
+        Column(Modifier.fillMaxSize().then(framePadding)) {
+            TopBar(vm = vm, compact = isLandscape, onClose = ::leave, onExport = ::export)
             BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
-                // the preview and the timeline share what the bars leave, about 60:40
-                val free = maxHeight - EditorMetrics.PlayBarHeight
-                val timelineHeight = maxOf(EditorMetrics.TimelineHeight, free * 0.4f)
-                vm.timelineHeight = timelineHeight
-                vm.areaHeight = maxHeight
-                Column(Modifier.fillMaxSize()) {
-                    Box(
-                        Modifier.weight(1f).fillMaxWidth().onGloballyPositioned { at ->
-                            val root = at.findRootCoordinates().size.height
-                            belowPreview = root - at.boundsInRoot().bottom
-                        },
-                    ) {
-                        // under the full-screen player it is hidden, and would make every frame a second time
-                        if (!vm.fullscreen) Preview(vm, Modifier.fillMaxSize())
+                if (isLandscape) {
+                    vm.areaHeight = maxHeight
+                    vm.timelineHeight = (maxHeight - EditorMetrics.DockHeight).coerceAtLeast(120.dp)
+                    Row(Modifier.fillMaxSize().navigationBarsPadding()) {
+                        Column(Modifier.weight(0.44f).fillMaxHeight()) {
+                            Box(
+                                Modifier.weight(1f).fillMaxWidth().onGloballyPositioned { at ->
+                                    val root = at.findRootCoordinates().size.height
+                                    belowPreview = root - at.boundsInRoot().bottom
+                                },
+                            ) {
+                                if (!vm.fullscreen) Preview(vm, Modifier.fillMaxSize())
+                            }
+                            PlayBar(vm = vm, onRotate = ::toggleOrientation)
+                        }
+                        Box(Modifier.fillMaxHeight().width(1.dp).background(Color(0x22FFFFFF)))
+                        Column(Modifier.weight(0.56f).fillMaxHeight()) {
+                            Box(Modifier.weight(1f).fillMaxWidth()) {
+                                Timeline(vm, Modifier.fillMaxSize())
+                            }
+                            Box(Modifier.fillMaxWidth().background(Palette.Timeline)) { Dock(vm) }
+                        }
                     }
-                    PlayBar(vm)
-                    Box(Modifier.fillMaxWidth().height(timelineHeight)) {
-                        Timeline(vm, Modifier.fillMaxSize())
+                } else {
+                    // the preview and the timeline share what the bars leave, about 60:40
+                    val free = maxHeight - EditorMetrics.PlayBarHeight
+                    val timelineHeight = maxOf(EditorMetrics.TimelineHeight, free * 0.4f)
+                    vm.timelineHeight = timelineHeight
+                    vm.areaHeight = maxHeight
+                    Column(Modifier.fillMaxSize()) {
+                        Box(
+                            Modifier.weight(1f).fillMaxWidth().onGloballyPositioned { at ->
+                                val root = at.findRootCoordinates().size.height
+                                belowPreview = root - at.boundsInRoot().bottom
+                            },
+                        ) {
+                            // under the full-screen player it is hidden, and would make every frame a second time
+                            if (!vm.fullscreen) Preview(vm, Modifier.fillMaxSize())
+                        }
+                        PlayBar(vm = vm, onRotate = ::toggleOrientation)
+                        Box(Modifier.fillMaxWidth().height(timelineHeight)) {
+                            Timeline(vm, Modifier.fillMaxSize())
+                        }
                     }
                 }
             }
-            Box(Modifier.fillMaxWidth().background(Palette.Timeline).navigationBarsPadding()) { Dock(vm) }
+            if (!isLandscape) {
+                Box(Modifier.fillMaxWidth().background(Palette.Timeline).navigationBarsPadding()) { Dock(vm) }
+            }
         }
         PanelHost(vm)
         if (vm.recording && vm.prompter.isNotBlank()) Teleprompter(vm.prompter)
@@ -202,16 +253,17 @@ object EditorMetrics {
 }
 
 @Composable
-private fun TopBar(vm: EditorViewModel, onClose: () -> Unit, onExport: () -> Unit) {
+private fun TopBar(vm: EditorViewModel, compact: Boolean = false, onClose: () -> Unit, onExport: () -> Unit) {
+    val barHeight = if (compact) 42.dp else EditorMetrics.TopBarHeight
     Row(
-        Modifier.fillMaxWidth().height(EditorMetrics.TopBarHeight).padding(horizontal = 4.dp),
+        Modifier.fillMaxWidth().height(barHeight).padding(horizontal = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(Modifier.padding(start = 6.dp).size(44.dp, 50.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
+        Box(Modifier.padding(start = 6.dp).size(44.dp, barHeight).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
             Glyph(LucideIcons.X, Palette.DockText, size = 26.dp, description = "Close")
         }
         // finding a tool by its name, beside the close button as the reference has it
-        Box(Modifier.size(44.dp, 50.dp).clickable { vm.stop(); vm.toolSearch = true }, contentAlignment = Alignment.Center) {
+        Box(Modifier.size(44.dp, barHeight).clickable { vm.stop(); vm.toolSearch = true }, contentAlignment = Alignment.Center) {
             Glyph(LucideIcons.Search, Palette.DockText, size = 24.dp, description = "Find a tool")
         }
         Spacer(Modifier.weight(1f))
@@ -437,7 +489,7 @@ private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageB
 }
 
 @Composable
-private fun PlayBar(vm: EditorViewModel) {
+private fun PlayBar(vm: EditorViewModel, onRotate: (() -> Unit)? = null) {
     val t = vm.timeline
     Row(
         Modifier.fillMaxWidth().height(EditorMetrics.PlayBarHeight).padding(horizontal = 10.dp),
@@ -446,6 +498,16 @@ private fun PlayBar(vm: EditorViewModel) {
         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(40.dp).clickable { vm.fullscreen = true }, contentAlignment = Alignment.Center) {
                 Glyph(LucideIcons.Expand, Palette.DockText, size = 24.dp, description = "Full screen")
+            }
+            if (onRotate != null) {
+                Box(Modifier.size(36.dp).clickable(onClick = onRotate), contentAlignment = Alignment.Center) {
+                    Glyph(
+                        LucideIcons.RotateCwSquare,
+                        if (vm.landscape) Palette.Accent else Palette.DockText,
+                        size = 22.dp,
+                        description = if (vm.landscape) "Portrait layout" else "Landscape layout",
+                    )
+                }
             }
         }
         Box(Modifier.size(44.dp).clickable { vm.togglePlay() }, contentAlignment = Alignment.Center) {

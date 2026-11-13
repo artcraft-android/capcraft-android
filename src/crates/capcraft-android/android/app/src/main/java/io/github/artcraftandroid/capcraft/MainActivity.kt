@@ -81,6 +81,13 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun App(shared: List<Uri>, consumeShared: () -> Unit) {
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    androidx.compose.runtime.LaunchedEffect(screen is Screen.Home) {
+        val activity = context as? android.app.Activity ?: return@LaunchedEffect
+        if (screen is Screen.Home) {
+            activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        }
+    }
     Box(Modifier.fillMaxSize()) {
         when (val s = screen) {
             Screen.Home -> HomeScreen(

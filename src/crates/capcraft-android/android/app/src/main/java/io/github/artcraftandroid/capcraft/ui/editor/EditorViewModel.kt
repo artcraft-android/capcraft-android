@@ -163,6 +163,8 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
     var timelineHeight by mutableStateOf(EditorMetrics.TimelineHeight)
     /** The height the preview, the play bar and the timeline share, under the top bar. */
     var areaHeight by mutableStateOf(androidx.compose.ui.unit.Dp(0f))
+    /** Whether the editor is currently arranged in two-pane landscape layout. */
+    var landscape by mutableStateOf(false)
     /** While set, a tap on the preview picks a colour (RGB) for it instead of selecting. */
     var pickColor: ((Int) -> Unit)? by mutableStateOf(null)
     /** The last frame the preview showed, for picking colours from. */

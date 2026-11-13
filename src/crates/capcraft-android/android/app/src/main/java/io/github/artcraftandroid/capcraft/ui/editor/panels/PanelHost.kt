@@ -17,11 +17,14 @@ import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.displayCutoutPadding
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -75,67 +78,75 @@ import kotlin.math.roundToInt
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** The open tool panel, sliding up over the timeline and the bottom bar. */
+/** The open tool panel, sliding up over the timeline and the bottom bar (or right pane in landscape). */
 @Composable
 fun PanelHost(vm: EditorViewModel) {
     val panel = vm.panel
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
-        AnimatedVisibility(
-            visible = panel != null,
-            enter = slideInVertically(tween(200)) { it },
-            exit = slideOutVertically(tween(160)) { it },
-        ) {
-            val p = remember(panel) { panel } ?: return@AnimatedVisibility
-            when (p) {
-                is Panel.Speed -> SpeedPanel(vm, p.curve)
-                Panel.Volume -> VolumePanel(vm)
-                Panel.Opacity -> OpacityPanel(vm)
-                Panel.Fade -> FadePanel(vm)
-                Panel.Ratio -> RatioPanel(vm)
-                is Panel.Transition -> TransitionPanel(vm, p.clipId)
-                is Panel.Packages -> PackagesPanel(vm, p.kind, p.target)
-                Panel.Adjust -> AdjustPanel(vm)
-                Panel.Quality -> LookPanel(vm, startTab = 2, target = Panel.Target.Clip)
-                // the text sheet's sliders have solid thumbs, as the reference's do
-                is Panel.Text -> androidx.compose.runtime.CompositionLocalProvider(LocalSolidThumbs provides true) { TextPanel(vm, p.clipId, p.tab) }
-                Panel.Stickers -> StickersPanel(vm)
-                Panel.Animation -> AnimationPanel(vm)
-                Panel.Crop -> CropPanel(vm)
-                is Panel.Background -> BackgroundPanel(vm, p.tab)
-                Panel.Voiceover -> VoiceoverPanel(vm)
-                Panel.SoundFx -> SoundFxPanel(vm)
-                Panel.Transcript -> TranscriptPanel(vm)
-                Panel.Draw -> DrawPanel(vm)
-                Panel.Tracking -> TrackingPanel(vm)
-                Panel.Enhance -> EnhancePanel(vm)
-                Panel.Captions -> AutoCaptionsSheet(vm)
-                Panel.Lyrics -> AutoCaptionsSheet(vm, lyrics = true)
-                is Panel.Speech -> SpeechPanel(vm, captions = false, clipId = p.clipId)
-                Panel.RemoveBg -> RemoveBgPanel(vm)
-                Panel.Chroma -> ChromaPanel(vm)
-                Panel.Blend -> BlendPanel(vm)
-                Panel.Mask -> MaskPanel(vm)
-                Panel.Basic -> BasicPanel(vm)
-                Panel.CustomCutout -> CustomCutoutPanel(vm)
-                Panel.ShapeStyle -> ShapeStylePanel(vm)
-                Panel.CaptionTemplates -> CaptionTemplatesPanel(vm)
-                Panel.Collage -> CollagePanel(vm)
-                Panel.Relight -> RelightPanel(vm)
-                Panel.Sounds -> SoundsPage(vm)
-                Panel.CameraTracking -> CameraTrackingPanel(vm)
-                Panel.MotionBlur -> MotionBlurPanel(vm)
-                Panel.BodyEffects -> BodyEffectsPanel(vm)
-                Panel.IsolateVoice -> IsolateVoicePanel(vm)
-                Panel.AutoReframe -> AutoReframePanel(vm)
-                Panel.Retouch -> RetouchPanel(vm)
-                Panel.Graphs -> GraphsPanel(vm)
-                Panel.Layer -> LayerPanel(vm)
-                Panel.EffectObject -> EffectObjectPanel(vm)
-                Panel.LayerAdjust -> LayerAdjustPanel(vm)
-                Panel.EnterCaptions -> EnterCaptionsPage(vm)
-                Panel.BatchEdit -> BatchEditPanel(vm)
-                Panel.Beats -> BeatsPanel(vm)
-                Panel.Stabilize -> StabilizePanel(vm)
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val landscape = maxWidth > maxHeight
+        val hostModifier = if (landscape) {
+            Modifier.align(Alignment.BottomEnd).fillMaxHeight().displayCutoutPadding().fillMaxWidth(0.56f)
+        } else {
+            Modifier.fillMaxSize()
+        }
+        Box(hostModifier, contentAlignment = Alignment.BottomCenter) {
+            AnimatedVisibility(
+                visible = panel != null,
+                enter = slideInVertically(tween(200)) { it },
+                exit = slideOutVertically(tween(160)) { it },
+            ) {
+                val p = remember(panel) { panel } ?: return@AnimatedVisibility
+                when (p) {
+                    is Panel.Speed -> SpeedPanel(vm, p.curve)
+                    Panel.Volume -> VolumePanel(vm)
+                    Panel.Opacity -> OpacityPanel(vm)
+                    Panel.Fade -> FadePanel(vm)
+                    Panel.Ratio -> RatioPanel(vm)
+                    is Panel.Transition -> TransitionPanel(vm, p.clipId)
+                    is Panel.Packages -> PackagesPanel(vm, p.kind, p.target)
+                    Panel.Adjust -> AdjustPanel(vm)
+                    Panel.Quality -> LookPanel(vm, startTab = 2, target = Panel.Target.Clip)
+                    // the text sheet's sliders have solid thumbs, as the reference's do
+                    is Panel.Text -> androidx.compose.runtime.CompositionLocalProvider(LocalSolidThumbs provides true) { TextPanel(vm, p.clipId, p.tab) }
+                    Panel.Stickers -> StickersPanel(vm)
+                    Panel.Animation -> AnimationPanel(vm)
+                    Panel.Crop -> CropPanel(vm)
+                    is Panel.Background -> BackgroundPanel(vm, p.tab)
+                    Panel.Voiceover -> VoiceoverPanel(vm)
+                    Panel.SoundFx -> SoundFxPanel(vm)
+                    Panel.Transcript -> TranscriptPanel(vm)
+                    Panel.Draw -> DrawPanel(vm)
+                    Panel.Tracking -> TrackingPanel(vm)
+                    Panel.Enhance -> EnhancePanel(vm)
+                    Panel.Captions -> AutoCaptionsSheet(vm)
+                    Panel.Lyrics -> AutoCaptionsSheet(vm, lyrics = true)
+                    is Panel.Speech -> SpeechPanel(vm, captions = false, clipId = p.clipId)
+                    Panel.RemoveBg -> RemoveBgPanel(vm)
+                    Panel.Chroma -> ChromaPanel(vm)
+                    Panel.Blend -> BlendPanel(vm)
+                    Panel.Mask -> MaskPanel(vm)
+                    Panel.Basic -> BasicPanel(vm)
+                    Panel.CustomCutout -> CustomCutoutPanel(vm)
+                    Panel.ShapeStyle -> ShapeStylePanel(vm)
+                    Panel.CaptionTemplates -> CaptionTemplatesPanel(vm)
+                    Panel.Collage -> CollagePanel(vm)
+                    Panel.Relight -> RelightPanel(vm)
+                    Panel.Sounds -> SoundsPage(vm)
+                    Panel.CameraTracking -> CameraTrackingPanel(vm)
+                    Panel.MotionBlur -> MotionBlurPanel(vm)
+                    Panel.BodyEffects -> BodyEffectsPanel(vm)
+                    Panel.IsolateVoice -> IsolateVoicePanel(vm)
+                    Panel.AutoReframe -> AutoReframePanel(vm)
+                    Panel.Retouch -> RetouchPanel(vm)
+                    Panel.Graphs -> GraphsPanel(vm)
+                    Panel.Layer -> LayerPanel(vm)
+                    Panel.EffectObject -> EffectObjectPanel(vm)
+                    Panel.LayerAdjust -> LayerAdjustPanel(vm)
+                    Panel.EnterCaptions -> EnterCaptionsPage(vm)
+                    Panel.BatchEdit -> BatchEditPanel(vm)
+                    Panel.Beats -> BeatsPanel(vm)
+                    Panel.Stabilize -> StabilizePanel(vm)
+                }
             }
         }
     }
@@ -162,11 +173,16 @@ fun PanelFrame(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val tallHeight = vm.timelineHeight + EditorMetrics.DockHeight
-    val target = when {
+    val rawTarget = when {
         // the top of the preview stays in sight over the sheet
         towering -> maxOf(tallHeight, vm.areaHeight + EditorMetrics.DockHeight - 235.dp)
         tall -> tallHeight
         else -> height
+    }
+    val target = if (vm.landscape && vm.areaHeight > 0.dp) {
+        minOf(rawTarget, vm.areaHeight.coerceAtLeast(170.dp))
+    } else {
+        rawTarget
     }
     val full = androidx.compose.animation.core.animateDpAsState(target, label = "sheet").value
     val bar: @Composable () -> Unit = {
