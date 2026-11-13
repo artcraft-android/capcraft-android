@@ -63,8 +63,12 @@ impl Peaks {
             return None;
         }
         let buckets_per_second = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if !buckets_per_second.is_finite() || buckets_per_second <= 0.0 {
+            return None;
+        }
         let count = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
-        if bytes.len() != 8 + count * 8 {
+        let payload = count.checked_mul(8)?;
+        if bytes.len() != 8usize.checked_add(payload)? {
             return None;
         }
         let floats = |offset: usize| -> Vec<f32> {
@@ -120,7 +124,7 @@ impl Peaks {
     /// it. Past the end, or an empty span, is silence.
     pub fn extremes(&self, from: f32, to: f32) -> (f32, f32) {
         let count = self.len();
-        if count == 0 || to <= from || self.buckets_per_second <= 0.0 {
+        if count == 0 || !(to > from) || !(self.buckets_per_second > 0.0) {
             return (0.0, 0.0);
         }
         // The buckets that begin inside the span, so a bucket straddling

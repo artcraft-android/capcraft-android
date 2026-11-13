@@ -95,8 +95,26 @@ impl Rational {
     }
 
     fn reduce(num: i128, den: i128) -> Self {
-        assert!(den != 0, "Rational denominator must not be zero");
-        Self::checked_reduce(num, den).expect("rational overflowed i64")
+        if den == 0 {
+            debug_assert!(den != 0, "Rational denominator must not be zero");
+            return Self::ZERO;
+        }
+        if let Some(exact) = Self::checked_reduce(num, den) {
+            return exact;
+        }
+        // Keep exact arithmetic whenever terms fit in i64; if compound speed
+        // and container time-base denominators grow past i64::MAX, shift both
+        // terms down together rather than crashing the editor process.
+        let (mut n, mut d) = if den < 0 { (-num, -den) } else { (num, den) };
+        let limit = i128::from(i64::MAX);
+        while n.abs() > limit || d > limit {
+            n >>= 1;
+            d = (d >> 1).max(1);
+        }
+        Self::checked_reduce(n, d).unwrap_or(Self {
+            num: n.clamp(i128::from(i64::MIN) + 1, limit) as i64,
+            den: d.clamp(1, limit) as i64,
+        })
     }
 
     /// Builds `num / den` in lowest terms, or `None` when the value cannot be
@@ -145,7 +163,10 @@ impl Rational {
     /// # Panics
     /// If this is zero.
     pub fn recip(self) -> Self {
-        assert!(!self.is_zero(), "cannot take the reciprocal of zero");
+        if self.is_zero() {
+            debug_assert!(!self.is_zero(), "cannot take the reciprocal of zero");
+            return Self::ZERO;
+        }
         Self::reduce(i128::from(self.den), i128::from(self.num))
     }
 
@@ -156,7 +177,7 @@ impl Rational {
 
     /// The smallest integer greater than or equal to this value.
     pub const fn ceil(self) -> i64 {
-        -((-self.num).div_euclid(self.den))
+        -self.num.saturating_neg().div_euclid(self.den)
     }
 
     /// Clamps to the inclusive range `[low, high]`.
@@ -240,7 +261,10 @@ impl Mul for Rational {
 impl Div for Rational {
     type Output = Self;
     fn div(self, rhs: Self) -> Self {
-        assert!(!rhs.is_zero(), "cannot divide a Rational by zero");
+        if rhs.is_zero() {
+            debug_assert!(!rhs.is_zero(), "cannot divide a Rational by zero");
+            return Self::ZERO;
+        }
         Self::reduce(
             i128::from(self.num) * i128::from(rhs.den),
             i128::from(self.den) * i128::from(rhs.num),
@@ -252,7 +276,7 @@ impl Neg for Rational {
     type Output = Self;
     fn neg(self) -> Self {
         Self {
-            num: -self.num,
+            num: self.num.saturating_neg(),
             den: self.den,
         }
     }
@@ -329,10 +353,13 @@ impl FrameRate {
     /// # Panics
     /// If `fps` is zero or negative.
     pub fn new(fps: Rational) -> Self {
-        assert!(
-            !fps.is_zero() && !fps.is_negative(),
-            "frame rate must be positive"
-        );
+        if fps.is_zero() || fps.is_negative() {
+            debug_assert!(
+                !fps.is_zero() && !fps.is_negative(),
+                "frame rate must be positive"
+            );
+            return Self::THIRTY;
+        }
         Self(fps)
     }
 
@@ -440,11 +467,18 @@ impl TimeRange {
     /// # Panics
     /// If `duration` is negative.
     pub fn new(start: Rational, duration: Rational) -> Self {
-        assert!(
+        debug_assert!(
             !duration.is_negative(),
             "TimeRange duration must not be negative"
         );
-        Self { start, duration }
+        Self {
+            start,
+            duration: if duration.is_negative() {
+                Rational::ZERO
+            } else {
+                duration
+            },
+        }
     }
 
     /// The first instant after the span.

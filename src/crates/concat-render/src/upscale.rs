@@ -257,13 +257,22 @@ impl Upscaler {
     /// `side` pixels across, on the first GPU that opens - `None` where
     /// there is none, and the caller runs the model the slow way.
     pub fn new(layers: &[ConvLayer], scale: u32, side: u32) -> Option<Upscaler> {
-        let instance = wgpu::Instance::default();
+        let backends = if cfg!(target_os = "android") {
+            wgpu::Backends::VULKAN
+        } else {
+            wgpu::Backends::all()
+        };
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             ..Default::default()
         }))
         .ok()?;
-        if adapter.get_info().device_type == wgpu::DeviceType::Cpu {
+        let info = adapter.get_info();
+        if info.device_type == wgpu::DeviceType::Cpu {
             return None;
         }
         let half = adapter.features().contains(wgpu::Features::SHADER_F16);
@@ -280,6 +289,10 @@ impl Upscaler {
             ..Default::default()
         }))
         .ok()?;
+        let name = info.name;
+        device.on_uncaptured_error(std::sync::Arc::new(move |error: wgpu::Error| {
+            log::error!("upscaler GPU device on {name} reported an error: {error}");
+        }));
         Self::on(device, queue, layers, scale, side, half)
     }
 

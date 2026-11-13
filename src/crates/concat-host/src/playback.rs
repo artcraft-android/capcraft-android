@@ -72,16 +72,22 @@ const PCM_RATE: u32 = 48_000;
 /// Decoded spans kept mapped beyond the current clip set. Enough that
 /// undo/redo across a few edits never re-decodes; small enough that a long
 /// session cannot accumulate hundreds of mappings.
-const MEMORY_CACHE_CAP: usize = 64;
+const MEMORY_CACHE_CAP: usize = if cfg!(target_os = "android") { 16 } else { 64 };
 
 /// Byte budget for `cache/audio` on disk. Stereo 16-bit 48k is ~11 MB a
 /// minute, so this keeps hours of decoded material before anything is
 /// evicted.
-const DISK_CACHE_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
+const DISK_CACHE_BUDGET: u64 = if cfg!(target_os = "android") {
+    512 * 1024 * 1024
+} else {
+    2 * 1024 * 1024 * 1024
+};
 
 /// Concurrent FFmpeg decode processes. Two keeps a dual-span edit prompt
-/// without letting a scrubbed trim fan out a dozen full-file decodes.
-const DECODE_WORKERS: usize = 2;
+/// without letting a scrubbed trim fan out a dozen full-file decodes; on
+/// Android one keeps background audio filtergraphs from competing with video
+/// decode and UI threads during rapid split/trim/speed edits.
+const DECODE_WORKERS: usize = if cfg!(target_os = "android") { 1 } else { 2 };
 
 /// One key of a clip's gain ride, as a spec carries it.
 ///
@@ -777,6 +783,7 @@ impl Playback {
             let last_active = Arc::clone(&last_active);
             std::thread::Builder::new()
                 .name("audio-output".into())
+                .stack_size(8 * 1024 * 1024)
                 .spawn(move || supervise_stream(rx, shared, events, last_active))
                 .map_err(|error| format!("could not spawn the audio thread: {error}"))?;
         }
@@ -789,11 +796,14 @@ impl Playback {
             let events = Arc::clone(&events);
             std::thread::Builder::new()
                 .name("transport-events".into())
+                .stack_size(2 * 1024 * 1024)
                 .spawn(move || {
                     loop {
                         std::thread::sleep(std::time::Duration::from_millis(33));
                         if shared.playing.load(Ordering::Relaxed) {
-                            events.position(shared.position());
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                events.position(shared.position());
+                            }));
                         }
                     }
                 })
@@ -822,6 +832,7 @@ impl Playback {
             let this = Arc::clone(&playback);
             std::thread::Builder::new()
                 .name(format!("audio-decode-{index}"))
+                .stack_size(8 * 1024 * 1024)
                 .spawn(move || decode_worker(&this))
                 .map_err(|error| format!("could not spawn a decode worker: {error}"))?;
         }
@@ -1048,17 +1059,20 @@ fn decode_worker(playback: &Arc<Playback>) {
                 // Newest first: pop from the back where set_clips pushes.
                 match jobs.pop_back() {
                     Some(job) => break job,
-                    None => jobs = playback.queue.available.wait(jobs).unwrap(),
+                    None => {
+                        jobs = playback
+                            .queue
+                            .available
+                            .wait(jobs)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
                 }
             }
         };
 
         // A span queued by an edit that has since been edited again is dead
         // weight; skip it before paying for FFmpeg.
-        let wanted = playback
-            .specs
-            .lock()
-            .unwrap()
+        let wanted = locked(&playback.specs)
             .iter()
             .any(|spec| decode_key(spec) == job.key);
         if !wanted {
@@ -1067,8 +1081,11 @@ fn decode_worker(playback: &Arc<Playback>) {
         }
 
         let within = copy_source(&locked(&playback.cache), &job.spec);
-        match decode(&job.spec, &job.project, &job.key, within) {
-            Ok(pcm) => {
+        let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode(&job.spec, &job.project, &job.key, within)
+        }));
+        match decoded {
+            Ok(Ok(pcm)) => {
                 let now = playback.tick.fetch_add(1, Ordering::Relaxed) + 1;
                 locked(&playback.cache).insert(
                     job.key.clone(),
@@ -1079,9 +1096,13 @@ fn decode_worker(playback: &Arc<Playback>) {
                     },
                 );
             }
-            Err(error) => report(
+            Ok(Err(error)) => report(
                 playback.events.as_ref(),
                 format!("audio decode failed for {}: {error}", job.spec.path),
+            ),
+            Err(_) => report(
+                playback.events.as_ref(),
+                format!("audio decode panicked for {}", job.spec.path),
             ),
         }
         locked(&playback.decoding).remove(&job.key);
@@ -1434,14 +1455,16 @@ fn supervise_stream(
     let mut reported_missing = false;
 
     loop {
-        let host = cpal::default_host();
-        let built = host
-            .default_output_device()
-            .ok_or_else(|| "no audio output device".to_owned())
-            .and_then(|device| {
-                let name = device.name().unwrap_or_default();
-                build_stream(&device, &rx, &shared, &events, &last_active).map(|s| (s, name))
-            });
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let host = cpal::default_host();
+            host.default_output_device()
+                .ok_or_else(|| "no audio output device".to_owned())
+                .and_then(|device| {
+                    let name = device.name().unwrap_or_default();
+                    build_stream(&device, &rx, &shared, &events, &last_active).map(|s| (s, name))
+                })
+        }))
+        .unwrap_or_else(|_| Err("audio backend panicked while opening output stream".to_owned()));
 
         match built {
             Ok((stream, device_name)) => {
@@ -1463,16 +1486,25 @@ fn supervise_stream(
                         );
                         break;
                     }
-                    let current = cpal::default_host()
-                        .default_output_device()
-                        .and_then(|d| d.name().ok());
-                    if let Some(current) = current
-                        && current != device_name
-                    {
-                        // Informational only - switching outputs is a
-                        // normal act, not an error toast.
-                        log::info!("audio device changed to {current}; rebuilding");
-                        break;
+                    // On Android, cpal's AAudio host only ever exposes a single
+                    // unnamed "default" device and signals route disconnects via
+                    // `error_callback` -> `failed`; skip re-probing every second.
+                    if !cfg!(target_os = "android") {
+                        let current = std::panic::catch_unwind(|| {
+                            cpal::default_host()
+                                .default_output_device()
+                                .and_then(|d| d.name().ok())
+                        })
+                        .ok()
+                        .flatten();
+                        if let Some(current) = current
+                            && current != device_name
+                        {
+                            // Informational only - switching outputs is a
+                            // normal act, not an error toast.
+                            log::info!("audio device changed to {current}; rebuilding");
+                            break;
+                        }
                     }
                 }
                 // `_stream` drops here, releasing the device before rebuild.
@@ -1529,6 +1561,28 @@ fn build_stream(
 ) -> Result<BuiltStream, String> {
     use cpal::traits::DeviceTrait;
 
+    if cfg!(target_os = "android") {
+        // cpal 0.16's AAudio `default_output_config()` calls JNI
+        // `AudioTrack.getMinBufferSize` 52 times with `.unwrap()` and picks
+        // `with_max_sample_rate()` (often 192 kHz, which AAudio rejects with
+        // `InvalidRate` or forces needlessly heavy resampling). Open native
+        // AAudio directly at our 48 kHz mix rate first, with 44.1 kHz / i16
+        // fallbacks before touching `default_output_config()`.
+        for rate in [PCM_RATE, 44_100] {
+            let direct = cpal::StreamConfig {
+                channels: 2,
+                sample_rate: cpal::SampleRate(rate),
+                buffer_size: cpal::BufferSize::Default,
+            };
+            if let Ok(built) = stream_for::<f32>(device, &direct, rx, shared, events, last_active) {
+                return Ok(built);
+            }
+            if let Ok(built) = stream_for::<i16>(device, &direct, rx, shared, events, last_active) {
+                return Ok(built);
+            }
+        }
+    }
+
     let config = device
         .default_output_config()
         .map_err(|error| format!("no default output config: {error}"))?;
@@ -1563,6 +1617,12 @@ where
     use cpal::traits::{DeviceTrait, StreamTrait};
 
     let channels = config.channels as usize;
+    if channels == 0 || config.sample_rate.0 == 0 {
+        return Err(format!(
+            "invalid audio stream config: {}ch @ {}Hz",
+            config.channels, config.sample_rate.0
+        ));
+    }
     let step = 1.0 / f64::from(config.sample_rate.0);
 
     // Seed from the world as it is, not from zero: a stream rebuilt mid-
@@ -1579,111 +1639,122 @@ where
         .build_output_stream(
             config,
             move |data: &mut [T], _| {
-                let mut sought = false;
-                // try_lock, not lock: the audio callback must never block.
-                // Contention only exists while the supervisor swaps streams,
-                // and then this callback is on its way out anyway.
-                if let Ok(receiver) = rx.try_lock() {
-                    while let Ok(message) = receiver.try_recv() {
-                        match message {
-                            Msg::SetClips(next) => clips = next,
-                            Msg::Play(at) => {
-                                position = at;
-                                playing = true;
-                            }
-                            Msg::Pause => playing = false,
-                            Msg::Seek(at) => {
-                                position = at;
-                                sought = true;
-                            }
-                        }
-                    }
-                }
-
-                if !playing {
-                    // A paused seek must reach the shared clock - the playing
-                    // store below never runs. Only on an actual seek, so this
-                    // silent branch cannot overwrite a fresher play() store
-                    // with its own stale idea of the position.
-                    if sought {
-                        shared.stamp(position);
-                    }
+                if channels == 0 {
                     data.fill(T::from_sample(0.0));
                     return;
                 }
-
-                let silent = shared.muted.load(Ordering::Relaxed);
-                let (mut loudest_left, mut loudest_right) = (0.0f32, 0.0f32);
-                for frame in data.chunks_mut(channels) {
-                    let mut left = 0.0f32;
-                    let mut right = 0.0f32;
-
-                    for clip in &clips {
-                        let local = position - clip.start;
-                        if local < 0.0 || local >= clip.duration {
-                            continue;
+                let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut sought = false;
+                    // try_lock, not lock: the audio callback must never block.
+                    // Contention only exists while the supervisor swaps streams,
+                    // and then this callback is on its way out anyway.
+                    if let Ok(receiver) = rx.try_lock() {
+                        while let Ok(message) = receiver.try_recv() {
+                            match message {
+                                Msg::SetClips(next) => clips = next,
+                                Msg::Play(at) => {
+                                    position = at;
+                                    playing = true;
+                                }
+                                Msg::Pause => playing = false,
+                                Msg::Seek(at) => {
+                                    position = at;
+                                    sought = true;
+                                }
+                            }
                         }
-                        let gain = gain_at(clip, local);
-                        if gain <= 0.0 {
-                            continue;
+                    }
+
+                    if !playing {
+                        // A paused seek must reach the shared clock - the playing
+                        // store below never runs. Only on an actual seek, so this
+                        // silent branch cannot overwrite a fresher play() store
+                        // with its own stale idea of the position.
+                        if sought {
+                            shared.stamp(position);
+                        }
+                        data.fill(T::from_sample(0.0));
+                        return;
+                    }
+
+                    let silent = shared.muted.load(Ordering::Relaxed);
+                    let (mut loudest_left, mut loudest_right) = (0.0f32, 0.0f32);
+                    for frame in data.chunks_mut(channels) {
+                        let mut left = 0.0f32;
+                        let mut right = 0.0f32;
+
+                        for clip in &clips {
+                            let local = position - clip.start;
+                            if local < 0.0 || local >= clip.duration {
+                                continue;
+                            }
+                            let gain = gain_at(clip, local);
+                            if gain <= 0.0 {
+                                continue;
+                            }
+
+                            // Linear interpolation across the 48k source grid -
+                            // exact when the device runs at 48k, inaudibly close
+                            // when it does not.
+                            let read = local * f64::from(PCM_RATE);
+                            let index = read.floor() as i64 + clip.lead;
+                            let fraction = (read - read.floor()) as f32;
+                            let pcm = &clip.pcm;
+                            left += gain
+                                * (pcm.sample(index, 0) * (1.0 - fraction)
+                                    + pcm.sample(index + 1, 0) * fraction);
+                            right += gain
+                                * (pcm.sample(index, 1) * (1.0 - fraction)
+                                    + pcm.sample(index + 1, 1) * fraction);
                         }
 
-                        // Linear interpolation across the 48k source grid -
-                        // exact when the device runs at 48k, inaudibly close
-                        // when it does not.
-                        let read = local * f64::from(PCM_RATE);
-                        let index = read.floor() as i64 + clip.lead;
-                        let fraction = (read - read.floor()) as f32;
-                        let pcm = &clip.pcm;
-                        left += gain
-                            * (pcm.sample(index, 0) * (1.0 - fraction)
-                                + pcm.sample(index + 1, 0) * fraction);
-                        right += gain
-                            * (pcm.sample(index, 1) * (1.0 - fraction)
-                                + pcm.sample(index + 1, 1) * fraction);
+                        if silent {
+                            left = 0.0;
+                            right = 0.0;
+                        }
+                        loudest_left = loudest_left.max(left.abs());
+                        loudest_right = loudest_right.max(right.abs());
+                        // Hard limit. A mix of boosted clips can exceed full
+                        // scale; wrapping would be far worse than flattening.
+                        frame[0] = T::from_sample(left.clamp(-1.0, 1.0));
+                        if channels > 1 {
+                            frame[1] = T::from_sample(right.clamp(-1.0, 1.0));
+                        }
+                        for extra in frame.iter_mut().skip(2) {
+                            *extra = T::from_sample(0.0);
+                        }
+
+                        position += step;
                     }
 
-                    if silent {
-                        left = 0.0;
-                        right = 0.0;
-                    }
-                    loudest_left = loudest_left.max(left.abs());
-                    loudest_right = loudest_right.max(right.abs());
-                    // Hard limit. A mix of boosted clips can exceed full
-                    // scale; wrapping would be far worse than flattening.
-                    frame[0] = T::from_sample(left.clamp(-1.0, 1.0));
-                    if channels > 1 {
-                        frame[1] = T::from_sample(right.clamp(-1.0, 1.0));
-                    }
-                    for extra in frame.iter_mut().skip(2) {
-                        *extra = T::from_sample(0.0);
+                    // One writer, so a load and a store keep the larger without
+                    // a compare loop; the meters' swap may land between them and
+                    // lose one buffer's peak, which no eye can see.
+                    for (cell, loudest) in [
+                        (&shared.peak_left, loudest_left),
+                        (&shared.peak_right, loudest_right),
+                    ] {
+                        if loudest > f32::from_bits(cell.load(Ordering::Relaxed)) {
+                            cell.store(loudest.to_bits(), Ordering::Relaxed);
+                        }
                     }
 
-                    position += step;
+                    shared.stamp(position);
+                }));
+                if ok.is_err() {
+                    data.fill(T::from_sample(0.0));
                 }
-
-                // One writer, so a load and a store keep the larger without
-                // a compare loop; the meters' swap may land between them and
-                // lose one buffer's peak, which no eye can see.
-                for (cell, loudest) in [
-                    (&shared.peak_left, loudest_left),
-                    (&shared.peak_right, loudest_right),
-                ] {
-                    if loudest > f32::from_bits(cell.load(Ordering::Relaxed)) {
-                        cell.store(loudest.to_bits(), Ordering::Relaxed);
-                    }
-                }
-
-                shared.stamp(position);
             },
             {
                 let events = Arc::clone(events);
                 let failed = Arc::clone(&failed);
                 move |error| {
-                    // The supervisor rebuilds on this flag; the report says
-                    // why the sound hiccuped.
-                    report(events.as_ref(), format!("audio stream error: {error}"));
                     failed.store(true, Ordering::Relaxed);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        // The supervisor rebuilds on this flag; the report says
+                        // why the sound hiccuped.
+                        report(events.as_ref(), format!("audio stream error: {error}"));
+                    }));
                 }
             },
             None,

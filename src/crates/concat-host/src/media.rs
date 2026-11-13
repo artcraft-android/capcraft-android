@@ -429,11 +429,23 @@ pub fn filmstrip_between(
         .filter(|seconds| *seconds > 0.0)
         .ok_or_else(|| format!("{path} reports no duration"))?;
     let fps = video.frame_rate.fps().as_f64().max(1.0);
-    // Aspect-correct and even, which is what the scaler is happiest with.
-    let width = ((f64::from(height) * f64::from(video.width) / f64::from(video.height)).round()
+    let count = count.clamp(1, 64);
+    let mut height = (height.max(2) & !1).max(2);
+    // Aspect-correct and even, which is what the scaler is happiest with, and
+    // bounded to 8192 px total strip width so mobile GPUs (Adreno's 16,384 px
+    // texture limit) never reject or crash uploading a wide filmstrip bitmap.
+    let mut width = ((f64::from(height) * f64::from(video.width) / f64::from(video.height)).round()
         as u32)
         .max(2)
         & !1;
+    const MAX_STRIP_WIDTH: u32 = 8192;
+    if width.saturating_mul(count) > MAX_STRIP_WIDTH {
+        let max_tile_w = (MAX_STRIP_WIDTH / count).max(2) & !1;
+        height = ((f64::from(height) * f64::from(max_tile_w) / f64::from(width)).round() as u32)
+            .max(2)
+            & !1;
+        width = max_tile_w;
+    }
 
     // The window, inside the file and at least a frame per tile long.
     let least = (f64::from(count) / fps).min(duration);

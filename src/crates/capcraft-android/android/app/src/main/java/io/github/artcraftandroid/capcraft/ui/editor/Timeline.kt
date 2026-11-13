@@ -410,7 +410,7 @@ fun Timeline(vm: EditorViewModel, modifier: Modifier) {
                                 var outcome = false
                                 while (true) {
                                     val e = awaitPointerEvent()
-                                    val c = e.changes.first()
+                                    val c = e.changes.firstOrNull() ?: break
                                     if (!c.pressed) { lifted = true; break }
                                     if (e.changes.count { it.pressed } > 1) break
                                     moved += c.positionChange()
@@ -737,6 +737,7 @@ private fun dropClip(vm: EditorViewModel, rows: List<RowView>, d: Drag, pxPerUs:
         if (index != from) vm.edit { reorderMain(clip.id, index.toUInt()) }
         return
     }
+    if (rows.size <= 1) return
     // rows of the same kind the finger passed over
     val step = (Track.ROW + Track.GAP) * dp
     val target = (d.row + (d.dy / step).roundToInt()).coerceIn(1, rows.size - 1)
@@ -846,8 +847,8 @@ private fun DrawScope.drawLeadingTiles(
     }
     val cover = layout.coverTile
     if (cover.right > 0) {
-        val first = main.clips.first()
-        val pic = coverPicture(first, cover.height.roundToInt())
+        val first = main.clips.firstOrNull()
+        val pic = first?.let { coverPicture(it, cover.height.roundToInt()) }
         drawRoundRect(Color(0xFF2A2A2A), cover.topLeft, cover.size, CornerRadius(10 * dp))
         clipRectRounded(cover, 10 * dp) {
             if (pic != null) drawCropped(pic, cover)
@@ -879,6 +880,7 @@ private fun DrawScope.clipRectRounded(r: Rect, radius: Float, block: DrawScope.(
 /** Draws [b] filling [r], cropped to keep its shape. */
 /** [b] whole inside [r], its shape kept, centred. */
 private fun DrawScope.drawFitted(b: Bitmap, r: Rect) {
+    if (b.width <= 0 || b.height <= 0 || r.width <= 0f || r.height <= 0f) return
     val scale = min(r.width / b.width, r.height / b.height)
     val w = b.width * scale
     val h = b.height * scale
@@ -890,16 +892,19 @@ private fun DrawScope.drawFitted(b: Bitmap, r: Rect) {
 }
 
 private fun DrawScope.drawCropped(b: Bitmap, r: Rect) {
+    if (b.width <= 0 || b.height <= 0 || r.width <= 0f || r.height <= 0f) return
     val img = b.asImageBitmap()
     val scale = max(r.width / b.width, r.height / b.height)
     val sw = r.width / scale
     val sh = r.height / scale
-    val sx = ((b.width - sw) / 2).coerceAtLeast(0f)
-    val sy = ((b.height - sh) / 2).coerceAtLeast(0f)
+    val ox = ((b.width - sw) / 2).roundToInt().coerceIn(0, b.width - 1)
+    val oy = ((b.height - sh) / 2).roundToInt().coerceIn(0, b.height - 1)
+    val ow = sw.roundToInt().coerceIn(1, b.width - ox)
+    val oh = sh.roundToInt().coerceIn(1, b.height - oy)
     drawImage(
         img,
-        srcOffset = IntOffset(sx.roundToInt(), sy.roundToInt()),
-        srcSize = IntSize(sw.roundToInt().coerceIn(1, b.width), sh.roundToInt().coerceIn(1, b.height)),
+        srcOffset = IntOffset(ox, oy),
+        srcSize = IntSize(ow, oh),
         dstOffset = IntOffset(r.left.roundToInt(), r.top.roundToInt()),
         dstSize = IntSize(r.width.roundToInt().coerceAtLeast(1), r.height.roundToInt().coerceAtLeast(1)),
     )
@@ -1065,7 +1070,7 @@ private fun DrawScope.drawLabel(
 /** A clip's pictures: square tiles from a filmstrip of its stretch of the file. */
 private fun DrawScope.drawFrames(clip: ClipView, r: Rect, layout: Layout) {
     val tile = r.height
-    if (r.width <= 0f) return
+    if (r.width <= 0f || tile <= 0f) return
     if (clip.kind == "image") {
         val pic = Thumbs.still(clip.path, 0, (tile * 1.2f).roundToInt()) ?: return
         var x = r.left
@@ -1076,17 +1081,18 @@ private fun DrawScope.drawFrames(clip: ClipView, r: Rect, layout: Layout) {
         return
     }
     val needed = ceil(r.width / tile).toInt().coerceAtLeast(1)
-    // quantised so zooming does not ask for a new strip every frame
+    // quantised so zooming does not ask for a new strip every frame, and capped at 24 tiles
+    // so wide/slowed clips never exceed mobile GPU max texture width (16,384 px on Adreno)
     val count = when {
         needed <= 4 -> needed
         needed <= 8 -> 8
         needed <= 16 -> 16
-        needed <= 32 -> 32
-        else -> 60
+        else -> 24
     }
     val from = clip.sourceStartUs
     val to = clip.sourceStartUs + (clip.durationUs * clip.speed).toLong()
     val strip = Thumbs.strip(clip.path, from, to, count, (tile * 0.8f).roundToInt().coerceAtLeast(16)) ?: return
+    if (strip.width <= 0 || strip.height <= 0) return
     val frameW = strip.width.toFloat() / count
     val img = strip.asImageBitmap()
     for (i in 0 until needed) {
@@ -1095,17 +1101,20 @@ private fun DrawScope.drawFrames(clip: ClipView, r: Rect, layout: Layout) {
         val src = min(count - 1, (i.toLong() * count / needed).toInt())
         val srcW = min(frameW, strip.height.toFloat())
         val srcX = src * frameW + (frameW - srcW) / 2
+        val ox = srcX.roundToInt().coerceIn(0, strip.width - 1)
+        val ow = srcW.roundToInt().coerceIn(1, strip.width - ox)
         drawImage(
             img,
-            srcOffset = IntOffset(srcX.roundToInt(), 0),
-            srcSize = IntSize(srcW.roundToInt().coerceAtLeast(1), strip.height),
+            srcOffset = IntOffset(ox, 0),
+            srcSize = IntSize(ow, strip.height),
             dstOffset = IntOffset(x.roundToInt(), r.top.roundToInt()),
-            dstSize = IntSize(tile.roundToInt(), r.height.roundToInt()),
+            dstSize = IntSize(tile.roundToInt().coerceAtLeast(1), r.height.roundToInt().coerceAtLeast(1)),
         )
     }
 }
 
 private fun DrawScope.drawWave(vm: EditorViewModel, clip: ClipView, r: Rect, layout: Layout) {
+    if (r.width <= 0f || r.height <= 0f) return
     val dp = layout.dp
     val bucketPx = 3 * dp
     val buckets = (r.width / bucketPx).roundToInt().coerceIn(8, 2048)
@@ -1113,6 +1122,7 @@ private fun DrawScope.drawWave(vm: EditorViewModel, clip: ClipView, r: Rect, lay
     val from = clip.sourceStartUs
     val to = clip.sourceStartUs + (clip.durationUs * clip.speed).toLong()
     val wave = Thumbs.wave(clip.path, vm.path, from, to, quant) ?: return
+    if (wave.isEmpty()) return
     val w = r.width / wave.size
     val mid = r.top + r.height / 2
     for (i in wave.indices) {

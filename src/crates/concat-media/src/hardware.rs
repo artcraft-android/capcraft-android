@@ -265,7 +265,7 @@ pub fn mediacodec_decoder(codec: ffmpeg::codec::Id, format: Pixel) -> Option<&'s
 /// them or a scrub elsewhere. So three; the fourth reader on decodes on
 /// the CPU as before, and a seat comes free when its reader closes or
 /// falls back.
-pub const MEDIACODEC_READERS: usize = 3;
+pub const MEDIACODEC_READERS: usize = 2;
 
 /// Pictures smaller than this, in pixels, are decoded in software even on
 /// a phone: a thumbnail or a scrub copy being written wants its frames at

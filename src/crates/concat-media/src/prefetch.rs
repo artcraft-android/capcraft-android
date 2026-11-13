@@ -231,6 +231,7 @@ impl Prefetcher {
             let lane = Arc::clone(&lane);
             if let Err(error) = std::thread::Builder::new()
                 .name(format!("concat-decode-{index}"))
+                .stack_size(8 * 1024 * 1024)
                 .spawn(move || work(&lane))
             {
                 log::error!("decode worker {index} could not start: {error}");
@@ -259,6 +260,9 @@ impl Prefetcher {
     /// walk from a keyframe, so this is roughly the share of the machine
     /// decoding may take while the window and the mix keep the rest.
     pub fn default_workers() -> usize {
+        if cfg!(target_os = "android") {
+            return 2;
+        }
         std::thread::available_parallelism().map_or(2, |threads| (threads.get() / 4).clamp(2, 4))
     }
 

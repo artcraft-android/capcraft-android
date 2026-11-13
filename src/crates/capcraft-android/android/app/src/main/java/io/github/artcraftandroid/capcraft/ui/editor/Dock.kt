@@ -118,10 +118,10 @@ fun rememberPickers(): Pickers {
     }
     return Pickers(
         // pictures and videos come through the app's own picker
-        visual = { cb -> MediaPick.open(MediaKinds.BOTH, multiple = true) { cb(it) } },
-        single = { cb -> MediaPick.open(MediaKinds.BOTH, multiple = false) { cb(it.first()) } },
+        visual = { cb -> MediaPick.open(MediaKinds.BOTH, multiple = true) { if (it.isNotEmpty()) cb(it) } },
+        single = { cb -> MediaPick.open(MediaKinds.BOTH, multiple = false) { it.firstOrNull()?.let(cb) } },
         audio = { cb -> PickerCallbacks.audio = cb; audio.launch(arrayOf("audio/*")) },
-        video = { cb -> MediaPick.open(MediaKinds.VIDEO, multiple = false) { cb(it.first()) } },
+        video = { cb -> MediaPick.open(MediaKinds.VIDEO, multiple = false) { it.firstOrNull()?.let(cb) } },
         // caption files have no settled type: SubRip comes as text, as its own type or as bytes
         captions = { cb ->
             PickerCallbacks.captions = cb
@@ -143,7 +143,7 @@ fun Dock(vm: EditorViewModel) {
     val pickers = rememberPickers()
     val selected = vm.selectedClip
     val row = vm.selectedRow
-    val level = vm.dock.last()
+    val level = vm.dock.lastOrNull() ?: DockLevel.Root
     val choosing = vm.chosen != null
     val key = when {
         choosing -> "multi"

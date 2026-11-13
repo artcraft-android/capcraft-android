@@ -84,8 +84,9 @@ fun CoverEditor(vm: EditorViewModel, onClose: () -> Unit) {
     }
     val context = androidx.compose.ui.platform.LocalContext.current
     fun pickAlbum() = MediaPick.open(MediaKinds.IMAGE, multiple = false) { uris ->
+        val uri = uris.firstOrNull() ?: return@open
         scope.launch {
-            album = withContext(Threads.preview) { runCatching { croppedTo(context, uris.first(), t.width, t.height) }.getOrNull() } ?: album
+            album = withContext(Threads.preview) { runCatching { croppedTo(context, uri, t.width, t.height) }.getOrNull() } ?: album
             tab = 1
         }
     }
@@ -93,6 +94,7 @@ fun CoverEditor(vm: EditorViewModel, onClose: () -> Unit) {
 
     LaunchedEffect(at) {
         val s = vm.session ?: return@LaunchedEffect
+        if (t.width == 0u || t.height == 0u) return@LaunchedEffect
         val w = 720
         val h = (w * t.height.toFloat() / t.width.toFloat()).roundToInt() / 2 * 2
         picture = withContext(Threads.preview) {

@@ -81,7 +81,15 @@ import kotlin.math.roundToInt
 @Composable
 fun EditorScreen(path: String, incoming: List<Uri>, then: String? = null, close: () -> Unit) {
     val app = LocalContext.current.applicationContext as Application
-    val vm: EditorViewModel = viewModel(key = path, factory = EditorViewModel.Factory(app, path))
+    val storeOwner = remember(path) {
+        object : androidx.lifecycle.ViewModelStoreOwner {
+            override val viewModelStore = androidx.lifecycle.ViewModelStore()
+        }
+    }
+    androidx.compose.runtime.DisposableEffect(storeOwner) {
+        onDispose { storeOwner.viewModelStore.clear() }
+    }
+    val vm: EditorViewModel = viewModel(viewModelStoreOwner = storeOwner, key = path, factory = EditorViewModel.Factory(app, path))
     val scope = rememberCoroutineScope()
     var exporting by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { vm.open(incoming, then) }
@@ -331,13 +339,24 @@ private class ScrubMeter {
 }
 
 /**
- * Three bitmaps the engine draws into in turn: the one on screen, the one made ahead of it while playing, and one
- * more, so the one on screen is never written mid-frame.
+ * Four bitmaps the engine draws into in turn while playing or scrubbing: never reusing the bitmap
+ * currently shown on screen, the prefetched next frame, or `vm.lastFrame` (which panels read off
+ * the main thread). Resting (`Motion.STILL`) frames allocate a fresh unshared bitmap.
  */
 private class FrameBuffers {
-    private val bitmaps = arrayOfNulls<Bitmap>(3)
+    private val bitmaps = arrayOfNulls<Bitmap>(4)
     private var next = 0
-    fun take(): Bitmap? = bitmaps[next]
+    fun take(busyA: Bitmap?, busyB: Bitmap?, busyC: Bitmap?): Bitmap? {
+        for (offset in bitmaps.indices) {
+            val idx = (next + offset) % bitmaps.size
+            val candidate = bitmaps[idx]
+            if (candidate !== busyA && candidate !== busyB && candidate !== busyC) {
+                next = idx
+                return candidate
+            }
+        }
+        return null
+    }
     fun put(b: Bitmap) {
         bitmaps[next] = b
         next = (next + 1) % bitmaps.size
@@ -353,6 +372,8 @@ private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageB
     val revision = vm.timeline?.revision
     LaunchedEffect(session, revision, width, height, vm.playing) {
         val s = session ?: return@LaunchedEffect
+        if (width <= 0 || height <= 0) return@LaunchedEffect
+        var displayed: Bitmap? = null
         if (vm.playing) {
             // which frame of the timeline an instant falls in, and the instant a frame is made for: a quarter of the way
             // in, as the engine takes the frame nearest the time it is asked for, and the middle was a tie that
@@ -361,16 +382,17 @@ private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageB
             val den = (vm.timeline?.fpsDen ?: 1L).coerceAtLeast(1L)
             fun frameAt(us: Long) = us * num / (den * 1_000_000L)
             fun timeOf(frame: Long) = (4 * frame + 1) * den * 1_000_000L / (4 * num)
+            var ready: Bitmap? = null
             suspend fun make(frame: Long): Bitmap? {
                 val pic = withContext(Threads.preview) {
                     runCatching { s.frame(timeOf(frame), width.toUInt(), height.toUInt(), Motion.PLAYING) }.getOrNull()
                 } ?: return null
-                val b = pic.intoBitmap(buffers.take()) ?: return null
+                val b = pic.intoBitmap(buffers.take(displayed, ready, vm.lastFrame)) ?: return null
                 buffers.put(b)
+                b.prepareToDraw()
                 return b
             }
             var shown = -1L
-            var ready: Bitmap? = null
             var readyFrame = -1L
             var frames = 0
             var skipped = 0L
@@ -385,6 +407,7 @@ private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageB
                     if (frame == shown) continue
                     if (shown >= 0 && frame > shown + 1) skipped += frame - shown - 1
                     val b = (if (frame == readyFrame) ready else null) ?: make(frame) ?: break
+                    displayed = b
                     image = b.asImageBitmap()
                     shown = frame
                     frames++
@@ -405,11 +428,22 @@ private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageB
                 val pic = withContext(Threads.preview) {
                     runCatching { s.frame(at, width.toUInt(), height.toUInt(), motion) }.getOrNull()
                 } ?: return
-                if (motion == Motion.SCRUBBING) meter.add(started)
-                val b = pic.intoBitmap(buffers.take()) ?: return
-                buffers.put(b)
-                vm.lastFrame = b
-                image = b.asImageBitmap()
+                if (motion == Motion.SCRUBBING) {
+                    meter.add(started)
+                    val b = pic.intoBitmap(buffers.take(displayed, null, vm.lastFrame)) ?: return
+                    buffers.put(b)
+                    b.prepareToDraw()
+                    displayed = b
+                    image = b.asImageBitmap()
+                } else {
+                    // Unshared bitmap when resting so panels (`OtherPanels`, `BodyEffects`, eyedropper)
+                    // can read `vm.lastFrame` safely without racing future `copyPixelsFromBuffer` writes.
+                    val b = pic.intoBitmap(null) ?: return
+                    b.prepareToDraw()
+                    displayed = b
+                    vm.lastFrame = b
+                    image = b.asImageBitmap()
+                }
             }
             var rest: Job? = null
             // every frame made is shown, and the next is made for wherever the playhead is by then:

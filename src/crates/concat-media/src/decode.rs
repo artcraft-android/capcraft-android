@@ -907,7 +907,16 @@ impl Decoder {
         unsafe {
             let raw = context.as_mut_ptr();
             (*raw).thread_type = ffmpeg::sys::FF_THREAD_FRAME | ffmpeg::sys::FF_THREAD_SLICE;
-            (*raw).thread_count = i32::from(options.threads);
+            let threads = if cfg!(target_os = "android") && options.threads == 0 {
+                // Unbounded frame threading (0 -> 9..16 threads per decoder on
+                // 8-core Snapdragon SoCs) multiplies 4K reference-frame pools
+                // across warm readers; four threads keeps seeks fast and memory
+                // bounded.
+                4
+            } else {
+                i32::from(options.threads)
+            };
+            (*raw).thread_count = threads;
         }
         let (accelerated, named) = match codec {
             Codec::Software => (None, None),
@@ -1363,6 +1372,26 @@ impl Decoder {
         let row = width as usize * if deep.is_some() { 8 } else { 4 };
         let stride = filtered.stride(0);
         let data = filtered.data(0);
+        if stride < row || height == 0 || width == 0 {
+            return Err(Error::Probe {
+                path: self.path.clone(),
+                detail: format!(
+                    "the filtergraph returned an invalid plane ({width}x{height}, stride {stride})"
+                ),
+            });
+        }
+        let needed = (height as usize - 1)
+            .saturating_mul(stride)
+            .saturating_add(row);
+        if data.len() < needed {
+            return Err(Error::Probe {
+                path: self.path.clone(),
+                detail: format!(
+                    "the filtergraph plane buffer is truncated ({} < {needed})",
+                    data.len()
+                ),
+            });
+        }
         let mut pixels = Vec::with_capacity(row * height as usize);
         for y in 0..height as usize {
             pixels.extend_from_slice(&data[y * stride..y * stride + row]);
@@ -1558,6 +1587,7 @@ fn first_picture_within(path: &Path, name: &'static str, wait: std::time::Durati
     let (answer, answered) = std::sync::mpsc::channel();
     let tried = std::thread::Builder::new()
         .name("mediacodec-first-picture".to_owned())
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let attempt = || -> Option<()> {
                 let mut input = ffmpeg::format::input(&path).ok()?;
@@ -1578,7 +1608,10 @@ fn first_picture_within(path: &Path, name: &'static str, wait: std::time::Durati
                     .ok()?
                     .map(|_| ())
             };
-            let works = attempt().is_some();
+            let works = std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt))
+                .ok()
+                .flatten()
+                .is_some();
             let _ = answer.send(works);
             // Late or not, what it found is the verdict from now on: a
             // decoder that was only slow to start is not written off for
