@@ -45,6 +45,7 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.BLACK),
         )
         super.onCreate(savedInstanceState)
+        volumeControlStream = android.media.AudioManager.STREAM_MUSIC
         shared.value = sharedUris(intent)
         val app = application as CapCraftApplication
         setContent {

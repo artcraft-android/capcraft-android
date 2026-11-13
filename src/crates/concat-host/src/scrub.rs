@@ -145,6 +145,14 @@ fn writing() -> &'static Mutex<HashSet<PathBuf>> {
     WRITING.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Whether any scrub copy is currently being encoded in the background.
+pub fn is_busy() -> bool {
+    !writing()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_empty()
+}
+
 /// Removes the copies under `project` that `keep` does not name: those of
 /// media no longer in the project, or read as a range they no longer are.
 /// One being written is left for its writer. Returns how many files went.

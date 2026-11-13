@@ -15,12 +15,14 @@ import io.github.artcraftandroid.capcraft.core.MobileSession
 import io.github.artcraftandroid.capcraft.core.RowKind
 import io.github.artcraftandroid.capcraft.core.RowView
 import io.github.artcraftandroid.capcraft.core.TimelineView
-import io.github.artcraftandroid.capcraft.core.clearPlayback
+import io.github.artcraftandroid.capcraft.core.clearPlaybackFor
 import io.github.artcraftandroid.capcraft.core.isPlaying
+import io.github.artcraftandroid.capcraft.core.isPreparingMedia
 import io.github.artcraftandroid.capcraft.core.pause
 import io.github.artcraftandroid.capcraft.core.play
 import io.github.artcraftandroid.capcraft.core.positionUs
 import io.github.artcraftandroid.capcraft.core.seek
+import io.github.artcraftandroid.capcraft.core.setMuted
 import io.github.artcraftandroid.capcraft.core.still
 import io.github.artcraftandroid.capcraft.engine.Media
 import io.github.artcraftandroid.capcraft.engine.Threads
@@ -152,6 +154,8 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
     var message: String? by mutableStateOf(null)
     /** A long operation in progress, shown over the editor ("Importing"). */
     var busy: String? by mutableStateOf(null)
+    /** Non-blocking background scrub-copy / audio-cache preparation in progress. */
+    var preparingMedia by mutableStateOf(false)
     var fullscreen by mutableStateOf(false)
     /** The cover editor is open. */
     var editingCover by mutableStateOf(false)
@@ -541,8 +545,16 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
         val end = timeline?.durationUs ?: 0L
         if (end <= 0) return
         val from = if (playhead >= end - 30_000) 0L else playhead
+        val s = session
+        val muteForVoiceover = recording
         viewModelScope.launch {
-            withContext(Threads.commands) { runCatching { play(from) } }
+            withContext(Threads.commands) {
+                runCatching {
+                    s?.syncPlayback()
+                    if (!muteForVoiceover) io.github.artcraftandroid.capcraft.core.setMuted(false)
+                    play(from)
+                }
+            }
             playhead = from
             playing = true
         }
@@ -976,7 +988,7 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
         val empty = timeline?.rows?.all { it.clips.isEmpty() } ?: false
         withContext(Threads.commands) {
             runCatching { pause() }
-            runCatching { clearPlayback() }
+            runCatching { clearPlaybackFor(path) }
             if (empty) {
                 runCatching { io.github.artcraftandroid.capcraft.core.deleteProject(path) }
             } else {
@@ -988,7 +1000,7 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
     override fun onCleared() {
         super.onCleared()
         runCatching { session?.save() }
-        runCatching { clearPlayback() }
+        runCatching { clearPlaybackFor(path) }
         session?.destroy()
     }
 
