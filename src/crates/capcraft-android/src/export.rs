@@ -78,14 +78,30 @@ pub fn start_export(
         .begin()
         .map_err(|_| MobileError::Busy("An export is already running.".to_owned()))?;
     let request = session.export_request(&settings)?;
+    // Free warm preview decoders and pooled GPU textures immediately so the
+    // export's 4K decoders get every MediaCodec seat instead of falling back to
+    // software decoding while `capcraft-readers` waits out its idle timer.
+    context.monitor.shrink();
+    concat_host::scheduler()
+        .pool()
+        .close_idle(std::time::Duration::ZERO);
+    concat_export::shrink_headless_pool(0.0);
+
     std::thread::Builder::new()
         .name("capcraft-export".to_owned())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let cancel = job.cancel_handle();
             let mut last = -1.0f32;
+            let mut last_stage = "";
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 concat_host::export::run(&request, &cancel, |progress: Progress| {
+                    if progress.stage != last_stage {
+                        if progress.stage == concat_export::RENDERING_IN_SOFTWARE {
+                            last = -1.0;
+                        }
+                        last_stage = progress.stage;
+                    }
                     let fraction = fraction_of(progress);
                     if fraction - last >= 0.005 || fraction >= 1.0 {
                         last = fraction;
@@ -124,7 +140,7 @@ fn fraction_of(progress: Progress) -> f32 {
         0.0
     };
     match progress.stage {
-        "rendering" => done * 0.9,
+        "rendering" | concat_export::RENDERING_IN_SOFTWARE => done * 0.9,
         "mixing audio" => 0.9 + done * 0.06,
         "muxing" => 0.96 + done * 0.04,
         // a stage this bridge does not know: hold where drawing ended
@@ -214,5 +230,8 @@ mod tests {
         ];
         assert!(steps.windows(2).all(|pair| pair[0] <= pair[1]), "{steps:?}");
         assert_eq!(steps[2], 1.0);
+        assert!(
+            (at(150, 300, concat_export::RENDERING_IN_SOFTWARE) - 0.45).abs() < 1e-6
+        );
     }
 }

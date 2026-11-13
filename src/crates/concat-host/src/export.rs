@@ -112,6 +112,14 @@ pub fn run_on(
     cancel: &AtomicBool,
     mut progress: impl FnMut(Progress),
 ) -> Result<String, String> {
+    // Release idle preview readers and pooled headless preview textures before
+    // opening export decoders so mobile hardware decoder seats (`MediaCodec`)
+    // are not held by paused editor previews.
+    crate::scheduler()
+        .pool()
+        .close_idle(std::time::Duration::ZERO);
+    concat_export::shrink_headless_pool(0.0);
+
     let mut report = |frame: i64, total: i64, stage: &'static str| {
         progress(Progress {
             frame,

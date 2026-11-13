@@ -3635,39 +3635,48 @@ impl WgpuCompositor {
         if deep {
             // Sixteen-bit integers, opaque already: the rows as they are.
             let row_bytes = width as usize * 8;
-            let mut pixels = vec![0u8; row_bytes * height as usize];
+            let mut pixels = Vec::with_capacity(row_bytes * height as usize);
             {
-                let data = slice.get_mapped_range().ok()?;
+                let Ok(data) = slice.get_mapped_range() else {
+                    target.staging.unmap();
+                    return None;
+                };
                 for row in 0..height as usize {
                     let from = &data[row * padded_row..row * padded_row + row_bytes];
-                    pixels[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(from);
+                    pixels.extend_from_slice(from);
                 }
             }
             target.staging.unmap();
             return Frame::from_rgba64(width, height, pixels, self.output);
         }
-        let mut frame = Frame::transparent(width, height);
+        let row_bytes = width as usize * 4;
+        let mut pixels = Vec::with_capacity(row_bytes * height as usize);
         {
             // A range that will not map is a failed map, as above.
-            let data = slice.get_mapped_range().ok()?;
-            let row_bytes = width as usize * 4;
-            let pixels = frame.pixels_mut();
+            let Ok(data) = slice.get_mapped_range() else {
+                target.staging.unmap();
+                return None;
+            };
+            let force_opaque = !self.see_through;
             for row in 0..height as usize {
                 let from = &data[row * padded_row..row * padded_row + row_bytes];
-                pixels[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(from);
-            }
-            // The output goes to a screen or an encoder, which have nothing
-            // to show through, and blending may have left alpha short of
-            // one - unless the canvas is see-through, when the alpha is
-            // the point (#456).
-            if !self.see_through {
-                for pixel in pixels.chunks_exact_mut(4) {
-                    pixel[3] = 255;
+                pixels.extend_from_slice(from);
+                // The output goes to a screen or an encoder, which have
+                // nothing to show through, and blending may have left alpha
+                // short of one - unless the canvas is see-through, when the
+                // alpha is the point (#456). Fix alpha per row while the 15 KB
+                // scanline sits hot in L1D rather than sweeping 33 MB of cold
+                // DRAM a second time.
+                if force_opaque {
+                    let row_slice = &mut pixels[row * row_bytes..(row + 1) * row_bytes];
+                    for pixel in row_slice.chunks_exact_mut(4) {
+                        pixel[3] = 255;
+                    }
                 }
             }
         }
         target.staging.unmap();
-        Some(frame)
+        Frame::from_rgba(width, height, pixels)
     }
 }
 

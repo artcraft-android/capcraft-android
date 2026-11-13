@@ -14,7 +14,7 @@ use ffmpeg_the_third::format::{self, Pixel};
 use ffmpeg_the_third::software::scaling;
 use ffmpeg_the_third::util::frame::video::Video;
 
-use crate::decode::ColorRange;
+use crate::decode::{ColorRange, RawYuv};
 use crate::error::{Error, Result};
 use crate::ffi;
 
@@ -1180,12 +1180,148 @@ const fn fourcc(tag: [u8; 4]) -> u32 {
     u32::from_le_bytes(tag)
 }
 
+/// Multi-threaded `libswscale` wrapper calling `sws_scale_frame` so slice
+/// worker threads actually run (legacy `sws_scale` is single-threaded).
+struct VideoScaler {
+    ptr: *mut ffmpeg::sys::SwsContext,
+}
+
+// SAFETY: `Encoder` owns its `VideoScaler` exclusively and never shares it
+// concurrently across threads; `SwsContext` carries no thread-local state.
+unsafe impl Send for VideoScaler {}
+
+impl Drop for VideoScaler {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: `self.ptr` was allocated by `sws_alloc_context` and is
+            // owned exclusively by `self`.
+            unsafe {
+                ffmpeg::sys::sws_freeContext(self.ptr);
+            }
+        }
+    }
+}
+
+impl VideoScaler {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        src_format: Pixel,
+        src_w: u32,
+        src_h: u32,
+        dst_format: Pixel,
+        dst_w: u32,
+        dst_h: u32,
+        cs: i32,
+        src_full: bool,
+        dst_full: bool,
+        threads: u16,
+    ) -> std::result::Result<Self, ffmpeg::Error> {
+        let threads = if threads > 0 {
+            i64::from(threads)
+        } else if cfg!(target_os = "android") {
+            4
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| (n.get() as i64).clamp(1, 4))
+                .unwrap_or(2)
+        };
+        // SAFETY: `sws_alloc_context`, `av_opt_set_int`, `sws_init_context`,
+        // and `sws_setColorspaceDetails` follow FFmpeg's documented lifecycle;
+        // on failure `guard`'s `Drop` frees the partially configured context.
+        unsafe {
+            let ptr = ffmpeg::sys::sws_alloc_context();
+            if ptr.is_null() {
+                return Err(ffmpeg::Error::Bug);
+            }
+            let guard = Self { ptr };
+            let raw = ptr.cast::<std::os::raw::c_void>();
+            let set = |name: &std::ffi::CStr, val: i64| {
+                ffmpeg::sys::av_opt_set_int(raw, name.as_ptr(), val, 0);
+            };
+            let src_fmt: ffmpeg::sys::AVPixelFormat = src_format.into();
+            let dst_fmt: ffmpeg::sys::AVPixelFormat = dst_format.into();
+            set(c"srcw", i64::from(src_w));
+            set(c"srch", i64::from(src_h));
+            set(c"src_format", i64::from(src_fmt.0));
+            set(c"dstw", i64::from(dst_w));
+            set(c"dsth", i64::from(dst_h));
+            set(c"dst_format", i64::from(dst_fmt.0));
+            set(c"src_range", i64::from(src_full));
+            set(c"dst_range", i64::from(dst_full));
+            set(c"sws_flags", i64::from(scaling::Flags::BILINEAR.bits()));
+            set(c"threads", threads);
+
+            let rc = ffmpeg::sys::sws_init_context(ptr, std::ptr::null_mut(), std::ptr::null_mut());
+            if rc < 0 {
+                return Err(ffmpeg::Error::from(rc));
+            }
+            let coefficients = ffmpeg::sys::sws_getCoefficients(cs);
+            ffmpeg::sys::sws_setColorspaceDetails(
+                ptr,
+                coefficients,
+                i32::from(src_full),
+                coefficients,
+                i32::from(dst_full),
+                0,
+                1 << 16,
+                1 << 16,
+            );
+            Ok(guard)
+        }
+    }
+
+    fn scale_frame(
+        &mut self,
+        src: &Video,
+        dst: &mut Video,
+    ) -> std::result::Result<(), ffmpeg::Error> {
+        // SAFETY: `self.ptr` is an initialized `SwsContext`, and both `src` and
+        // `dst` own valid `AVFrame` headers and refcounted plane buffers.
+        let rc = unsafe { ffmpeg::sys::sws_scale_frame(self.ptr, dst.as_mut_ptr(), src.as_ptr()) };
+        if rc < 0 {
+            Err(ffmpeg::Error::from(rc))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn ensure_writable_video<'a>(
+    slot: &'a mut Option<Video>,
+    format: Pixel,
+    width: u32,
+    height: u32,
+    path: &Path,
+) -> Result<&'a mut Video> {
+    let recreate = slot.as_ref().is_none_or(|v| {
+        v.format() != format || v.width() != width || v.height() != height
+    });
+    if recreate {
+        *slot = Some(Video::new(format, width, height));
+    }
+    let video = slot.as_mut().expect("just initialized");
+    // SAFETY: `video` was allocated via `Video::new` (`av_frame_get_buffer`).
+    // When `refcount == 1` (every MediaCodec frame), this is an O(1) no-op;
+    // when a software encoder still holds a lookahead ref, FFmpeg allocates a
+    // fresh writable buffer without touching the encoder's copy.
+    let rc = unsafe { ffmpeg::sys::av_frame_make_writable(video.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(ffi::fail("make frame writable", path, ffmpeg::Error::from(rc)));
+    }
+    Ok(video)
+}
+
 /// Encodes through libavcodec into a container libavformat writes.
 pub struct Encoder {
     path: PathBuf,
     output: format::context::Output,
     encoder: encoder::video::Encoder,
-    scaler: scaling::Context,
+    scaler: VideoScaler,
+    yuv_scaler: Option<(Pixel, u32, u32, VideoScaler)>,
+    staging_rgba: Option<Video>,
+    converted: Option<Video>,
+    pixel_format: Pixel,
+    threads: u16,
     /// The encoder's time base, and the stream's after the header was
     /// written - the muxer is free to pick its own.
     encoder_time_base: ffmpeg::Rational,
@@ -1327,8 +1463,22 @@ impl Encoder {
         frame_rate: FrameRate,
         options: &EncodeOptions,
     ) -> Result<Self> {
+        Self::create_with_faststart(path, width, height, frame_rate, options, true)
+    }
+
+    /// [`Encoder::create`] with optional `+faststart` control so temporary
+    /// video-only files about to be remuxed with audio do not rewrite the file
+    /// twice on flash storage.
+    pub fn create_with_faststart(
+        path: impl AsRef<Path>,
+        width: u32,
+        height: u32,
+        frame_rate: FrameRate,
+        options: &EncodeOptions,
+        faststart: bool,
+    ) -> Result<Self> {
         use ffmpeg::color::{Primaries, Space, TransferCharacteristic};
-        Self::create_tagged(
+        Self::open(
             path,
             width,
             height,
@@ -1339,6 +1489,8 @@ impl Encoder {
                 TransferCharacteristic::BT709,
                 Space::BT709,
             ),
+            None,
+            faststart,
         )
     }
 
@@ -1393,7 +1545,7 @@ impl Encoder {
             ffmpeg::color::Space,
         ),
     ) -> Result<Self> {
-        Self::open(path, width, height, frame_rate, options, tags, None)
+        Self::open(path, width, height, frame_rate, options, tags, None, true)
     }
 
     /// Opens `path` for an HDR file: BT.2020, ten bits, HLG or PQ as
@@ -1410,6 +1562,20 @@ impl Encoder {
         frame_rate: FrameRate,
         options: &EncodeOptions,
         signal: Signal,
+    ) -> Result<Self> {
+        Self::create_hdr_with_faststart(path, width, height, frame_rate, options, signal, true)
+    }
+
+    /// [`Encoder::create_hdr`] with optional `+faststart` control for
+    /// temporary video-only files about to be remuxed with audio.
+    pub fn create_hdr_with_faststart(
+        path: impl AsRef<Path>,
+        width: u32,
+        height: u32,
+        frame_rate: FrameRate,
+        options: &EncodeOptions,
+        signal: Signal,
+        faststart: bool,
     ) -> Result<Self> {
         use ffmpeg::color::{Primaries, Space, TransferCharacteristic};
         let path = path.as_ref();
@@ -1456,12 +1622,14 @@ impl Encoder {
             &options,
             (Primaries::BT2020, transfer, Space::BT2020NCL),
             Some(signal),
+            faststart,
         )
     }
 
     /// The one way in: `tags` on the file, and `hdr` the signal of deep
     /// frames when the file is HDR (see [`Encoder::create_hdr`]), else the
     /// frames are eight-bit sRGB.
+    #[allow(clippy::too_many_arguments)]
     fn open(
         path: impl AsRef<Path>,
         width: u32,
@@ -1474,6 +1642,7 @@ impl Encoder {
             ffmpeg::color::Space,
         ),
         hdr: Option<Signal>,
+        faststart: bool,
     ) -> Result<Self> {
         ffi::init();
         let options = &settled(options);
@@ -1596,8 +1765,9 @@ impl Encoder {
         }
         // The index up front, so a player starts before the file is in.
         // Not for ProRes: moving it there writes the whole file again, gigabytes
-        // a minute, for an intermediate no one streams.
-        let header = if options.codec == VideoCodec::ProRes4444 {
+        // a minute, for an intermediate no one streams. And not for a temp
+        // video-only file that `audio::mux` is about to remux with `+faststart`.
+        let header = if options.codec == VideoCodec::ProRes4444 || !faststart {
             ffmpeg::Dictionary::new()
         } else {
             ffmpeg::dict! { "movflags" => "+faststart" }
@@ -1611,45 +1781,35 @@ impl Encoder {
             .unwrap_or(time_base);
 
         let deep = hdr.is_some();
-        let mut scaler = scaling::Context::get(
+        let cs = if deep {
+            ffmpeg::sys::SWS_CS_BT2020
+        } else {
+            ffmpeg::sys::SWS_CS_ITU709
+        };
+        let scaler = VideoScaler::new(
             if deep { Pixel::RGBA64LE } else { Pixel::RGBA },
             width,
             height,
             pixel_format,
             width,
             height,
-            scaling::Flags::BILINEAR,
+            cs,
+            true,
+            options.color_range == ColorRange::Full,
+            options.threads,
         )
         .map_err(|error| ffi::fail("scaler", path, error))?;
-        // BT.709 coefficients from full-range RGB to YUV in the range the
-        // file is tagged with, rather than swscale's BT.601 default: the
-        // file says 709, so the numbers in it are 709, and it says which
-        // range, so the numbers span that range.
-        // SAFETY: `scaler` owns a live SwsContext; the coefficient tables
-        // are static and the call only sets fields on the context.
-        unsafe {
-            let coefficients = ffmpeg::sys::sws_getCoefficients(if deep {
-                ffmpeg::sys::SWS_CS_BT2020
-            } else {
-                ffmpeg::sys::SWS_CS_ITU709
-            });
-            ffmpeg::sys::sws_setColorspaceDetails(
-                scaler.as_mut_ptr(),
-                coefficients,
-                1,
-                coefficients,
-                i32::from(options.color_range == ColorRange::Full),
-                0,
-                1 << 16,
-                1 << 16,
-            );
-        }
 
         Ok(Self {
             path: path.to_path_buf(),
             output,
             encoder,
             scaler,
+            yuv_scaler: None,
+            staging_rgba: None,
+            converted: None,
+            pixel_format,
+            threads: options.threads,
             encoder_time_base: time_base,
             stream_time_base,
             width,
@@ -1855,6 +2015,110 @@ fn until_ended<S>(
     }
 }
 
+impl Encoder {
+    /// Encodes a BT.709 YUV frame directly without an RGBA round-trip.
+    ///
+    /// When the decoded YUV frame already matches the encoder's pixel format
+    /// and dimensions (for example MediaCodec `NV12` decode -> MediaCodec
+    /// `NV12` encode at 4K), only a reference-counted `AVFrame` header is
+    /// created (`av_frame_ref`, zero pixel copies). Otherwise `sws_scale_frame`
+    /// converts or scales YUV->YUV directly across worker threads.
+    pub fn write_yuv_frame(&mut self, yuv: &RawYuv) -> Result<()> {
+        if self.finished {
+            return Err(Error::Io {
+                path: self.path.clone(),
+                source: std::io::Error::other("encoder was already finished"),
+            });
+        }
+        if self.deep {
+            return Err(Error::Io {
+                path: self.path.clone(),
+                source: std::io::Error::other("an HDR file takes sixteen-bit frames"),
+            });
+        }
+
+        let src = &yuv.0;
+        let pts = self.written as i64;
+        if src.format() == self.pixel_format
+            && src.width() == self.width
+            && src.height() == self.height
+        {
+            let mut out = Video::empty();
+            // SAFETY: both `AVFrame`s are valid; `av_frame_ref` increments the
+            // atomic `AVBufferRef` counts without copying plane bytes.
+            let rc = unsafe { ffmpeg::sys::av_frame_ref(out.as_mut_ptr(), src.as_ptr()) };
+            if rc < 0 {
+                out = src.clone();
+            }
+            out.set_pts(Some(pts));
+            // SAFETY: `out` owns its own `AVFrame` header; `color_range` and
+            // `colorspace` are plain enum fields.
+            unsafe {
+                (*out.as_mut_ptr()).color_range = self.color_range.into();
+                (*out.as_mut_ptr()).colorspace = ffmpeg::color::Space::BT709.into();
+            }
+            self.send(Some(&out))?;
+            self.written += 1;
+            return self.drain();
+        }
+
+        let full = self.color_range == ffmpeg::color::Range::JPEG;
+        let need_new_scaler = self
+            .yuv_scaler
+            .as_ref()
+            .is_none_or(|(fmt, w, h, _)| {
+                *fmt != src.format() || *w != src.width() || *h != src.height()
+            });
+        if need_new_scaler {
+            let scaler = VideoScaler::new(
+                src.format(),
+                src.width(),
+                src.height(),
+                self.pixel_format,
+                self.width,
+                self.height,
+                ffmpeg::sys::SWS_CS_ITU709,
+                full,
+                full,
+                self.threads,
+            )
+            .map_err(|error| ffi::fail("yuv scaler", &self.path, error))?;
+            self.yuv_scaler = Some((src.format(), src.width(), src.height(), scaler));
+        }
+
+        {
+            let converted = ensure_writable_video(
+                &mut self.converted,
+                self.pixel_format,
+                self.width,
+                self.height,
+                &self.path,
+            )?;
+            // SAFETY: `converted` owns a writable `AVFrame` header.
+            unsafe {
+                (*converted.as_mut_ptr()).color_range = self.color_range.into();
+                (*converted.as_mut_ptr()).colorspace = ffmpeg::color::Space::BT709.into();
+            }
+            let (_, _, _, scaler) = self.yuv_scaler.as_mut().expect("just initialized");
+            scaler
+                .scale_frame(src, converted)
+                .map_err(|error| ffi::fail("convert yuv", &self.path, error))?;
+            converted.set_pts(Some(pts));
+            // Re-stamp range after `sws_scale_frame` copies properties.
+            unsafe {
+                (*converted.as_mut_ptr()).color_range = self.color_range.into();
+                (*converted.as_mut_ptr()).colorspace = ffmpeg::color::Space::BT709.into();
+            }
+        }
+        let converted = self.converted.take().expect("just populated");
+        let send_res = self.send(Some(&converted));
+        self.converted = Some(converted);
+        send_res?;
+        self.written += 1;
+        self.drain()
+    }
+}
+
 impl FrameSink for Encoder {
     fn write_frame(&mut self, frame: &Frame) -> Result<()> {
         if frame.width() != self.width || frame.height() != self.height {
@@ -1888,32 +2152,73 @@ impl FrameSink for Encoder {
         } else {
             (Pixel::RGBA, 4)
         };
-        let mut rgba = Video::new(pixel, self.width, self.height);
-        {
-            let stride = rgba.stride(0);
-            let row = self.width as usize * bytes;
-            let data = rgba.data_mut(0);
-            for (y, source) in frame.pixels().chunks_exact(row).enumerate() {
-                data[y * stride..y * stride + row].copy_from_slice(source);
-            }
-        }
+        let colorspace: ffmpeg::sys::AVColorSpace = if deep {
+            ffmpeg::color::Space::BT2020NCL.into()
+        } else {
+            ffmpeg::color::Space::BT709.into()
+        };
         if let Some(light) = &mut self.light {
             light.measure(frame.pixels());
         }
-        let mut converted = Video::empty();
-        self.scaler
-            .run(&rgba, &mut converted)
-            .map_err(|error| ffi::fail("convert", &self.path, error))?;
-        converted.set_pts(Some(self.written as i64));
-        // The frame says what its numbers span, the same as the stream
-        // does: a hardware encoder reads it off the frame.
-        // SAFETY: `converted` is a live frame the scaler just filled; the
-        // range is a plain field the encoder reads with the picture.
-        unsafe {
-            (*converted.as_mut_ptr()).color_range = self.color_range.into();
+        let pts = self.written as i64;
+        {
+            let rgba = ensure_writable_video(
+                &mut self.staging_rgba,
+                pixel,
+                self.width,
+                self.height,
+                &self.path,
+            )?;
+            let stride = rgba.stride(0);
+            let row = self.width as usize * bytes;
+            let height = self.height as usize;
+            let data = rgba.data_mut(0);
+            if stride == row {
+                data[..row * height].copy_from_slice(frame.pixels());
+            } else {
+                for (y, source) in frame.pixels().chunks_exact(row).enumerate() {
+                    data[y * stride..y * stride + row].copy_from_slice(source);
+                }
+            }
+            // SAFETY: `rgba` owns a live `AVFrame` header; setting `color_range`
+            // and `colorspace` lets `sws_scale_frame` propagate exact RGB->YUV
+            // tables across every worker slice thread.
+            unsafe {
+                (*rgba.as_mut_ptr()).color_range = ffmpeg::color::Range::JPEG.into();
+                (*rgba.as_mut_ptr()).colorspace = colorspace;
+            }
         }
-
-        self.send(Some(&converted))?;
+        {
+            let rgba = self.staging_rgba.as_ref().expect("just populated");
+            let converted = ensure_writable_video(
+                &mut self.converted,
+                self.pixel_format,
+                self.width,
+                self.height,
+                &self.path,
+            )?;
+            // SAFETY: `converted` owns a writable `AVFrame` header.
+            unsafe {
+                (*converted.as_mut_ptr()).color_range = self.color_range.into();
+                (*converted.as_mut_ptr()).colorspace = colorspace;
+            }
+            self.scaler
+                .scale_frame(rgba, converted)
+                .map_err(|error| ffi::fail("convert", &self.path, error))?;
+            converted.set_pts(Some(pts));
+            // The frame says what its numbers span, the same as the stream
+            // does: a hardware encoder reads it off the frame.
+            // SAFETY: `converted` is a live frame the scaler just filled; the
+            // range is a plain field the encoder reads with the picture.
+            unsafe {
+                (*converted.as_mut_ptr()).color_range = self.color_range.into();
+                (*converted.as_mut_ptr()).colorspace = colorspace;
+            }
+        }
+        let converted = self.converted.take().expect("just populated");
+        let send_res = self.send(Some(&converted));
+        self.converted = Some(converted);
+        send_res?;
         self.written += 1;
         self.drain()
     }
@@ -3211,5 +3516,125 @@ mod tests {
             assert!(result.is_err(), "{}", codec.label());
             assert!(!path.exists());
         }
+    }
+
+    #[test]
+    fn multithreaded_scaler_preserves_bt709_across_all_slices() {
+        let mut src = Video::new(Pixel::RGBA, 128, 128);
+        let stride = src.stride(0);
+        for y in 0..128usize {
+            for x in 0..128usize {
+                let off = y * stride + x * 4;
+                src.data_mut(0)[off..off + 4].copy_from_slice(&[0, 255, 0, 255]);
+            }
+        }
+        unsafe {
+            (*src.as_mut_ptr()).color_range = ffmpeg::color::Range::JPEG.into();
+            (*src.as_mut_ptr()).colorspace = ffmpeg::color::Space::BT709.into();
+        }
+        let run = |threads: u16| {
+            let mut scaler = VideoScaler::new(
+                Pixel::RGBA,
+                128,
+                128,
+                Pixel::NV12,
+                128,
+                128,
+                ffmpeg::sys::SWS_CS_ITU709,
+                true,
+                false,
+                threads,
+            )
+            .expect("scaler");
+            let mut dst = Video::new(Pixel::NV12, 128, 128);
+            unsafe {
+                (*dst.as_mut_ptr()).color_range = ffmpeg::color::Range::MPEG.into();
+                (*dst.as_mut_ptr()).colorspace = ffmpeg::color::Space::BT709.into();
+            }
+            scaler.scale_frame(&src, &mut dst).expect("scale");
+            let y_stride = dst.stride(0);
+            let top = dst.data(0)[8 * y_stride + 64];
+            let bottom = dst.data(0)[120 * y_stride + 64];
+            (top, bottom)
+        };
+        let (t1_top, t1_bot) = run(1);
+        let (t4_top, t4_bot) = run(4);
+        assert_eq!((t1_top, t1_bot), (t4_top, t4_bot));
+        // Limited-range BT.709 pure green has Y ~ 173 (whereas BT.601 is ~145).
+        assert!(
+            t4_top > 165 && t4_bot > 165,
+            "expected BT.709 luma on all slices, got top={t4_top}, bot={t4_bot}"
+        );
+    }
+
+    #[test]
+    fn raw_yuv_export_round_trips_zero_copy_and_scaled() {
+        use crate::decode::{DecodeOptions, Decoder, ExportFrame, FrameSource};
+        let dir = std::env::temp_dir();
+        let src_path = dir.join("concat-raw-yuv-src.mp4");
+        let same_path = dir.join("concat-raw-yuv-same.mp4");
+        let down_path = dir.join("concat-raw-yuv-down.mp4");
+        let opts = EncodeOptions {
+            crf: 16,
+            ..EncodeOptions::default()
+        };
+        let mut enc = Encoder::create(&src_path, 128, 128, FrameRate::THIRTY, &opts).unwrap();
+        let green =
+            Frame::from_rgba(128, 128, [20u8, 210, 40, 255].repeat(128 * 128)).expect("frame");
+        for _ in 0..4 {
+            enc.write_frame(&green).unwrap();
+        }
+        enc.finish().unwrap();
+
+        // 1:1 raw YUV bypass (zero-copy av_frame_ref when formats match).
+        {
+            let mut dec = Decoder::open(&src_path, &DecodeOptions::default()).unwrap();
+            let mut out = Encoder::create_with_faststart(
+                &same_path,
+                128,
+                128,
+                FrameRate::THIRTY,
+                &opts,
+                false,
+            )
+            .unwrap();
+            let mut count = 0;
+            while let Some(frame) = dec.next_export_frame(128, 128, ColorRange::Limited).unwrap() {
+                match frame {
+                    ExportFrame::Yuv(yuv) => out.write_yuv_frame(&yuv).unwrap(),
+                    ExportFrame::Rgba(_) => panic!("expected raw YUV fast path"),
+                }
+                count += 1;
+            }
+            assert_eq!(count, 4);
+            out.finish().unwrap();
+        }
+
+        // Downscaled raw YUV bypass (128x128 decoded -> 64x64 YUV->YUV scaled).
+        {
+            let dec_opts = DecodeOptions::default().scaled_to(64, 64);
+            let mut dec = Decoder::open(&src_path, &dec_opts).unwrap();
+            let mut out = Encoder::create(&down_path, 64, 64, FrameRate::THIRTY, &opts).unwrap();
+            let mut count = 0;
+            while let Some(frame) = dec.next_export_frame(64, 64, ColorRange::Limited).unwrap() {
+                match frame {
+                    ExportFrame::Yuv(yuv) => out.write_yuv_frame(&yuv).unwrap(),
+                    ExportFrame::Rgba(_) => panic!("expected raw YUV fast path for downscale"),
+                }
+                count += 1;
+            }
+            assert_eq!(count, 4);
+            out.finish().unwrap();
+        }
+
+        for check in [(&same_path, 128u32), (&down_path, 64u32)] {
+            let mut verify = Decoder::open(check.0, &DecodeOptions::default()).unwrap();
+            let frame = verify.next_frame().unwrap().expect("decoded frame");
+            assert_eq!((frame.width(), frame.height()), (check.1, check.1));
+            let px = &frame.pixels()[..4];
+            assert!(px[1] > 190 && px[0] < 50 && px[2] < 70, "got {px:?}");
+            let _ = std::fs::remove_file(check.0);
+        }
+        let _ = std::fs::remove_file(&src_path);
     }
 }

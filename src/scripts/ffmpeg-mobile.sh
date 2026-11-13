@@ -41,6 +41,17 @@ if [ ! -f "$src/configure" ]; then
   tar -xf "$work/ffmpeg-$version.tar.xz" -C "$work"
 fi
 
+# The engine's own changes to FFmpeg, in scripts/ffmpeg-patches: applied
+# once, and found already applied on a source tree an earlier build left.
+for patch in "$workspace"/scripts/ffmpeg-patches/*.patch; do
+  [ -f "$patch" ] || continue
+  if patch -d "$src" -p1 -R -f -s --dry-run < "$patch" >/dev/null 2>&1; then
+    continue
+  fi
+  echo "Applying $(basename "$patch")"
+  patch -d "$src" -p1 -N < "$patch"
+done
+
 # One build tree per target, so two phones can be built from one source.
 build=$work/build-$target
 rm -rf "$build"
