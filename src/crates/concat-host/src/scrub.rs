@@ -196,12 +196,11 @@ pub fn write(
             .map_err(|error| format!("{}: {error}", folder.display()))?;
     }
     let partial = target.with_extension("part.mov");
-    let mut options = DecodeOptions::default()
+    let options = DecodeOptions::default()
         .scaled_to(width, height)
-        .in_range(range);
-    if !cfg!(target_os = "android") {
-        options = options.in_software().threaded(2);
-    }
+        .in_range(range)
+        .in_software()
+        .threaded(2);
     let mut decoder = Decoder::open(source, &options).map_err(|error| error.to_string())?;
     let mut writer = ScrubWriter::create(&partial, width, height, copy_rate, QUALITY)
         .map_err(|error| error.to_string())?;

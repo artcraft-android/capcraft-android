@@ -145,6 +145,7 @@ impl Monitor {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .shrink_pool(0.25);
         }
+        concat_export::shrink_headless_pool(0.25);
     }
 
     /// A compositor of its own on the window's device, for work off the
@@ -414,6 +415,7 @@ impl Monitor {
     /// closes.
     pub fn clear(&self) {
         self.pool.clear();
+        concat_export::shrink_headless_pool(0.0);
         *self
             .plan
             .lock()

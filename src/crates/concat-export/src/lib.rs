@@ -1694,43 +1694,159 @@ fn recovered(losses: u32, hdr: bool) -> Result<WgpuCompositor, String> {
     Ok(compositor)
 }
 
-/// A compositor for the frames drawn without a window: the API's and the
-/// command line's previews. Made once and kept, since making a device is
-/// far slower than drawing one small frame on it.
-fn headless<T>(draw: impl FnOnce(&mut WgpuCompositor) -> T) -> Result<T, String> {
-    static HEADLESS: std::sync::OnceLock<Option<std::sync::Mutex<WgpuCompositor>>> =
+type HeadlessTask = Box<dyn FnOnce(&mut Option<WgpuCompositor>) + Send>;
+
+static HEADLESS_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn headless_worker() -> Option<&'static std::sync::mpsc::Sender<HeadlessTask>> {
+    static WORKER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<HeadlessTask>>> =
         std::sync::OnceLock::new();
-    // A machine with nothing to draw on stays so for the process; why is
-    // in the log above this line, adapter by adapter.
-    let slot = HEADLESS
+    WORKER
         .get_or_init(|| {
-            let made = WgpuCompositor::new();
-            match &made {
-                Some(gpu) => {
-                    let adapter = gpu.adapter_info();
-                    log::info!(
-                        "previews draw on {} ({:?}, {:?})",
-                        adapter.name,
-                        adapter.device_type,
-                        adapter.backend
-                    );
+            let (tx, rx) = std::sync::mpsc::channel::<HeadlessTask>();
+            let spawned = std::thread::Builder::new()
+                .name("concat-headless-gpu".to_owned())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    let mut slot: Option<WgpuCompositor> = None;
+                    let mut tried = false;
+                    while let Ok(task) = rx.recv() {
+                        if !tried {
+                            tried = true;
+                            slot = std::panic::catch_unwind(WgpuCompositor::new)
+                                .ok()
+                                .flatten();
+                            match &slot {
+                                Some(gpu) => {
+                                    let adapter = gpu.adapter_info();
+                                    log::info!(
+                                        "previews draw on {} ({:?}, {:?})",
+                                        adapter.name,
+                                        adapter.device_type,
+                                        adapter.backend
+                                    );
+                                }
+                                None => {
+                                    log::error!("previews have nothing to draw on: {NO_RENDERER}");
+                                }
+                            }
+                        } else if slot.as_ref().is_some_and(WgpuCompositor::lost)
+                            && let Ok(Some(fresh)) = std::panic::catch_unwind(WgpuCompositor::new)
+                        {
+                            log::warn!(
+                                "previews: the GPU device was lost; drawing on a fresh one"
+                            );
+                            slot = Some(fresh);
+                        }
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            task(&mut slot);
+                        }))
+                        .is_err()
+                        {
+                            log::error!("previews: headless GPU composite panicked; resetting");
+                            slot = std::panic::catch_unwind(WgpuCompositor::new)
+                                .ok()
+                                .flatten();
+                        }
+                    }
+                });
+            match spawned {
+                Ok(_) => Some(tx),
+                Err(error) => {
+                    log::error!("previews: could not spawn headless GPU thread: {error}");
+                    None
                 }
-                None => log::error!("previews have nothing to draw on: {NO_RENDERER}"),
             }
-            made.map(std::sync::Mutex::new)
         })
         .as_ref()
-        .ok_or_else(|| NO_RENDERER.to_owned())?;
-    let mut gpu = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    // A device that died under an earlier preview is not kept: every
-    // preview after it would be black.
-    if gpu.lost()
-        && let Some(fresh) = WgpuCompositor::new()
-    {
-        log::warn!("previews: the GPU device was lost; drawing on a fresh one");
-        *gpu = fresh;
+}
+
+/// Releases pooled textures held by the shared headless preview compositor down
+/// to `fraction` (`0.0..=1.0`) of its budget. Safe to call before the headless
+/// compositor has been created (does nothing in that case).
+pub fn shrink_headless_pool(fraction: f64) {
+    if !HEADLESS_STARTED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
     }
-    Ok(draw(&mut gpu))
+    if let Some(tx) = headless_worker() {
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        if tx
+            .send(Box::new(move |slot| {
+                if let Some(gpu) = slot.as_mut() {
+                    gpu.shrink_pool(fraction);
+                }
+                let _ = done_tx.send(());
+            }))
+            .is_ok()
+        {
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        }
+    }
+}
+
+/// A compositor for the frames drawn without a window: the API's and the
+/// command line's previews. Made once and kept on one dedicated 8 MiB worker
+/// thread so Vulkan/EGL thread-local driver state never hops threads and
+/// mobile shader compilers never run on Android ART's 1 MiB thread stack.
+fn headless<'env, T: Send + 'env>(
+    draw: impl FnOnce(&mut WgpuCompositor) -> T + Send + 'env,
+) -> Result<T, String> {
+    let tx = headless_worker().ok_or_else(|| NO_RENDERER.to_owned())?;
+    HEADLESS_STARTED.store(true, std::sync::atomic::Ordering::Release);
+
+    type Slot<T> = (std::sync::Mutex<(bool, Option<Result<T, String>>)>, std::sync::Condvar);
+    let pair: Arc<Slot<T>> = Arc::new((
+        std::sync::Mutex::new((false, None)),
+        std::sync::Condvar::new(),
+    ));
+    let worker_pair = Arc::clone(&pair);
+
+    struct SignalDone<T>(Arc<Slot<T>>);
+    impl<T> Drop for SignalDone<T> {
+        fn drop(&mut self) {
+            let (lock, cvar) = &*self.0;
+            let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+            state.0 = true;
+            cvar.notify_all();
+        }
+    }
+
+    let boxed: Box<dyn FnOnce(&mut Option<WgpuCompositor>) + Send + 'env> =
+        Box::new(move |slot| {
+            let signal = SignalDone(worker_pair);
+            let outcome = match slot.as_mut() {
+                Some(gpu) => Ok(draw(gpu)),
+                None => Err(NO_RENDERER.to_owned()),
+            };
+            let (lock, _) = &*signal.0;
+            lock.lock().unwrap_or_else(|p| p.into_inner()).1 = Some(outcome);
+        });
+    // SAFETY: `WaitGuard` below blocks the current stack frame until `SignalDone`
+    // drops on the worker thread (or `tx.send` fails and drops `task` immediately),
+    // so `'env` strictly outlives the boxed closure's execution and drop.
+    let task: HeadlessTask = unsafe { std::mem::transmute(boxed) };
+
+    if tx.send(task).is_err() {
+        return Err(NO_RENDERER.to_owned());
+    }
+
+    struct WaitGuard<'a, T>(&'a Slot<T>);
+    impl<T> Drop for WaitGuard<'_, T> {
+        fn drop(&mut self) {
+            let (lock, cvar) = self.0;
+            let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+            while !state.0 {
+                state = cvar.wait(state).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+    }
+    let guard = WaitGuard(&pair);
+    drop(guard);
+
+    let (lock, _) = &*pair;
+    let outcome = lock.lock().unwrap_or_else(|p| p.into_inner()).1.take();
+    outcome.unwrap_or_else(|| Err("headless GPU composite panicked".to_owned()))
 }
 
 /// Composites every frame of the timeline into a soundless video file.

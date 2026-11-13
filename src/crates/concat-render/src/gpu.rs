@@ -677,6 +677,14 @@ struct PooledTexture {
 /// memory outright, so a quarter.
 pub fn pool_budget_for(device: wgpu::DeviceType) -> u64 {
     const MB: u64 = 1024 * 1024;
+    if cfg!(target_os = "android") {
+        // Mobile GPUs (Adreno, Mali, Xclipse) report IntegratedGpu and share
+        // LPDDR memory with Android's UI, decoders, and frame caches.
+        return match device {
+            wgpu::DeviceType::Cpu => 32 * MB,
+            _ => 48 * MB,
+        };
+    }
     match device {
         wgpu::DeviceType::DiscreteGpu => 512 * MB,
         wgpu::DeviceType::Cpu => 128 * MB,
@@ -696,7 +704,7 @@ const REVEAL_CACHE: usize = 64;
 /// And at most this many textures, whatever their size: many small
 /// distinct frames - a title's layers, masks - would otherwise pile up
 /// under the byte budget for as long as none of them is a megabyte.
-const POOL_TEXTURES: usize = 1024;
+const POOL_TEXTURES: usize = if cfg!(target_os = "android") { 96 } else { 1024 };
 
 /// The reusable output target and its readback buffer, for one output size.
 struct Target {
@@ -3745,65 +3753,101 @@ impl Compositor for WgpuCompositor {
         to: &Frame,
         pass: &TransitionPass,
     ) -> Option<Frame> {
-        if self.dead {
+        let max_side = self.max_side();
+        if self.dead
+            || width == 0
+            || height == 0
+            || width > max_side
+            || height > max_side
+            || from.width() == 0
+            || from.height() == 0
+            || from.width() > max_side
+            || from.height() > max_side
+            || to.width() == 0
+            || to.height() == 0
+            || to.width() > max_side
+            || to.height() > max_side
+        {
             return None;
         }
-        // The two pictures, uploaded into the working space as any frame
-        // is, so the shader reads what the device-kept path hands it.
-        self.used.values_mut().for_each(|used| *used = 0);
-        let view_of = |gpu: &Self, frame: &Frame, index: usize| {
-            gpu.pool[&(frame.width(), frame.height())][index]
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default())
-        };
-        let from_index = self.upload(from);
-        let to_index = self.upload(to);
-        let from_view = view_of(self, from, from_index);
-        let to_view = view_of(self, to, to_index);
-        let (canvas, _, canvas_view) = self.canvas(width, height);
-        self.target(width, height);
-        let target_texture = self.current_target().texture.clone();
-        let view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.encode_transition(
-            width,
-            height,
-            time,
-            &from_view,
-            &to_view,
-            pass,
-            &canvas_view,
-        )?;
-        self.resolve(&mut encoder, (width, height), canvas, &view);
-        {
-            let target = self.current_target();
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &target.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &target.staging,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(target.padded_row as u32),
-                        rows_per_image: Some(height),
+        let uncaught = self.uncaught.load(std::sync::atomic::Ordering::Relaxed);
+        let memory = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let drawn = (|| -> Option<Frame> {
+            // The two pictures, uploaded into the working space as any frame
+            // is, so the shader reads what the device-kept path hands it.
+            self.used.values_mut().for_each(|used| *used = 0);
+            let view_of = |gpu: &Self, frame: &Frame, index: usize| {
+                Some(
+                    gpu.pool
+                        .get(&(frame.width(), frame.height()))?
+                        .get(index)?
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default()),
+                )
+            };
+            let from_index = self.upload(from);
+            let to_index = self.upload(to);
+            let from_view = view_of(self, from, from_index)?;
+            let to_view = view_of(self, to, to_index)?;
+            let (canvas, _, canvas_view) = self.canvas(width, height);
+            self.target(width, height);
+            let target_texture = self.current_target().texture.clone();
+            let view = target_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut encoder = self.encode_transition(
+                width,
+                height,
+                time,
+                &from_view,
+                &to_view,
+                pass,
+                &canvas_view,
+            )?;
+            self.resolve(&mut encoder, (width, height), canvas, &view);
+            {
+                let target = self.current_target();
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &target.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
                     },
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &target.staging,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(target.padded_row as u32),
+                            rows_per_image: Some(height),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            self.queue.submit([encoder.finish()]);
+            self.retire();
+            self.read_back()
+        })();
+        let refused = pollster::block_on(validation.pop());
+        let exhausted = pollster::block_on(memory.pop());
+        let mut failed = drawn.is_none();
+        for error in [exhausted, refused].into_iter().flatten() {
+            log::error!("GPU transition combine at {time:.3}s failed: {error}");
+            failed = true;
         }
-        self.queue.submit([encoder.finish()]);
-        let frame = self.read_back();
-        if frame.is_none() {
+        if self.uncaught.load(std::sync::atomic::Ordering::Relaxed) != uncaught {
+            log::error!("GPU transition combine at {time:.3}s triggered an uncaptured GPU error");
+            failed = true;
+        }
+        if failed {
             self.dead = true;
+            return None;
         }
-        frame
+        drawn
     }
 }
 
