@@ -791,11 +791,68 @@ fn open_video(
     global_header: bool,
     attempt: Attempt,
 ) -> Result<(encoder::video::Encoder, Pixel)> {
+    let family = Family::of(encoder_name);
+    let pixel_format =
+        alpha_pixel_format(encoder_name).unwrap_or_else(|| family.pixel_format(options.ten_bit));
+    match open_video_with_pixel(
+        encoder_name,
+        codec,
+        path,
+        (width, height),
+        rate,
+        options,
+        tags,
+        hdr,
+        global_header,
+        attempt,
+        pixel_format,
+    ) {
+        Ok(opened) => Ok(opened),
+        // Some Android MediaCodec components (older OMX hardware and
+        // OMX.google.h264.encoder) accept planar YUV420P only and refuse NV12.
+        Err(first)
+            if family == Family::MediaCodec && !options.ten_bit && pixel_format == Pixel::NV12 =>
+        {
+            open_video_with_pixel(
+                encoder_name,
+                codec,
+                path,
+                (width, height),
+                rate,
+                options,
+                tags,
+                hdr,
+                global_header,
+                attempt,
+                Pixel::YUV420P,
+            )
+            .or(Err(first))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_video_with_pixel(
+    encoder_name: &'static str,
+    codec: ffmpeg::Codec,
+    path: &Path,
+    (width, height): (u32, u32),
+    rate: ffmpeg::Rational,
+    options: &EncodeOptions,
+    tags: (
+        ffmpeg::color::Primaries,
+        ffmpeg::color::TransferCharacteristic,
+        ffmpeg::color::Space,
+    ),
+    hdr: Option<Signal>,
+    global_header: bool,
+    attempt: Attempt,
+    pixel_format: Pixel,
+) -> Result<(encoder::video::Encoder, Pixel)> {
     let pq = hdr == Some(Signal::Pq);
     let family = Family::of(encoder_name);
     let plain = attempt != Attempt::AsAsked;
-    let pixel_format =
-        alpha_pixel_format(encoder_name).unwrap_or_else(|| family.pixel_format(options.ten_bit));
     // ProRes has no rate to steer: its profile is the quality.
     let rated = options.codec.rate_controlled();
     let cbr = rated && options.rate_mode == RateMode::Cbr && options.bitrate_kbps > 0;
