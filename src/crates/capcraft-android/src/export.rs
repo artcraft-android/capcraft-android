@@ -43,15 +43,29 @@ pub struct ExportSettings {
     pub output: String,
 }
 
+/// Maximum single-axis dimension phone MediaCodec H.264/HEVC encoders
+/// reliably accept (Level 5.2 ceiling: 4096 px).
+const MAX_EXPORT_SIDE: f64 = 4096.0;
+
+/// Minimum macroblock-aligned dimension MediaCodec encoders accept.
+const MIN_EXPORT_SIDE: u32 = 16;
+
 /// The size of an export at `resolution` for a `width` by `height` canvas.
+///
+/// Scales proportionally so the short side matches `resolution`, caps the
+/// long side at [`MAX_EXPORT_SIDE`] (preserving aspect ratio on 20:9 screen
+/// recordings exported at 4K so MediaCodec never rejects >4096 px), and
+/// aligns both axes to even dimensions >= [`MIN_EXPORT_SIDE`].
 #[uniffi::export]
 pub fn export_size(width: u32, height: u32, resolution: u32) -> Vec<u32> {
     let short = width.min(height).max(1);
-    let scale = f64::from(resolution.max(2)) / f64::from(short);
-    vec![
-        even((f64::from(width) * scale).round() as u32),
-        even((f64::from(height) * scale).round() as u32),
-    ]
+    let mut scale = f64::from(resolution.max(MIN_EXPORT_SIDE)) / f64::from(short);
+    let long_scaled = f64::from(width.max(height)) * scale;
+    if long_scaled > MAX_EXPORT_SIDE {
+        scale *= MAX_EXPORT_SIDE / long_scaled;
+    }
+    let clamp_side = |px: u32| even(((f64::from(px) * scale).round() as u32).max(MIN_EXPORT_SIDE));
+    vec![clamp_side(width), clamp_side(height)]
 }
 
 /// A bitrate for a frame size and rate that looks right on a phone: about
@@ -77,22 +91,47 @@ pub fn start_export(
         .exporter
         .begin()
         .map_err(|_| MobileError::Busy("An export is already running.".to_owned()))?;
-    let request = session.export_request(&settings)?;
+    let mut request = session.export_request(&settings)?;
+    let allow_hevc_fallback = !settings.hevc;
     std::thread::Builder::new()
         .name("capcraft-export".to_owned())
         .spawn(move || {
             let cancel = job.cancel_handle();
-            let mut last = -1.0f32;
-            let result = concat_host::export::run(&request, &cancel, |progress: Progress| {
-                let fraction = fraction_of(progress);
-                if fraction - last >= 0.005 || fraction >= 1.0 {
-                    last = fraction;
-                    listener.on_progress(fraction);
+            let run_once = |req: &concat_export::ExportRequest| {
+                let mut last = -1.0f32;
+                concat_host::export::run(req, &cancel, |progress: Progress| {
+                    let fraction = fraction_of(progress);
+                    if fraction - last >= 0.005 || fraction >= 1.0 {
+                        last = fraction;
+                        listener.on_progress(fraction);
+                    }
+                })
+            };
+            let mut result = run_once(&request);
+            if result.is_err() && !job.cancelled() && allow_hevc_fallback {
+                let _ = std::fs::remove_file(&request.output);
+                request.codec = VideoCodec::Hevc;
+                log::warn!("H.264 export failed; retrying with HEVC MediaCodec");
+                if let Ok(hevc_result) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_once(&request)))
+                {
+                    result = hevc_result;
                 }
-            });
+            }
             match result {
-                Ok(path) => listener.on_done(path),
-                Err(message) => listener.on_failed(message, job.cancelled()),
+                Ok(path) => {
+                    let non_empty = std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 0);
+                    if non_empty {
+                        listener.on_done(path);
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                        listener.on_failed("Export produced an empty file.".to_owned(), false);
+                    }
+                }
+                Err(message) => {
+                    let _ = std::fs::remove_file(&request.output);
+                    listener.on_failed(message, job.cancelled());
+                }
             }
             drop(job);
         })
@@ -184,7 +223,7 @@ impl MobileSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{Progress, fraction_of};
+    use super::{Progress, export_size, fraction_of};
 
     fn at(frame: i64, total: i64, stage: &'static str) -> f32 {
         fraction_of(Progress {
@@ -192,6 +231,22 @@ mod tests {
             total,
             stage,
         })
+    }
+
+    #[test]
+    fn panoramic_and_tall_exports_stay_within_mediacodec_bounds() {
+        assert_eq!(export_size(1080, 1920, 1080), vec![1080, 1920]);
+        assert_eq!(export_size(1920, 1080, 2160), vec![3840, 2160]);
+        // A 20:9 phone screen recording (1080x2400) asked for 4K keeps its
+        // aspect ratio while capping the long side at 4096 for MediaCodec.
+        let tall = export_size(1080, 2400, 2160);
+        assert_eq!(tall, vec![1842, 4096]);
+        assert!(
+            tall.iter()
+                .all(|&side| (16..=4096).contains(&side) && side % 2 == 0)
+        );
+        // Tiny inputs clamp to macroblock minimum (>= 16, even).
+        assert_eq!(export_size(4, 4, 4), vec![16, 16]);
     }
 
     /// The ring moves with the frames drawn, then steps through the sound

@@ -3,4 +3,7 @@
     <cache-path name="exports" path="exports/" />
     <!-- what the phone's camera records for Shoot and record, before the project takes a copy -->
     <cache-path name="captures" path="captures/" />
+    <!-- fallback export folder when MediaStore is restricted by custom ROM storage scopes -->
+    <external-files-path name="external_exports" path="." />
+    <files-path name="internal_exports" path="exports/" />
 </paths>

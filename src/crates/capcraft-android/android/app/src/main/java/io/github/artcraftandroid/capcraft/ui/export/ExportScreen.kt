@@ -80,7 +80,7 @@ import kotlinx.coroutines.withContext
 
 private sealed interface Stage {
     data class Running(val fraction: Float) : Stage
-    data class Done(val uri: Uri?) : Stage
+    data class Done(val uri: Uri) : Stage
     data class Failed(val message: String) : Stage
 }
 
@@ -153,9 +153,17 @@ fun ExportScreen(vm: EditorViewModel, onClose: () -> Unit, onHome: () -> Unit) {
 
             override fun onDone(path: String) {
                 scope.launch {
-                    val uri = withContext(Dispatchers.IO) { if (gif) publishGif(appContext, File(path)) else publish(appContext, File(path)) }
-                    ExportService.finish(appContext, if (gif) "Saved to Pictures" else "Saved to your device")
-                    stage = Stage.Done(uri)
+                    val file = File(path)
+                    val uri = withContext(Dispatchers.IO) {
+                        if (gif) publishGif(appContext, file) else publish(appContext, file)
+                    }
+                    if (uri != null) {
+                        ExportService.finish(appContext, if (gif) "Saved to Pictures" else "Saved to your device")
+                        stage = Stage.Done(uri)
+                    } else {
+                        ExportService.finish(appContext, "Export failed")
+                        stage = Stage.Failed("The exported file could not be saved to device storage.")
+                    }
                 }
             }
 
@@ -229,11 +237,12 @@ fun ExportScreen(vm: EditorViewModel, onClose: () -> Unit, onHome: () -> Unit) {
                 contentAlignment = Alignment.Center,
             ) {
                 val st = stage
-                if (st is Stage.Done && st.uri != null && !vm.exportGif && !vm.exportPhoto) {
+                if (st is Stage.Done && !vm.exportGif && !vm.exportPhoto) {
                     // the finished video, playing quietly in place of the cover
                     androidx.compose.ui.viewinterop.AndroidView(
                         factory = { ctx ->
                             android.widget.VideoView(ctx).apply {
+                                setOnErrorListener { _, _, _ -> true }
                                 setOnPreparedListener { mp ->
                                     mp.isLooping = true
                                     mp.setVolume(0f, 0f)
@@ -280,8 +289,8 @@ fun ExportScreen(vm: EditorViewModel, onClose: () -> Unit, onHome: () -> Unit) {
                     }
                     Spacer(Modifier.height(26.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(36.dp)) {
-                        ShareTarget(LucideIcons.Share2, "Share") { st.uri?.let { share(context, it) } }
-                        ShareTarget(LucideIcons.ExternalLink, "Open") { st.uri?.let { open(context, it, vm.exportGif, vm.exportPhoto) } }
+                        ShareTarget(LucideIcons.Share2, "Share") { share(context, st.uri) }
+                        ShareTarget(LucideIcons.ExternalLink, "Open") { open(context, st.uri, vm.exportGif, vm.exportPhoto) }
                     }
                 }
                 is Stage.Failed -> {
@@ -322,70 +331,127 @@ private fun ShareTarget(icon: androidx.compose.ui.graphics.vector.ImageVector, l
 
 /** Opens the saved file in whatever app the phone shows videos or pictures with. */
 private fun open(context: Context, uri: Uri, gif: Boolean, photo: Boolean = false) {
-    runCatching {
-        context.startActivity(
-            android.content.Intent(android.content.Intent.ACTION_VIEW).setDataAndType(uri, if (photo) "image/jpeg" else if (gif) "image/gif" else "video/mp4")
-                .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
-        )
+    val mime = if (photo) "image/jpeg" else if (gif) "image/gif" else "video/mp4"
+    val viewIntent = Intent(Intent.ACTION_VIEW)
+        .setDataAndType(uri, mime)
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(viewIntent) }.onFailure {
+        runCatching { context.startActivity(Intent.createChooser(viewIntent, null).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
     }
 }
 
-/** Saves a still as a JPEG in Pictures/CapCraft. */
-private fun publishPhoto(context: Context, picture: Bitmap): Uri? = runCatching {
-    val name = "CapCraft_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
-    val values = ContentValues().apply {
-        put(MediaStore.Images.Media.DISPLAY_NAME, name)
-        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-        put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/CapCraft")
-        put(MediaStore.Images.Media.IS_PENDING, 1)
-    }
+private fun writeMediaStore(
+    context: Context,
+    collection: Uri,
+    name: String,
+    mime: String,
+    relativeDir: String,
+    writeTo: (java.io.OutputStream) -> Unit,
+): Uri? {
     val resolver = context.contentResolver
-    val uri = resolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)
-        ?: return@runCatching null
-    resolver.openOutputStream(uri)?.use { out -> picture.compress(Bitmap.CompressFormat.JPEG, 95, out) }
-    values.clear()
-    values.put(MediaStore.Images.Media.IS_PENDING, 0)
-    resolver.update(uri, values, null, null)
-    uri
+    for (usePending in listOf(true, false)) {
+        var inserted: Uri? = null
+        try {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relativeDir)
+                if (usePending) put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val uri = resolver.insert(collection, values) ?: continue
+            inserted = uri
+            val out = resolver.openOutputStream(uri) ?: throw java.io.IOException("MediaStore returned null output stream")
+            out.use { stream ->
+                writeTo(stream)
+                stream.flush()
+            }
+            if (usePending) {
+                val done = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                resolver.update(uri, done, null, null)
+            }
+            return uri
+        } catch (_: Throwable) {
+            inserted?.let { runCatching { resolver.delete(it, null, null) } }
+        }
+    }
+    return null
+}
+
+private fun fallbackFileUri(
+    context: Context,
+    name: String,
+    mime: String,
+    externalType: String,
+    writeTo: (java.io.OutputStream) -> Unit,
+): Uri? = runCatching {
+    val base = context.getExternalFilesDir(externalType) ?: File(context.filesDir, "exports")
+    val dir = File(base, "CapCraft").apply { mkdirs() }
+    val dest = File(dir, name)
+    dest.outputStream().buffered().use { out ->
+        writeTo(out)
+        out.flush()
+    }
+    if (!dest.isFile || dest.length() <= 0L) {
+        dest.delete()
+        return@runCatching null
+    }
+    runCatching { android.media.MediaScannerConnection.scanFile(context, arrayOf(dest.absolutePath), arrayOf(mime), null) }
+    androidx.core.content.FileProvider.getUriForFile(context, "${context.packageName}.files", dest)
 }.getOrNull()
+
+/** Saves a still as a JPEG in Pictures/CapCraft. */
+private fun publishPhoto(context: Context, picture: Bitmap): Uri? {
+    val name = "CapCraft_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
+    val writer: (java.io.OutputStream) -> Unit = { out ->
+        if (!picture.compress(Bitmap.CompressFormat.JPEG, 95, out)) {
+            throw java.io.IOException("JPEG compression failed")
+        }
+    }
+    return writeMediaStore(
+        context,
+        MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+        name,
+        "image/jpeg",
+        Environment.DIRECTORY_PICTURES + "/CapCraft",
+        writer,
+    ) ?: fallbackFileUri(context, name, "image/jpeg", Environment.DIRECTORY_PICTURES, writer)
+}
 
 /** Copies a finished GIF into Pictures/CapCraft and deletes the cache copy. */
-private fun publishGif(context: Context, file: File): Uri? = runCatching {
-    val values = ContentValues().apply {
-        put(MediaStore.Images.Media.DISPLAY_NAME, file.name)
-        put(MediaStore.Images.Media.MIME_TYPE, "image/gif")
-        put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/CapCraft")
-        put(MediaStore.Images.Media.IS_PENDING, 1)
+private fun publishGif(context: Context, file: File): Uri? {
+    if (!file.isFile || file.length() <= 0L) return null
+    val writer: (java.io.OutputStream) -> Unit = { out ->
+        file.inputStream().use { it.copyTo(out, 1 shl 16) }
     }
-    val resolver = context.contentResolver
-    val uri = resolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)
-        ?: return@runCatching null
-    resolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out, 1 shl 16) } }
-    values.clear()
-    values.put(MediaStore.Images.Media.IS_PENDING, 0)
-    resolver.update(uri, values, null, null)
-    file.delete()
-    uri
-}.getOrNull()
+    val uri = writeMediaStore(
+        context,
+        MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+        file.name,
+        "image/gif",
+        Environment.DIRECTORY_PICTURES + "/CapCraft",
+        writer,
+    ) ?: fallbackFileUri(context, file.name, "image/gif", Environment.DIRECTORY_PICTURES, writer)
+    if (uri != null) file.delete()
+    return uri
+}
 
 /** Copies the finished file into Movies/CapCraft and deletes the cache copy. */
-private fun publish(context: Context, file: File): Uri? = runCatching {
-    val values = ContentValues().apply {
-        put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
-        put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-        put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/CapCraft")
-        put(MediaStore.Video.Media.IS_PENDING, 1)
+private fun publish(context: Context, file: File): Uri? {
+    if (!file.isFile || file.length() <= 0L) return null
+    val writer: (java.io.OutputStream) -> Unit = { out ->
+        file.inputStream().use { it.copyTo(out, 1 shl 16) }
     }
-    val resolver = context.contentResolver
-    val uri = resolver.insert(MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)
-        ?: return@runCatching null
-    resolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out, 1 shl 16) } }
-    values.clear()
-    values.put(MediaStore.Video.Media.IS_PENDING, 0)
-    resolver.update(uri, values, null, null)
-    file.delete()
-    uri
-}.getOrNull()
+    val uri = writeMediaStore(
+        context,
+        MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+        file.name,
+        "video/mp4",
+        Environment.DIRECTORY_MOVIES + "/CapCraft",
+        writer,
+    ) ?: fallbackFileUri(context, file.name, "video/mp4", Environment.DIRECTORY_MOVIES, writer)
+    if (uri != null) file.delete()
+    return uri
+}
 
 private fun share(context: Context, uri: Uri) {
     val send = Intent(Intent.ACTION_SEND).apply {
@@ -393,5 +459,7 @@ private fun share(context: Context, uri: Uri) {
         putExtra(Intent.EXTRA_STREAM, uri)
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
-    context.startActivity(Intent.createChooser(send, null))
+    runCatching {
+        context.startActivity(Intent.createChooser(send, null).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }
 }
