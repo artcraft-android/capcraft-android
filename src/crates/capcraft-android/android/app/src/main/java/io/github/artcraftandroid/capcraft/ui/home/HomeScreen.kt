@@ -396,7 +396,7 @@ fun HomeScreen(
                         onShowTrash = { showingTrash = it; managing = null },
                         onTrashMenu = { trashMenu = it },
                     )
-                    else -> MeTab(onLicences = { licences = true }, onAbout = { about = true }, onCleared = { message = it })
+                    else -> SettingsTab(onLicences = { licences = true }, onAbout = { about = true }, onCleared = { message = it })
                 }
             }
             val picked = managing
@@ -997,7 +997,7 @@ private fun BottomBar(tab: Int, latest: ProjectSummary?, onTab: (Int) -> Unit) {
             listOf(
                 Triple("Edit", LucideIcons.Scissors, 0),
                 Triple("Projects", LucideIcons.Folder, 1),
-                Triple("Me", LucideIcons.UserRound, 2),
+                Triple("Settings", LucideIcons.Settings, 2),
             ).forEach { (label, icon, i) ->
                 val on = tab == i
                 Column(
@@ -1024,11 +1024,11 @@ private fun BottomBar(tab: Int, latest: ProjectSummary?, onTab: (Int) -> Unit) {
     }
 }
 
-// ── Me ──
+// ── Settings ──
 
 /** The app's settings: one tall row a setting, its value or a chevron at the right. */
 @Composable
-private fun MeTab(onLicences: () -> Unit, onAbout: () -> Unit, onCleared: (String) -> Unit) {
+private fun SettingsTab(onLicences: () -> Unit, onAbout: () -> Unit, onCleared: (String) -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val version = remember { appVersion(context) }
