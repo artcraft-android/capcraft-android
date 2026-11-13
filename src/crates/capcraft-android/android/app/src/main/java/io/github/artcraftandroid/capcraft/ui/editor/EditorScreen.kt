@@ -149,6 +149,29 @@ fun EditorScreen(path: String, incoming: List<Uri>, then: String? = null, close:
         }
     }
 
+    // Track non-blocking background clip preparation (scrub copies + full audio cache).
+    LaunchedEffect(vm.session, vm.timeline?.revision) {
+        if (vm.session == null) {
+            vm.preparingMedia = false
+            return@LaunchedEffect
+        }
+        var idlePolls = 0
+        while (isActive) {
+            val active = withContext(Threads.thumbnails) {
+                runCatching { io.github.artcraftandroid.capcraft.core.isPreparingMedia() }.getOrDefault(false)
+            }
+            vm.preparingMedia = active
+            if (active) {
+                idlePolls = 0
+                delay(350)
+            } else {
+                idlePolls++
+                if (idlePolls >= 5) break
+                delay(350)
+            }
+        }
+    }
+
     // how far above the screen's foot the preview ends: a notice shows just above it, as the reference's do
     var belowPreview by remember { mutableStateOf(0f) }
     val density = androidx.compose.ui.platform.LocalDensity.current
@@ -301,6 +324,25 @@ fun Preview(vm: EditorViewModel, modifier: Modifier) {
         }
         if (t.rows.all { it.clips.isEmpty() }) {
             Text("Add media to start editing", style = Type.Small)
+        }
+        if (vm.preparingMedia && !vm.fullscreen) {
+            Row(
+                Modifier
+                    .align(Alignment.TopStart)
+                    .padding(10.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(Palette.Panel.copy(alpha = 0.84f))
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircularProgressIndicator(
+                    color = Palette.Accent,
+                    modifier = Modifier.size(12.dp),
+                    strokeWidth = 1.6.dp,
+                )
+                Spacer(Modifier.width(7.dp))
+                Text("Optimizing clip…", style = Type.Small.copy(fontSize = 11.sp))
+            }
         }
     }
 }

@@ -83,6 +83,10 @@ const DISK_CACHE_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 /// without letting a scrubbed trim fan out a dozen full-file decodes.
 const DECODE_WORKERS: usize = 2;
 
+/// Seconds decoded ahead of a long span's full decode so initial playback
+/// has sound within tens of milliseconds while the rest caches behind it.
+const HEAD_SECONDS: f64 = 4.0;
+
 /// One key of a clip's gain ride, as a spec carries it.
 ///
 /// The engine's `animate::Key` in a shape serde can read: the same three
@@ -528,6 +532,9 @@ struct Shared {
     /// show. Above 1.0 is a mix that clipped.
     peak_left: AtomicU32,
     peak_right: AtomicU32,
+    /// Incremented on every output callback so the supervisor can detect an
+    /// OS stream that suspended silently without firing its error handler.
+    callbacks: AtomicU64,
 }
 
 /// The longest the clock runs on past the callback's last word. A callback
@@ -545,6 +552,7 @@ impl Shared {
             muted: AtomicBool::new(false),
             peak_left: AtomicU32::new(0),
             peak_right: AtomicU32::new(0),
+            callbacks: AtomicU64::new(0),
         }
     }
 
@@ -892,6 +900,16 @@ impl Playback {
         self.shared.muted.store(muted, Ordering::Relaxed);
     }
 
+    /// The project folder whose clips currently own the player, if any.
+    pub fn project_path(&self) -> Option<PathBuf> {
+        locked(&self.project).clone()
+    }
+
+    /// Whether any audible clip spans are still decoding in the background.
+    pub fn is_preparing(&self) -> bool {
+        !locked(&self.decoding).is_empty()
+    }
+
     /// Replaces the audible clip set.
     ///
     /// Anything already decoded plays immediately; anything new joins the
@@ -1067,10 +1085,19 @@ fn decode_worker(playback: &Arc<Playback>) {
         }
 
         let within = copy_source(&locked(&playback.cache), &job.spec);
+        let head_key = if within.is_none() {
+            publish_head(playback, &job)
+        } else {
+            None
+        };
         match decode(&job.spec, &job.project, &job.key, within) {
             Ok(pcm) => {
                 let now = playback.tick.fetch_add(1, Ordering::Relaxed) + 1;
-                locked(&playback.cache).insert(
+                let mut cache = locked(&playback.cache);
+                if let Some(ref temporary) = head_key {
+                    cache.remove(temporary);
+                }
+                cache.insert(
                     job.key.clone(),
                     CacheEntry {
                         pcm: Arc::new(pcm),
@@ -1079,14 +1106,84 @@ fn decode_worker(playback: &Arc<Playback>) {
                     },
                 );
             }
-            Err(error) => report(
-                playback.events.as_ref(),
-                format!("audio decode failed for {}: {error}", job.spec.path),
-            ),
+            Err(error) => {
+                if let Some(ref temporary) = head_key {
+                    locked(&playback.cache).remove(temporary);
+                }
+                report(
+                    playback.events.as_ref(),
+                    format!("audio decode failed for {}: {error}", job.spec.path),
+                );
+            }
+        }
+        if let Some(temporary) = head_key {
+            let path = job
+                .project
+                .join("cache")
+                .join("audio")
+                .join(format!("{temporary}.wav"));
+            let _ = std::fs::remove_file(path);
         }
         locked(&playback.decoding).remove(&job.key);
         playback.resync();
     }
+}
+
+/// Slice of `spec` near `playhead` decoded ahead of a long span so pressing
+/// Play right after importing or opening an uncached clip produces immediate
+/// sound through [`stand_in`] while the full WAV caches behind it.
+fn head_slice(spec: &ClipSpec, playhead: f64) -> Option<ClipSpec> {
+    if spec.bus.is_some() || spec.duration <= HEAD_SECONDS + 1.0 {
+        return None;
+    }
+    let speed = concat_media::audio::clamp_speed(spec.speed);
+    let offset = if playhead > spec.start && playhead < spec.start + spec.duration - 0.25 {
+        playhead - spec.start
+    } else {
+        0.0
+    };
+    let duration = HEAD_SECONDS.min(spec.duration - offset);
+    if duration <= 0.05 {
+        return None;
+    }
+    let mut head = spec.clone();
+    head.start = spec.start + offset;
+    head.source_start = spec.source_start + offset * speed;
+    head.duration = duration;
+    Some(head)
+}
+
+/// Decodes and publishes a short stand-in slice for `job` when nothing in
+/// the cache covers it yet and its full `.wav` is not already on disk.
+fn publish_head(playback: &Arc<Playback>, job: &DecodeJob) -> Option<String> {
+    let head = head_slice(&job.spec, playback.position())?;
+    let destination = job
+        .project
+        .join("cache")
+        .join("audio")
+        .join(format!("{}.wav", job.key));
+    if destination.is_file() {
+        return None;
+    }
+    if stand_in(&locked(&playback.cache), &head).is_some() {
+        return None;
+    }
+    let head_key = format!("{}.head", job.key);
+    let mut reach = Reach::of(&head)?;
+    // Never treat the short preview slice as a whole-clip copy source.
+    reach.plain = false;
+    let pcm = decode(&head, &job.project, &head_key, None).ok()?;
+    let now = playback.tick.fetch_add(1, Ordering::Relaxed) + 1;
+    locked(&playback.cache).insert(
+        head_key.clone(),
+        CacheEntry {
+            pcm: Arc::new(pcm),
+            last_used: now,
+            reach: Some(reach),
+        },
+    );
+    playback.resync();
+    Some(head_key)
 }
 
 /// Which files a sweep of `directory` should delete to fit `budget` bytes:
@@ -1106,9 +1203,9 @@ fn sweep_plan(directory: &Path, live: &HashSet<String>, budget: u64) -> Option<V
         let name = entry.file_name().to_string_lossy().into_owned();
         let Ok(meta) = entry.metadata() else { continue };
 
-        // A `.decoding` file is a crashed or torn run once it is old enough
-        // that no live decode can still be writing it.
-        if name.ends_with(".decoding") {
+        // A `.decoding` or `.head.wav` file is a crashed or torn run once it
+        // is old enough that no live decode can still be writing it.
+        if name.ends_with(".decoding") || name.ends_with(".head.wav") {
             let stale = meta
                 .modified()
                 .ok()
@@ -1454,6 +1551,8 @@ fn supervise_stream(
                 // in system settings).
                 let failed = stream.failed;
                 let _stream = stream.stream;
+                let mut last_callbacks = shared.callbacks.load(Ordering::Relaxed);
+                let mut silent_ticks: u32 = 0;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(1000));
                     if failed.load(Ordering::Relaxed) {
@@ -1462,6 +1561,19 @@ fn supervise_stream(
                             "audio stream failed; rebuilding".to_owned(),
                         );
                         break;
+                    }
+                    let now_callbacks = shared.callbacks.load(Ordering::Relaxed);
+                    if now_callbacks == last_callbacks {
+                        silent_ticks += 1;
+                        // Rebuild if the OS suspended the stream callback while
+                        // playback is rolling (or for >2s when idle).
+                        if shared.playing.load(Ordering::Relaxed) || silent_ticks >= 2 {
+                            log::warn!("audio stream callback stalled; rebuilding");
+                            break;
+                        }
+                    } else {
+                        last_callbacks = now_callbacks;
+                        silent_ticks = 0;
                     }
                     let current = cpal::default_host()
                         .default_output_device()
@@ -1579,6 +1691,7 @@ where
         .build_output_stream(
             config,
             move |data: &mut [T], _| {
+                shared.callbacks.fetch_add(1, Ordering::Relaxed);
                 let mut sought = false;
                 // try_lock, not lock: the audio callback must never block.
                 // Contention only exists while the supervisor swaps streams,
@@ -2200,5 +2313,58 @@ mod tests {
         assert!(sweep_plan(&directory.join("missing"), &live, 8).is_none());
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_long_clip_publishes_its_head_slice_before_the_full_decode() {
+        let dir = std::env::temp_dir().join(format!("concat-head-slice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let rate = super::PCM_RATE;
+        let mut data = Vec::with_capacity(rate as usize * 8 * 4);
+        for index in 0..rate * 8 {
+            let t = f64::from(index) / f64::from(rate);
+            let value = (0.4 * (2.0 * std::f64::consts::PI * 330.0 * t).sin() * 32767.0) as i16;
+            data.extend_from_slice(&value.to_le_bytes());
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let source = dir.join("long.wav");
+        {
+            let mut file = std::fs::File::create(&source).expect("creates");
+            let mut writer = super::WavWriter::start(&mut file).expect("starts");
+            writer.write(&mut file, &data).expect("writes");
+            writer.finish(&mut file).expect("finishes");
+        }
+
+        let spec = tone_spec(&source, 0.0, 8.0);
+        let playback = std::sync::Arc::new(idle(std::collections::HashMap::new()));
+        playback.set_clips(dir.clone(), vec![spec.clone()]);
+        assert!(
+            playback.is_preparing(),
+            "queued span marks player preparing"
+        );
+        assert!(
+            super::locked(&playback.last_active).is_empty(),
+            "uncached before worker runs"
+        );
+
+        let job = super::locked(&playback.queue.jobs)
+            .pop_back()
+            .expect("queued job");
+        let head_key = super::publish_head(&playback, &job).expect("head slice published");
+        {
+            let active = super::locked(&playback.last_active);
+            assert_eq!(active.len(), 1, "head slice immediately makes clip audible");
+            assert_eq!(active[0].lead, 0);
+            assert!(active[0].pcm.sample(1_200, 0).abs() > 0.01);
+        }
+        assert!(
+            super::copy_source(&super::locked(&playback.cache), &spec).is_none(),
+            "head slice is never mistaken for a full-clip copy source"
+        );
+
+        let _ = head_key;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

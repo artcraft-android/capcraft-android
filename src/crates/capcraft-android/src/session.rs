@@ -476,6 +476,11 @@ impl MobileSession {
         self.lock().session.path().to_owned()
     }
 
+    /// Ensures the singleton audio player carries this session's audible clips.
+    pub fn sync_playback(&self) {
+        crate::playback::sync(&self.lock().session);
+    }
+
     /// The timeline as it stands.
     pub fn view(&self) -> TimelineView {
         Self::view_of(&self.lock())

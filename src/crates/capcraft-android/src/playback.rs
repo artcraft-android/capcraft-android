@@ -9,10 +9,10 @@
 //! Whatever the open session makes audible is handed to the player after
 //! every edit ([`sync`]), so play always sounds like the timeline.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use concat_host::playback::{ClipSpec, GainKey, Playback, PlaybackEvents};
+use concat_host::playback::{Playback, PlaybackEvents};
 use concat_host::session::Session;
 
 use crate::{MobileError, context, micros, seconds};
@@ -113,53 +113,11 @@ pub(crate) fn sync(session: &Session) {
             Err(_) => return,
         },
     };
-    let specs = specs(session);
+    let specs = concat_host::playback::audible(&session.flattened_clips());
     let path = PathBuf::from(session.path());
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         player.set_clips(path, specs)
     }));
-}
-
-/// The clips a session makes audible, as the player takes them: through the
-/// exporter's own cut into pieces, so a speed curve sounds as it will in
-/// the file.
-fn specs(session: &Session) -> Vec<ClipSpec> {
-    session
-        .flattened_clips()
-        .iter()
-        .filter(|clip| {
-            !clip.muted
-                && (clip.kind == concat_export::ClipKind::Audio
-                    || (clip.kind == concat_export::ClipKind::Video
-                        && clip.has_audio.unwrap_or(true)))
-        })
-        .flat_map(concat_export::audio_pieces)
-        .map(|piece| ClipSpec {
-            // a file of the timeline's, not a mix under sound layers
-            bus: None,
-            path: piece.path.to_string_lossy().into_owned(),
-            audio_stream: piece.stream.map(|index| index as u32),
-            start: piece.start,
-            duration: piece.duration,
-            source_start: piece.source_start,
-            volume: piece.volume as f32,
-            volume_curve: piece
-                .volume_curve
-                .keys()
-                .iter()
-                .map(|key| GainKey {
-                    at: key.at,
-                    gain: key.value,
-                    ease: [key.ease.x1, key.ease.y1, key.ease.x2, key.ease.y2],
-                })
-                .collect(),
-            fade_in: piece.fade_in,
-            fade_out: piece.fade_out,
-            speed: piece.speed,
-            preserve_pitch: piece.preserve_pitch,
-            chain: piece.filter_chain,
-        })
-        .collect()
 }
 
 /// Tells `listener` about the player's failures from now on.
@@ -219,6 +177,27 @@ pub fn set_muted(muted: bool) {
 pub fn clear_playback() {
     if let Some(player) = running() {
         player.pause();
+        player.set_muted(false);
         player.set_clips(PathBuf::new(), Vec::new());
     }
+}
+
+/// Clears the player only when `project_path` still owns it, so a previous
+/// editor's teardown cannot wipe a newly opened project's audio clips.
+#[uniffi::export]
+pub fn clear_playback_for(project_path: String) {
+    if let Some(player) = running()
+        && player.project_path().as_deref() == Some(Path::new(&project_path))
+    {
+        player.pause();
+        player.set_muted(false);
+        player.set_clips(PathBuf::new(), Vec::new());
+    }
+}
+
+/// Whether background clip preparation (scrub copies or audio caches) is
+/// running.
+#[uniffi::export]
+pub fn is_preparing_media() -> bool {
+    concat_host::scrub::is_busy() || running().is_some_and(|player| player.is_preparing())
 }
