@@ -426,9 +426,13 @@ impl ColorSignal {
     /// the way in, or they arrive flat, dim and the wrong colour - the
     /// 10-bit PQ file from a phone, decoded as if it were a 709 one.
     pub fn is_wide(&self) -> bool {
-        use ffmpeg::color::{Primaries, TransferCharacteristic as Transfer};
+        use ffmpeg::color::{Primaries, Space, TransferCharacteristic as Transfer};
         matches!(self.transfer, Transfer::SMPTE2084 | Transfer::ARIB_STD_B67)
-            || self.primaries == Primaries::BT2020
+            || matches!(self.primaries, Primaries::BT2020 | Primaries::SMPTE432)
+            || matches!(
+                self.matrix,
+                Space::BT2020NCL | Space::BT2020CL | Space::ICTCP
+            )
     }
 
     /// Whether the transfer is a high dynamic range one: PQ or HLG.
@@ -448,6 +452,9 @@ impl ColorSignal {
             Primaries::BT2020 => "bt2020",
             Primaries::BT709 => "bt709",
             Primaries::SMPTE432 => "smpte432",
+            Primaries::SMPTE431 => "smpte431",
+            Primaries::SMPTE170M => "smpte170m",
+            Primaries::BT470BG => "bt470bg",
             _ => "auto",
         };
         let transfer = match self.transfer {
@@ -456,12 +463,19 @@ impl ColorSignal {
             Transfer::BT2020_10 => "bt2020-10",
             Transfer::BT2020_12 => "bt2020-12",
             Transfer::BT709 => "bt709",
+            Transfer::IEC61966_2_1 => "iec61966-2-1",
+            Transfer::Linear => "linear",
             _ => "auto",
         };
         let matrix = match self.matrix {
             Space::BT2020NCL => "bt2020nc",
-            Space::BT2020CL => "bt2020c",
             Space::BT709 => "bt709",
+            Space::SMPTE170M => "smpte170m",
+            Space::BT470BG => "bt470bg",
+            Space::SMPTE240M => "smpte240m",
+            Space::FCC => "fcc",
+            // Named constants in vf_scale stop here; "auto" lets swscale
+            // read the frame's own AVColorSpace (ICtCp, BT.2020 CL, YCgCo).
             _ => "auto",
         };
         let range = match self.range {
@@ -478,15 +492,23 @@ impl ColorSignal {
 
     /// What a deep frame of this source says it holds, when the source is
     /// one the compositor converts on the GPU: Rec. 2020 primaries, with
-    /// PQ, HLG or a gamma. `None` for anything else - a P3 source, say -
-    /// which keeps the eight-bit conversion here.
+    /// PQ, HLG or a gamma. `None` for anything else - a P3 or ICtCp source,
+    /// say - which keeps the eight-bit conversion here.
     pub fn deep_signal(&self) -> Option<Signal> {
-        use ffmpeg::color::{Primaries, TransferCharacteristic as Transfer};
+        use ffmpeg::color::{Primaries, Space, TransferCharacteristic as Transfer};
+        if self.primaries != Primaries::BT2020 {
+            return None;
+        }
+        if !matches!(
+            self.matrix,
+            Space::BT2020NCL | Space::BT2020CL | Space::Unspecified
+        ) {
+            return None;
+        }
         match self.transfer {
             Transfer::SMPTE2084 => Some(Signal::Pq),
             Transfer::ARIB_STD_B67 => Some(Signal::Hlg),
-            _ if self.primaries == Primaries::BT2020 => Some(Signal::SdrWide),
-            _ => None,
+            _ => Some(Signal::SdrWide),
         }
     }
 
@@ -496,7 +518,7 @@ impl ColorSignal {
     fn native_args(self) -> String {
         use ffmpeg::color::{Range, Space};
         let matrix = match self.matrix {
-            Space::BT2020CL => "bt2020c",
+            Space::BT2020CL => "auto",
             Space::BT709 => "bt709",
             _ => "bt2020nc",
         };
@@ -511,8 +533,17 @@ impl ColorSignal {
 /// The signal a deep frame is decoded in, when `options` asks for one and
 /// the source is one the compositor converts: nothing in the decoder's
 /// graph may need eight bits, so no chain and no pre-chain.
+///
+/// On Android the preview and export targets are eight-bit SDR, and some
+/// Vulkan drivers (e.g. Adreno 830 on Android 17, #28) mis-sample the
+/// sixteen-bit integer upload texture, so wide and HDR sources convert
+/// cleanly through swscale's perceptual BT.709 tone-map instead.
 fn deep_output(options: &DecodeOptions, color: Option<&ColorSignal>) -> Option<Signal> {
-    if !options.deep || options.filter_chain.is_some() || options.pre_chain.is_some() {
+    if cfg!(target_os = "android")
+        || !options.deep
+        || options.filter_chain.is_some()
+        || options.pre_chain.is_some()
+    {
         return None;
     }
     color?.deep_signal()
@@ -689,10 +720,9 @@ impl Decoder {
         let drawn = crate::svg::readable(path.as_ref())?;
         let path = drawn.as_path();
         let input = ffmpeg::format::input(path).map_err(|error| ffi::fail("open", path, error))?;
-        let stream =
-            crate::probe::picture_stream(&input).ok_or_else(|| Error::NoVideoStream {
-                path: path.to_path_buf(),
-            })?;
+        let stream = crate::probe::picture_stream(&input).ok_or_else(|| Error::NoVideoStream {
+            path: path.to_path_buf(),
+        })?;
         let stream_index = stream.index();
         let time_base = stream.time_base();
         let start = ffi::origin(&input);
@@ -1559,10 +1589,19 @@ fn first_picture_within(path: &Path, name: &'static str, wait: std::time::Durati
     let tried = std::thread::Builder::new()
         .name("mediacodec-first-picture".to_owned())
         .spawn(move || {
-            let attempt = || -> Option<()> {
+            let attempt = || -> Option<bool> {
                 let mut input = ffmpeg::format::input(&path).ok()?;
-                let (mut codec, index) = {
+                let (mut codec, index, color) = {
                     let stream = crate::probe::picture_stream(&input)?;
+                    let color = unsafe {
+                        let raw = stream.parameters().as_ptr();
+                        (
+                            ffmpeg::color::Primaries::from((*raw).color_primaries),
+                            ffmpeg::color::TransferCharacteristic::from((*raw).color_trc),
+                            ffmpeg::color::Space::from((*raw).color_space),
+                            ffmpeg::color::Range::from((*raw).color_range),
+                        )
+                    };
                     let (codec, _) = Decoder::open_codec(
                         &path,
                         &stream,
@@ -1570,15 +1609,18 @@ fn first_picture_within(path: &Path, name: &'static str, wait: std::time::Durati
                         Codec::Named(name),
                     )
                     .ok()?;
-                    (codec, stream.index())
+                    (codec, stream.index(), color)
                 };
                 let mut held = None;
                 let read = || feed::read_packet(&mut input, index);
-                feed::next_frame(&mut codec, &mut held, read)
-                    .ok()?
-                    .map(|_| ())
+                let mut picture = feed::next_frame(&mut codec, &mut held, read).ok()??;
+                picture.set_color_primaries(color.0);
+                picture.set_color_transfer_characteristic(color.1);
+                picture.set_color_space(color.2);
+                picture.set_color_range(color.3);
+                Some(picture_matches_software(&path, name, &picture))
             };
-            let works = attempt().is_some();
+            let works = attempt().unwrap_or(false);
             let _ = answer.send(works);
             // Late or not, what it found is the verdict from now on: a
             // decoder that was only slow to start is not written off for
@@ -1586,6 +1628,87 @@ fn first_picture_within(path: &Path, name: &'static str, wait: std::time::Durati
             hardware::mediacodec_answered(name, works);
         });
     tried.is_ok() && answered.recv_timeout(wait).unwrap_or(false)
+}
+
+/// Checks that MediaCodec's first decoded frame is not colour-corrupted
+/// relative to FFmpeg's own software decoder for the same stream (#28).
+/// When FFmpeg carries no software decoder for the codec (e.g. AV1), the
+/// hardware picture is accepted as-is.
+fn picture_matches_software(path: &Path, name: &str, hw: &Video) -> bool {
+    let Ok(mut input) = ffmpeg::format::input(path) else {
+        return true;
+    };
+    let Some((mut sw_codec, index)) = (|| {
+        let stream = crate::probe::picture_stream(&input)?;
+        let (codec, _) =
+            Decoder::open_codec(path, &stream, &DecodeOptions::default(), Codec::Software).ok()?;
+        Some((codec, stream.index()))
+    })() else {
+        return true;
+    };
+    let mut held = None;
+    let read = || feed::read_packet(&mut input, index);
+    let Ok(Some(sw)) = feed::next_frame(&mut sw_codec, &mut held, read) else {
+        return true;
+    };
+    let (Some(hw_rgb), Some(sw_rgb)) = (tiny_rgba(hw), tiny_rgba(&sw)) else {
+        return true;
+    };
+    let diff = mean_rgb_diff(&hw_rgb, &sw_rgb);
+    if diff > 28.0 {
+        log::warn!(
+            "MediaCodec's {name} distorted colours on {} (mean RGB diff {diff:.1}); decoding in software",
+            path.display()
+        );
+        return false;
+    }
+    true
+}
+
+fn tiny_rgba(frame: &Video) -> Option<Vec<u8>> {
+    const SIDE: u32 = 32;
+    if frame.width() == 0 || frame.height() == 0 || frame.format() == Pixel::None {
+        return None;
+    }
+    let mut scaler = ffmpeg::software::scaling::Context::get(
+        frame.format(),
+        frame.width(),
+        frame.height(),
+        Pixel::RGBA,
+        SIDE,
+        SIDE,
+        ffmpeg::software::scaling::Flags::BILINEAR,
+    )
+    .ok()?;
+    let mut out = Video::empty();
+    scaler.run(frame, &mut out).ok()?;
+    let stride = out.stride(0);
+    let data = out.data(0);
+    let row = SIDE as usize * 4;
+    let mut packed = Vec::with_capacity(row * SIDE as usize);
+    for y in 0..SIDE as usize {
+        packed.extend_from_slice(&data[y * stride..y * stride + row]);
+    }
+    Some(packed)
+}
+
+fn mean_rgb_diff(a: &[u8], b: &[u8]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for (pa, pb) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        sum += u64::from(pa[0].abs_diff(pb[0]))
+            + u64::from(pa[1].abs_diff(pb[1]))
+            + u64::from(pa[2].abs_diff(pb[2]));
+        count += 3;
+    }
+    if count == 0 {
+        0.0
+    } else {
+        sum as f32 / count as f32
+    }
 }
 
 /// A second reference to `frame`'s picture: the same buffers, counted,
@@ -2522,5 +2645,67 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(frames.len(), 30);
         assert_ne!(decoder.hardware(), Some(absent));
+    }
+
+    #[test]
+    fn non_bt2020_hdr_and_ictcp_convert_through_bt709_rather_than_deep() {
+        use ffmpeg::color::{Primaries, Range, Space, TransferCharacteristic as Transfer};
+
+        // Display P3 + PQ must NOT be treated as Rec. 2020 deep upload.
+        let p3_pq = ColorSignal {
+            primaries: Primaries::SMPTE432,
+            transfer: Transfer::SMPTE2084,
+            matrix: Space::BT709,
+            range: Range::MPEG,
+            implied: false,
+        };
+        assert!(p3_pq.is_wide());
+        assert_eq!(p3_pq.deep_signal(), None);
+        let filter = video_filter(
+            0,
+            &DecodeOptions::default().scaled_to(640, 360).deep(true),
+            640,
+            360,
+            Some(&p3_pq),
+        );
+        assert!(filter.contains(":out_color_matrix=bt709:"), "{filter}");
+        assert!(filter.ends_with(",format=rgba"), "{filter}");
+
+        // Dolby Vision ICtCp must convert through bt709 (in_color_matrix=auto reads AVCOL_SPC_ICTCP), never bt2020nc deep upload.
+        let dovi = ColorSignal {
+            primaries: Primaries::BT2020,
+            transfer: Transfer::SMPTE2084,
+            matrix: Space::ICTCP,
+            range: Range::MPEG,
+            implied: false,
+        };
+        assert!(dovi.is_wide());
+        assert_eq!(dovi.deep_signal(), None);
+        let dovi_filter = video_filter(
+            0,
+            &DecodeOptions::default().scaled_to(640, 360).deep(true),
+            640,
+            360,
+            Some(&dovi),
+        );
+        assert!(
+            dovi_filter.contains(":in_color_matrix=auto:"),
+            "{dovi_filter}"
+        );
+        assert!(
+            dovi_filter.contains(":out_color_matrix=bt709:"),
+            "{dovi_filter}"
+        );
+        assert!(dovi_filter.ends_with(",format=rgba"), "{dovi_filter}");
+
+        // True Rec. 2020 PQ keeps its deep signal on non-Android hosts.
+        let bt2020_pq = ColorSignal {
+            primaries: Primaries::BT2020,
+            transfer: Transfer::SMPTE2084,
+            matrix: Space::BT2020NCL,
+            range: Range::MPEG,
+            implied: false,
+        };
+        assert_eq!(bt2020_pq.deep_signal(), Some(Signal::Pq));
     }
 }
