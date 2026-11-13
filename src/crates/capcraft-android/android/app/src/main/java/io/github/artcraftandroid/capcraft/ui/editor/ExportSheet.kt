@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -40,6 +41,8 @@ import io.github.artcraftandroid.capcraft.ui.MaterialIcons
 import io.github.artcraftandroid.capcraft.ui.Palette
 import io.github.artcraftandroid.capcraft.ui.Type
 import io.github.artcraftandroid.capcraft.ui.editor.panels.Tabs
+import io.github.artcraftandroid.capcraft.ui.i18n.tr
+import io.github.artcraftandroid.capcraft.ui.i18n.trf
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.ln
@@ -105,26 +108,26 @@ fun ExportSheet(vm: EditorViewModel, onExport: () -> Unit) {
                 }
                 Spacer(Modifier.width(9.dp))
                 Box(
-                    Modifier.height(32.dp).width(65.dp).clip(RoundedCornerShape(6.dp)).background(Palette.Accent)
-                        .clickable { vm.exportSheet = false; onExport() },
+                    Modifier.height(32.dp).defaultMinSize(minWidth = 65.dp).clip(RoundedCornerShape(6.dp)).background(Palette.Accent)
+                        .clickable { vm.exportSheet = false; onExport() }.padding(horizontal = 12.dp),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Text("Export", style = Type.BodyStrong.copy(color = Palette.OnAccent, fontSize = 15.sp, fontWeight = FontWeight.Medium))
+                    Text(tr("Export"), style = Type.BodyStrong.copy(color = Palette.OnAccent, fontSize = 15.sp, fontWeight = FontWeight.Medium), maxLines = 1)
                 }
                 Spacer(Modifier.width(16.dp))
             }
             if (vm.exportGif) {
                 val size = GIF_SIZES.indexOf(vm.gifSize).coerceAtLeast(0)
-                SettingSlider("Resolution", "Smaller files load faster", GIF_SIZES.map { "${it}p" }, size.toFloat()) {
+                SettingSlider(tr("Resolution"), tr("Smaller files load faster"), GIF_SIZES.map { "${it}p" }, size.toFloat()) {
                     vm.gifSize = GIF_SIZES[it.roundToInt().coerceIn(0, GIF_SIZES.size - 1)]
                 }
                 val rate = GIF_RATES.indexOf(vm.gifFps).coerceAtLeast(0)
-                SettingSlider("Frame rate", "More pictures, smoother motion", GIF_RATES.map { "$it" }, rate.toFloat()) {
+                SettingSlider(tr("Frame rate"), tr("More pictures, smoother motion"), GIF_RATES.map { "$it" }, rate.toFloat()) {
                     vm.gifFps = GIF_RATES[it.roundToInt().coerceIn(0, GIF_RATES.size - 1)]
                 }
                 Divider()
                 Text(
-                    "A looping picture without sound",
+                    tr("A looping picture without sound"),
                     style = Type.Small.copy(fontSize = 13.sp),
                     modifier = Modifier.align(Alignment.CenterHorizontally),
                 )
@@ -132,26 +135,26 @@ fun ExportSheet(vm: EditorViewModel, onExport: () -> Unit) {
             }
             val res = exportResolutionOf(vm)
             val r = RESOLUTIONS.indexOf(res).coerceAtLeast(0)
-            SettingSlider("Resolution", RESOLUTION_HINTS[r], RESOLUTION_LABELS, r.toFloat()) {
+            SettingSlider(tr("Resolution"), tr(RESOLUTION_HINTS[r]), RESOLUTION_LABELS, r.toFloat()) {
                 vm.exportResolution = RESOLUTIONS[it.roundToInt().coerceIn(0, RESOLUTIONS.size - 1)]
             }
             if (vm.exportPhoto) {
                 Divider()
                 Text(
-                    "The picture under the playhead, saved as a photo",
+                    tr("The picture under the playhead, saved as a photo"),
                     style = Type.Small.copy(fontSize = 13.sp),
                     modifier = Modifier.align(Alignment.CenterHorizontally),
                 )
                 return@Column
             }
             val f = FRAME_RATES.indexOf(vm.exportFps).coerceAtLeast(2)
-            SettingSlider("Frame rate", if (vm.exportFps >= 50) "Very smooth motion" else "Steady, everyday motion", FRAME_RATES.map { "$it" }, f.toFloat()) {
+            SettingSlider(tr("Frame rate"), tr(if (vm.exportFps >= 50) "Very smooth motion" else "Steady, everyday motion"), FRAME_RATES.map { "$it" }, f.toFloat()) {
                 vm.exportFps = FRAME_RATES[it.roundToInt().coerceIn(0, FRAME_RATES.size - 1)]
             }
             val dims = exportSize(t.width, t.height, res.toUInt())
             val suggested = (suggestedBitrateKbps(dims[0], dims[1], vm.exportFps.toUInt()).toInt() / 1000.0).roundToInt().coerceAtLeast(1)
             val mbps = vm.exportMbps ?: suggested
-            SettingSlider("Bitrate (Mbps)", "Suggested for this video: $suggested", MBPS.map { "$it" }, mbpsToPosition(mbps), continuous = true) {
+            SettingSlider(tr("Bitrate (Mbps)"), trf("Suggested for this video: %d", suggested), MBPS.map { "$it" }, mbpsToPosition(mbps), continuous = true) {
                 val chosen = positionToMbps(it)
                 // the suggestion is sticky, so it can be found again
                 vm.exportMbps = if (abs(chosen - suggested) <= max(1, suggested / 10)) null else chosen
@@ -160,7 +163,7 @@ fun ExportSheet(vm: EditorViewModel, onExport: () -> Unit) {
             val kbps = exportKbps(vm, dims[0].toInt(), dims[1].toInt())
             val mb = (kbps + 128) / 8.0 / 1000.0 * (t.durationUs / 1e6)
             Text(
-                "Estimated file size: %s MB".format(if (mb < 10) "%.1f".format(mb) else "${mb.roundToInt()}"),
+                trf("Estimated file size: %s MB", if (mb < 10) "%.1f".format(mb) else "${mb.roundToInt()}"),
                 style = Type.Small.copy(fontSize = 13.sp),
                 modifier = Modifier.align(Alignment.CenterHorizontally),
             )

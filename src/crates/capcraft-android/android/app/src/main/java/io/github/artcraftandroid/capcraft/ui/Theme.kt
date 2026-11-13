@@ -3,10 +3,16 @@ package io.github.artcraftandroid.capcraft.ui
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.sp
+import io.github.artcraftandroid.capcraft.ui.i18n.AppLanguage
+import io.github.artcraftandroid.capcraft.ui.i18n.LocalLanguagePack
 
 /** CapCraft's palette: a black editor with one cyan accent. */
 object Palette {
@@ -67,15 +73,28 @@ object Type {
 
 @Composable
 fun CapCraftTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = darkColorScheme(
-            primary = Palette.Accent,
-            onPrimary = Palette.OnAccent,
-            background = Palette.Black,
-            surface = Palette.Panel,
-            onSurface = Palette.Text,
-            onBackground = Palette.Text,
-        ),
-        content = content,
+    val context = LocalContext.current
+    AppLanguage.ensureLoaded(context)
+    val pack = AppLanguage.resolveActive(
+        id = AppLanguage.selectedId,
+        builtIns = AppLanguage.builtInPacks,
+        customs = AppLanguage.customPacks,
     )
+    val direction = if (pack.rtl) LayoutDirection.Rtl else LayoutDirection.Ltr
+    CompositionLocalProvider(
+        LocalLanguagePack provides pack,
+        LocalLayoutDirection provides direction,
+    ) {
+        MaterialTheme(
+            colorScheme = darkColorScheme(
+                primary = Palette.Accent,
+                onPrimary = Palette.OnAccent,
+                background = Palette.Black,
+                surface = Palette.Panel,
+                onSurface = Palette.Text,
+                onBackground = Palette.Text,
+            ),
+            content = content,
+        )
+    }
 }

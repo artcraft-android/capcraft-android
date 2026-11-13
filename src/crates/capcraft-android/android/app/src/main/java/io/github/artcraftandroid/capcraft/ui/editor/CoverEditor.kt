@@ -48,6 +48,7 @@ import io.github.artcraftandroid.capcraft.ui.common.MediaKinds
 import io.github.artcraftandroid.capcraft.ui.common.MediaPick
 import io.github.artcraftandroid.capcraft.ui.editor.panels.CapSlider
 import io.github.artcraftandroid.capcraft.ui.editor.panels.Tabs
+import io.github.artcraftandroid.capcraft.ui.i18n.tr
 import kotlin.math.roundToInt
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -106,7 +107,7 @@ fun CoverEditor(vm: EditorViewModel, onClose: () -> Unit) {
                 Glyph(LucideIcons.X, Palette.Text, size = 26.dp, description = "Close")
             }
             Spacer(Modifier.weight(1f))
-            Text("Reset", style = Type.Body, modifier = Modifier.clickable { at = 0; tab = 0 }.padding(12.dp))
+            Text(tr("Reset"), style = Type.Body, modifier = Modifier.clickable { at = 0; tab = 0 }.padding(12.dp))
             Box(
                 Modifier.padding(end = 12.dp).height(32.dp).clip(RoundedCornerShape(8.dp)).background(Palette.Accent)
                     .clickable {
@@ -138,7 +139,7 @@ fun CoverEditor(vm: EditorViewModel, onClose: () -> Unit) {
                     }
                     .padding(horizontal = 16.dp),
                 contentAlignment = Alignment.Center,
-            ) { Text("Save", style = Type.BodyStrong.copy(color = Palette.OnAccent)) }
+            ) { Text(tr("Save"), style = Type.BodyStrong.copy(color = Palette.OnAccent)) }
         }
         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
             val density = LocalDensity.current
@@ -166,7 +167,7 @@ fun CoverEditor(vm: EditorViewModel, onClose: () -> Unit) {
             )
         } else {
             Text(
-                "Choose another picture",
+                tr("Choose another picture"),
                 style = Type.Body.copy(color = Palette.Accent),
                 modifier = Modifier.clickable { pickAlbum() }.padding(horizontal = 20.dp, vertical = 18.dp),
             )

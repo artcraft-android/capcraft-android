@@ -57,6 +57,8 @@ import io.github.artcraftandroid.capcraft.ui.Type
 import io.github.artcraftandroid.capcraft.ui.common.MediaKinds
 import io.github.artcraftandroid.capcraft.ui.common.MediaPick
 import io.github.artcraftandroid.capcraft.ui.editor.panels.collage
+import io.github.artcraftandroid.capcraft.ui.i18n.AppLanguage
+import io.github.artcraftandroid.capcraft.ui.i18n.tr
 
 /** One tool of the bottom bar. */
 data class Tool(
@@ -86,7 +88,7 @@ private fun multiTools(vm: EditorViewModel): List<Tool> {
             vm.edit { delete(chosen.toList()) }
             vm.chosen = null
         },
-        Tool("deselect", if (chosen.isEmpty()) "Deselect all" else "Deselect all (${chosen.size})", LucideIcons.SquareCheckBig) { vm.chosen = null },
+        Tool("deselect", if (chosen.isEmpty()) "Deselect all" else AppLanguage.translate("Deselect all (%d)", chosen.size), LucideIcons.SquareCheckBig) { vm.chosen = null },
     )
 }
 
@@ -237,7 +239,7 @@ private fun ToolItem(tool: Tool, width: androidx.compose.ui.unit.Dp = 60.dp) {
         Glyph(tool.icon, tint, size = 23.dp)
         Spacer(Modifier.height(6.dp))
         Text(
-            tool.label,
+            tr(tool.label),
             style = Type.DockLabel.copy(color = tint, textAlign = TextAlign.Center),
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
@@ -596,7 +598,9 @@ fun ToolSearch(vm: EditorViewModel, onClose: () -> Unit) {
     val effects = io.github.artcraftandroid.capcraft.ui.editor.panels.rememberPackages("effect")
         .filter { it.category !in setOf("Cutout", "Color", "Basic", "Text") }
     val words = query.trim()
-    val tools = if (words.isEmpty()) emptyList() else all.filter { it.label.contains(words, ignoreCase = true) }
+    val tools = if (words.isEmpty()) emptyList() else all.filter {
+        it.label.contains(words, ignoreCase = true) || AppLanguage.translate(it.label).contains(words, ignoreCase = true)
+    }
     val found = if (words.isEmpty()) emptyList() else effects.filter { it.name.contains(words, ignoreCase = true) }.take(8)
 
     /** The clip a suggestion acts on: the selected picture, or the main clip under the playhead. */
@@ -616,21 +620,21 @@ fun ToolSearch(vm: EditorViewModel, onClose: () -> Unit) {
         ) {
             Row(Modifier.fillMaxWidth().height(60.dp).padding(start = 4.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.weight(1f)) {
-                    io.github.artcraftandroid.capcraft.ui.editor.panels.SearchField(query, { query = it }, "Describe what you want to do")
+                    io.github.artcraftandroid.capcraft.ui.editor.panels.SearchField(query, { query = it }, tr("Describe what you want to do"))
                 }
                 Text(
-                    "Done",
+                    tr("Done"),
                     style = Type.BodyStrong.copy(color = Palette.Text, fontSize = 16.sp),
                     modifier = Modifier.clickable(onClick = onClose).padding(horizontal = 12.dp, vertical = 8.dp),
                 )
             }
             Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
                 if (words.isEmpty()) {
-                    SearchHeading("Recommended")
+                    SearchHeading(tr("Recommended"))
                     listOf<Pair<String, () -> Unit>>(
-                        "Flip video horizontally" to { target()?.let { vm.mirror(it) } ?: run { vm.message = "Add a clip first" } },
-                        "Add auto captions" to { vm.panel = Panel.Captions },
-                        "Reduce video noise" to {
+                        tr("Flip video horizontally") to { target()?.let { vm.mirror(it) } ?: run { vm.message = "Add a clip first" } },
+                        tr("Add auto captions") to { vm.panel = Panel.Captions },
+                        tr("Reduce video noise") to {
                             target()?.let { vm.toggleCleaner(it, "concat.denoise", "Noise reduction") } ?: run { vm.message = "Add a clip first" }
                         },
                     ).forEach { (line, act) ->
@@ -678,10 +682,10 @@ fun ToolSearch(vm: EditorViewModel, onClose: () -> Unit) {
                     Spacer(Modifier.height(24.dp))
                 } else {
                     if (tools.isEmpty() && found.isEmpty()) {
-                        Text("Nothing by that name", style = Type.Small, modifier = Modifier.padding(vertical = 24.dp))
+                        Text(tr("Nothing by that name"), style = Type.Small, modifier = Modifier.padding(vertical = 24.dp))
                     }
                     if (tools.isNotEmpty()) {
-                        SearchHeading("Tools")
+                        SearchHeading(tr("Tools"))
                         tools.chunked(4).forEach { line ->
                             Row(Modifier.fillMaxWidth()) {
                                 line.forEach { tool ->
@@ -695,7 +699,7 @@ fun ToolSearch(vm: EditorViewModel, onClose: () -> Unit) {
                     }
                     if (found.isNotEmpty()) {
                         Spacer(Modifier.height(12.dp))
-                        SearchHeading("Effects")
+                        SearchHeading(tr("Effects"))
                         found.chunked(4).forEach { line ->
                             EffectRow(vm, line) { e ->
                                 onClose()
@@ -713,16 +717,16 @@ fun ToolSearch(vm: EditorViewModel, onClose: () -> Unit) {
 /** A section's title in the search sheet. */
 @Composable
 private fun SearchHeading(title: String) {
-    Text(title, style = Type.BodyStrong.copy(color = Palette.Text, fontSize = 17.sp), modifier = Modifier.padding(top = 8.dp, bottom = 6.dp))
+    Text(tr(title), style = Type.BodyStrong.copy(color = Palette.Text, fontSize = 17.sp), modifier = Modifier.padding(top = 8.dp, bottom = 6.dp))
 }
 
 /** A trending shelf's name, and More at the right to open its whole panel. */
 @Composable
 private fun SearchSubheading(title: String, onMore: () -> Unit) {
     Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(title, style = Type.Body.copy(color = Palette.DockText, fontSize = 14.sp), modifier = Modifier.weight(1f))
+        Text(tr(title), style = Type.Body.copy(color = Palette.DockText, fontSize = 14.sp), modifier = Modifier.weight(1f))
         Row(Modifier.clickable(onClick = onMore).padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("More", style = Type.Small.copy(color = Palette.TextSecondary, fontSize = 13.sp))
+            Text(tr("More"), style = Type.Small.copy(color = Palette.TextSecondary, fontSize = 13.sp))
             Glyph(LucideIcons.ChevronRight, Palette.TextSecondary, size = 16.dp)
         }
     }
