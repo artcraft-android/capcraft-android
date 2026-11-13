@@ -61,7 +61,7 @@ const ROLL_FORWARD_FRAMES: i64 = 60;
 /// Warm readers one file at one level may hold: enough for the two sides of
 /// a transition within a file and a scrub elsewhere in it, few enough that
 /// a 4K file does not hold a decoder per playback worker.
-const READERS_PER_KEY: usize = 3;
+const READERS_PER_KEY: usize = if cfg!(target_os = "android") { 2 } else { 3 };
 
 /// What one frame request asks for; see [`ReaderPool::frame`].
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -701,7 +701,11 @@ impl ReaderPool {
 
     /// 512 MB of frames, eight warm readers - enough for a busy timeline.
     pub fn with_defaults() -> Self {
-        Self::new(512 * 1024 * 1024, 8)
+        if cfg!(target_os = "android") {
+            Self::new(128 * 1024 * 1024, 4)
+        } else {
+            Self::new(512 * 1024 * 1024, 8)
+        }
     }
 
     /// The frame cache a machine with `total_memory` bytes of RAM gets: a
@@ -711,9 +715,16 @@ impl ReaderPool {
     /// Unknown memory gets the 512 MB the pool always had.
     pub fn frame_budget(total_memory: Option<u64>) -> usize {
         const MB: u64 = 1024 * 1024;
-        let bytes = match total_memory {
-            Some(total) => (total / 16).clamp(256 * MB, 1024 * MB),
-            None => 512 * MB,
+        let bytes = if cfg!(target_os = "android") {
+            match total_memory {
+                Some(total) => (total / 32).clamp(64 * MB, 160 * MB),
+                None => 128 * MB,
+            }
+        } else {
+            match total_memory {
+                Some(total) => (total / 16).clamp(256 * MB, 1024 * MB),
+                None => 512 * MB,
+            }
         };
         usize::try_from(bytes).unwrap_or(usize::MAX)
     }
@@ -722,7 +733,8 @@ impl ReaderPool {
     /// [`ReaderPool::frame_budget`]. Eight warm readers at most, and those
     /// not asked for in a while are closed by [`ReaderPool::close_idle`].
     pub fn sized_for(total_memory: Option<u64>) -> Self {
-        Self::new(Self::frame_budget(total_memory), 8)
+        let max_readers = if cfg!(target_os = "android") { 4 } else { 8 };
+        Self::new(Self::frame_budget(total_memory), max_readers)
     }
 
     /// Closes the warm readers nobody has asked for in `idle`, and that no
