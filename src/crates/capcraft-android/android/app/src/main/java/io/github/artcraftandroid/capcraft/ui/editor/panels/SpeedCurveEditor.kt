@@ -64,7 +64,10 @@ private fun meanOf(points: List<Pair<Double, Double>>): Double {
  */
 @Composable
 fun SpeedCurveEditor(vm: EditorViewModel, clip: ClipView, start: List<Pair<Double, Double>>, onBack: () -> Unit) {
-    var points by remember(clip.id) { mutableStateOf(start.sortedBy { it.first }) }
+    var points by remember(clip.id) {
+        val sorted = start.sortedBy { it.first }
+        mutableStateOf(if (sorted.size >= 2) sorted else listOf(0.0 to 1.0, 1.0 to 1.0))
+    }
     var chosen by remember(clip.id) { mutableIntStateOf(-1) }
     val sourceSeconds = clip.durationUs * clip.speed / 1e6
     val playheadAt = ((vm.playhead - clip.startUs).toDouble() / clip.durationUs.coerceAtLeast(1)).coerceIn(0.0, 1.0)
@@ -92,10 +95,11 @@ fun SpeedCurveEditor(vm: EditorViewModel, clip: ClipView, start: List<Pair<Doubl
                     if (removable) {
                         send(points.filterIndexed { i, _ -> i != chosen }, null)
                         chosen = -1
-                    } else {
+                    } else if (points.size >= 2) {
                         // a new point on the curve where the playhead is, unless one is already there
                         if (points.none { abs(it.first - playheadAt) < 0.03 }) {
-                            val i = points.indexOfFirst { it.first > playheadAt }.coerceAtLeast(1)
+                            val found = points.indexOfFirst { it.first > playheadAt }
+                            val i = if (found < 0) points.lastIndex else found.coerceIn(1, points.lastIndex)
                             val (a, sa) = points[i - 1]
                             val (b, sb) = points[i]
                             val f = ((playheadAt - a) / (b - a).coerceAtLeast(1e-6)).coerceIn(0.0, 1.0)

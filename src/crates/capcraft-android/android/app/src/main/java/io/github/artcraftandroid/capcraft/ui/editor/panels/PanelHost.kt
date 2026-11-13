@@ -232,7 +232,7 @@ private fun SpeedRuler(position: Float, onChange: (Float) -> Unit, onDone: () ->
             Modifier.fillMaxWidth().height(28.dp).align(Alignment.BottomStart)
                 .pointerInput(Unit) {
                     val pad = thumb.toPx() / 2
-                    val span = size.width - thumb.toPx()
+                    val span = (size.width - thumb.toPx()).coerceAtLeast(1f)
                     fun at(x: Float) = ((x - pad) / span).coerceIn(0f, 1f)
                     awaitEachGesture {
                         val down = awaitFirstDown()
@@ -240,7 +240,7 @@ private fun SpeedRuler(position: Float, onChange: (Float) -> Unit, onDone: () ->
                         onChange(at(down.position.x))
                         while (true) {
                             val e = awaitPointerEvent()
-                            val c = e.changes.first()
+                            val c = e.changes.firstOrNull() ?: break
                             if (!c.pressed) break
                             onChange(at(c.position.x))
                             c.consume()
@@ -251,7 +251,7 @@ private fun SpeedRuler(position: Float, onChange: (Float) -> Unit, onDone: () ->
                 },
         ) {
             val pad = thumb.toPx() / 2
-            val span = size.width - thumb.toPx()
+            val span = (size.width - thumb.toPx()).coerceAtLeast(1f)
             val cy = size.height / 2
             val ticks = 36
             for (i in 0..ticks) {
@@ -560,12 +560,15 @@ private fun SpeedPanel(vm: EditorViewModel, curve: Boolean) {
             SpeedRuler(
                 position = speedToPos(speed),
                 onChange = {
+                    if (!it.isFinite()) return@SpeedRuler
                     var s = posToSpeed(it)
+                    if (!s.isFinite()) return@SpeedRuler
                     // stick to 1x and the round marks
                     for (mark in floatArrayOf(1f, 2f, 5f, 10f)) if (abs(s - mark) / mark < 0.04f) s = mark
-                    speed = (s * 10).roundToInt() / 10f
+                    val tenths = (s * 10f).roundToInt().coerceIn(1, 160)
+                    speed = tenths / 10f
                     vm.command(
-                        JSONObject().put("op", "setClipSpeed").put("clipId", clip.id).put("speed", speed.toDouble()),
+                        JSONObject().put("op", "setClipSpeed").put("clipId", clip.id).put("speed", tenths / 10.0),
                         gesture = "speed",
                     )
                 },

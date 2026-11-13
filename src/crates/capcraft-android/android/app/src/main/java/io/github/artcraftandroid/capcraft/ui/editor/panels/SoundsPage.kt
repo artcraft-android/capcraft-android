@@ -317,7 +317,7 @@ fun SoundsPage(vm: EditorViewModel) {
                                 Modifier.fillMaxWidth().height(40.dp).clip(RoundedCornerShape(20.dp)).border(1.dp, Palette.Accent, RoundedCornerShape(20.dp))
                                     .clickable {
                                         MediaPick.open(MediaKinds.VIDEO, multiple = false) { uris ->
-                                            val uri = uris.first()
+                                            val uri = uris.firstOrNull() ?: return@open
                                             SoundShelf.addExtracted(context, describeVideo(context, uri))
                                             shelf++
                                             take(uri)

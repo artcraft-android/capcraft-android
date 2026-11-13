@@ -132,6 +132,7 @@ fun PreviewOverlay(vm: EditorViewModel, modifier: Modifier) {
                     val selected = vm.selected
                     val w = size.width.toFloat()
                     val h = size.height.toFloat()
+                    if (w <= 0f || h <= 0f) return@awaitEachGesture
                     // the corner buttons of a framed selection come first
                     val framedBox = boxes.firstOrNull { it.clipId == selected }
                         ?.takeIf { vm.selectedRow != io.github.artcraftandroid.capcraft.core.RowKind.MAIN }
@@ -145,7 +146,7 @@ fun PreviewOverlay(vm: EditorViewModel, modifier: Modifier) {
                         var turned = false
                         while (true) {
                             val event = awaitPointerEvent()
-                            val change = event.changes.first()
+                            val change = event.changes.firstOrNull() ?: break
                             if (!change.pressed) break
                             val now = change.position - middle
                             val k = (now.getDistance() / reach0).toDouble()
@@ -247,9 +248,11 @@ fun PreviewOverlay(vm: EditorViewModel, modifier: Modifier) {
                     if (!moved && picker != null) {
                         // the colour under the finger, from the frame on screen
                         vm.lastFrame?.let { frame ->
-                            val px = (down.position.x / w * frame.width).toInt().coerceIn(0, frame.width - 1)
-                            val py = (down.position.y / h * frame.height).toInt().coerceIn(0, frame.height - 1)
-                            picker(frame.getPixel(px, py) and 0xFFFFFF)
+                            if (!frame.isRecycled && frame.width > 0 && frame.height > 0) {
+                                val px = (down.position.x / w * frame.width).toInt().coerceIn(0, frame.width - 1)
+                                val py = (down.position.y / h * frame.height).toInt().coerceIn(0, frame.height - 1)
+                                runCatching { picker(frame.getPixel(px, py) and 0xFFFFFF) }
+                            }
                         }
                         vm.pickColor = null
                     } else if (moved) {

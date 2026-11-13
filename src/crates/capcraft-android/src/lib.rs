@@ -146,12 +146,13 @@ pub fn init(files_dir: String, cache_dir: String) -> Result<(), MobileError> {
     // behind. One reopens on its next frame.
     let _ = std::thread::Builder::new()
         .name("capcraft-readers".to_owned())
+        .stack_size(2 * 1024 * 1024)
         .spawn(|| {
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
+                std::thread::sleep(std::time::Duration::from_secs(3));
                 let closed = concat_host::scheduler()
                     .pool()
-                    .close_idle(std::time::Duration::from_secs(10));
+                    .close_idle(std::time::Duration::from_secs(6));
                 if closed > 0 {
                     log::debug!("memory: closed {closed} idle decoder(s)");
                 }
@@ -163,9 +164,10 @@ pub fn init(files_dir: String, cache_dir: String) -> Result<(), MobileError> {
     let (prefetch, prefetch_rx) = std::sync::mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(1);
     let _ = std::thread::Builder::new()
         .name("capcraft-prefetch".to_owned())
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             while let Ok(job) = prefetch_rx.recv() {
-                job();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
             }
         });
     let _ = CONTEXT.set(Context {
@@ -213,6 +215,9 @@ pub fn engine_version() -> String {
 pub fn trim_memory() {
     if let Ok(context) = context() {
         context.monitor.clear();
+        let _ = concat_host::scheduler()
+            .pool()
+            .close_idle(std::time::Duration::ZERO);
     }
 }
 

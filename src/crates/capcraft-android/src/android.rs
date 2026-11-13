@@ -30,6 +30,11 @@ static VM: AtomicPtr<JavaVM> = AtomicPtr::new(std::ptr::null_mut());
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn JNI_OnLoad(vm: *mut JavaVM, _reserved: *mut c_void) -> jint {
     VM.store(vm, Ordering::Release);
+    #[cfg(target_os = "android")]
+    if !vm.is_null() {
+        // SAFETY: `vm` is the process-lifetime JavaVM pointer provided by ART.
+        unsafe { concat_media::set_android_java_vm(vm.cast()) };
+    }
     JNI_VERSION_1_6
 }
 
@@ -80,6 +85,10 @@ pub unsafe extern "system" fn Java_io_github_artcraftandroid_capcraft_NativeCont
         // SAFETY: both pointers stay valid for the life of the process: the
         // VM is the process's, and the global reference is never deleted.
         unsafe { ndk_context::initialize_android_context(vm.cast(), global.cast()) };
+        #[cfg(target_os = "android")]
+        unsafe {
+            concat_media::set_android_java_vm(vm.cast());
+        }
         log::info!("android: context handed to the engine");
     });
 }

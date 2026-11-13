@@ -40,13 +40,17 @@ object Thumbs {
 
     /** A strip of [count] frames of [path] between two source times, [height] pixels tall. */
     fun strip(path: String, fromUs: Long, toUs: Long, count: Int, height: Int): Bitmap? {
+        if (count <= 0 || height <= 0) return null
         val key = "s|$path|$fromUs|$toUs|$count|$height"
         strips.get(key)?.let { return it }
         if (pending.add(key)) {
             scope.launch {
-                runCatching { filmstrip(path, fromUs, toUs, count.toUInt(), height.toUInt()).toBitmap() }
-                    .getOrNull()?.let { strips.put(key, it) }
-                pending.remove(key)
+                try {
+                    runCatching { filmstrip(path, fromUs, toUs, count.toUInt(), height.toUInt()).toBitmap() }
+                        .getOrNull()?.let { strips.put(key, it) }
+                } finally {
+                    pending.remove(key)
+                }
                 withContext(Dispatchers.Main) { version.intValue++ }
             }
         }
@@ -55,12 +59,16 @@ object Thumbs {
 
     /** A still (a photo, or a frame of a video at [atUs]) [width] pixels across. */
     fun still(path: String, atUs: Long, width: Int): Bitmap? {
+        if (width <= 0) return null
         val key = "p|$path|$atUs|$width"
         strips.get(key)?.let { return it }
         if (pending.add(key)) {
             scope.launch {
-                runCatching { still(path, atUs, width.toUInt()).toBitmap() }.getOrNull()?.let { strips.put(key, it) }
-                pending.remove(key)
+                try {
+                    runCatching { still(path, atUs, width.toUInt()).toBitmap() }.getOrNull()?.let { strips.put(key, it) }
+                } finally {
+                    pending.remove(key)
+                }
                 withContext(Dispatchers.Main) { version.intValue++ }
             }
         }
@@ -69,13 +77,17 @@ object Thumbs {
 
     /** [buckets] peaks of [path] between two source times, 0..1. */
     fun wave(path: String, project: String, fromUs: Long, toUs: Long, buckets: Int): FloatArray? {
+        if (buckets <= 0) return null
         val key = "w|$path|$fromUs|$toUs|$buckets"
         waves.get(key)?.let { return it }
         if (pending.add(key)) {
             scope.launch {
-                runCatching { waveform(path, project, fromUs, toUs, buckets.toUInt()).toFloatArray() }
-                    .getOrNull()?.let { waves.put(key, it) }
-                pending.remove(key)
+                try {
+                    runCatching { waveform(path, project, fromUs, toUs, buckets.toUInt()).toFloatArray() }
+                        .getOrNull()?.let { waves.put(key, it) }
+                } finally {
+                    pending.remove(key)
+                }
                 withContext(Dispatchers.Main) { version.intValue++ }
             }
         }

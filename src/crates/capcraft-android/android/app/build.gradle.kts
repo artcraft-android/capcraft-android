@@ -82,6 +82,8 @@ abstract class CargoNdkBuild : DefaultTask() {
         val remap = listOf(
             "--remap-path-prefix=${File(workspaceDir.get()).absolutePath}=/capcraft",
             "--remap-path-prefix=$cargoHome=/cargo",
+            "-C",
+            "link-arg=-Wl,-z,max-page-size=16384",
         )
         execOperations.exec {
             workingDir(workspaceDir.get())

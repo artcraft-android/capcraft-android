@@ -80,19 +80,26 @@ pub fn start_export(
     let request = session.export_request(&settings)?;
     std::thread::Builder::new()
         .name("capcraft-export".to_owned())
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let cancel = job.cancel_handle();
             let mut last = -1.0f32;
-            let result = concat_host::export::run(&request, &cancel, |progress: Progress| {
-                let fraction = fraction_of(progress);
-                if fraction - last >= 0.005 || fraction >= 1.0 {
-                    last = fraction;
-                    listener.on_progress(fraction);
-                }
-            });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                concat_host::export::run(&request, &cancel, |progress: Progress| {
+                    let fraction = fraction_of(progress);
+                    if fraction - last >= 0.005 || fraction >= 1.0 {
+                        last = fraction;
+                        listener.on_progress(fraction);
+                    }
+                })
+            }));
             match result {
-                Ok(path) => listener.on_done(path),
-                Err(message) => listener.on_failed(message, job.cancelled()),
+                Ok(Ok(path)) => listener.on_done(path),
+                Ok(Err(message)) => listener.on_failed(message, job.cancelled()),
+                Err(_) => listener.on_failed(
+                    "Export failed unexpectedly.".to_owned(),
+                    job.cancelled(),
+                ),
             }
             drop(job);
         })
