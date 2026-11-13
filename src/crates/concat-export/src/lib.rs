@@ -35,14 +35,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use concat_core::SpeedCurve;
 use concat_core::animate::{Animation, Ease as AnimEase, Key as AnimKey, Track as AnimTrack};
-use concat_core::frame::{Frame, Signal};
+use concat_core::frame::{Depth, Frame, Signal};
 use concat_core::shader::{RevealMap, ShaderPass};
 use concat_core::time::{FrameRate, Rational};
-use concat_core::timeline::{Clip, ClipId, MediaRef, Timeline, Track, TrackKind, Transform};
+use concat_core::timeline::{Blend, Clip, ClipId, MediaRef, Timeline, Track, TrackKind, Transform};
 use concat_effects::Catalogue;
 use concat_media::audio::{self, AudioClip};
 use concat_media::{
-    DecodeOptions, Decoder, EncodeOptions, Encoder, FrameSink, FrameSource, RateMode, VideoCodec,
+    DecodeOptions, Decoder, EncodeOptions, Encoder, ExportFrame, FrameSink, FrameSource, RateMode,
+    RawYuv, VideoCodec,
 };
 use concat_project::model::{AppliedFilter, ClipMask, ColorSpace, Cutout};
 use concat_render::{
@@ -1297,6 +1298,7 @@ pub fn render_on(
             &visible,
             transitions,
             &silent,
+            sound.is_empty(),
             &mut reporter,
         )?;
 
@@ -1694,46 +1696,163 @@ fn recovered(losses: u32, hdr: bool) -> Result<WgpuCompositor, String> {
     Ok(compositor)
 }
 
-/// A compositor for the frames drawn without a window: the API's and the
-/// command line's previews. Made once and kept, since making a device is
-/// far slower than drawing one small frame on it.
-fn headless<T>(draw: impl FnOnce(&mut WgpuCompositor) -> T) -> Result<T, String> {
-    static HEADLESS: std::sync::OnceLock<Option<std::sync::Mutex<WgpuCompositor>>> =
+type HeadlessTask = Box<dyn FnOnce(&mut Option<WgpuCompositor>) + Send>;
+
+static HEADLESS_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn headless_worker() -> Option<&'static std::sync::mpsc::Sender<HeadlessTask>> {
+    static WORKER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<HeadlessTask>>> =
         std::sync::OnceLock::new();
-    // A machine with nothing to draw on stays so for the process; why is
-    // in the log above this line, adapter by adapter.
-    let slot = HEADLESS
+    WORKER
         .get_or_init(|| {
-            let made = WgpuCompositor::new();
-            match &made {
-                Some(gpu) => {
-                    let adapter = gpu.adapter_info();
-                    log::info!(
-                        "previews draw on {} ({:?}, {:?})",
-                        adapter.name,
-                        adapter.device_type,
-                        adapter.backend
-                    );
+            let (tx, rx) = std::sync::mpsc::channel::<HeadlessTask>();
+            let spawned = std::thread::Builder::new()
+                .name("concat-headless-gpu".to_owned())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    let mut slot: Option<WgpuCompositor> = None;
+                    let mut tried = false;
+                    while let Ok(task) = rx.recv() {
+                        if !tried {
+                            tried = true;
+                            slot = std::panic::catch_unwind(WgpuCompositor::new)
+                                .ok()
+                                .flatten();
+                            match &slot {
+                                Some(gpu) => {
+                                    let adapter = gpu.adapter_info();
+                                    log::info!(
+                                        "previews draw on {} ({:?}, {:?})",
+                                        adapter.name,
+                                        adapter.device_type,
+                                        adapter.backend
+                                    );
+                                }
+                                None => {
+                                    log::error!("previews have nothing to draw on: {NO_RENDERER}");
+                                }
+                            }
+                        } else if slot.as_ref().is_some_and(WgpuCompositor::lost)
+                            && let Ok(Some(fresh)) = std::panic::catch_unwind(WgpuCompositor::new)
+                        {
+                            log::warn!(
+                                "previews: the GPU device was lost; drawing on a fresh one"
+                            );
+                            slot = Some(fresh);
+                        }
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            task(&mut slot);
+                        }))
+                        .is_err()
+                        {
+                            log::error!("previews: headless GPU composite panicked; resetting");
+                            slot = std::panic::catch_unwind(WgpuCompositor::new)
+                                .ok()
+                                .flatten();
+                        }
+                    }
+                });
+            match spawned {
+                Ok(_) => Some(tx),
+                Err(error) => {
+                    log::error!("previews: could not spawn headless GPU thread: {error}");
+                    None
                 }
-                None => log::error!("previews have nothing to draw on: {NO_RENDERER}"),
             }
-            made.map(std::sync::Mutex::new)
         })
         .as_ref()
-        .ok_or_else(|| NO_RENDERER.to_owned())?;
-    let mut gpu = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    // A device that died under an earlier preview is not kept: every
-    // preview after it would be black.
-    if gpu.lost()
-        && let Some(fresh) = WgpuCompositor::new()
-    {
-        log::warn!("previews: the GPU device was lost; drawing on a fresh one");
-        *gpu = fresh;
+}
+
+/// Releases pooled textures held by the shared headless preview compositor down
+/// to `fraction` (`0.0..=1.0`) of its budget. Safe to call before the headless
+/// compositor has been created (does nothing in that case).
+pub fn shrink_headless_pool(fraction: f64) {
+    if !HEADLESS_STARTED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
     }
-    Ok(draw(&mut gpu))
+    if let Some(tx) = headless_worker() {
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        if tx
+            .send(Box::new(move |slot| {
+                if let Some(gpu) = slot.as_mut() {
+                    gpu.shrink_pool(fraction);
+                }
+                let _ = done_tx.send(());
+            }))
+            .is_ok()
+        {
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        }
+    }
+}
+
+/// A compositor for the frames drawn without a window: the API's and the
+/// command line's previews. Made once and kept on one dedicated 8 MiB worker
+/// thread so Vulkan/EGL thread-local driver state never hops threads and
+/// mobile shader compilers never run on Android ART's 1 MiB thread stack.
+fn headless<'env, T: Send + 'env>(
+    draw: impl FnOnce(&mut WgpuCompositor) -> T + Send + 'env,
+) -> Result<T, String> {
+    let tx = headless_worker().ok_or_else(|| NO_RENDERER.to_owned())?;
+    HEADLESS_STARTED.store(true, std::sync::atomic::Ordering::Release);
+
+    type Slot<T> = (std::sync::Mutex<(bool, Option<Result<T, String>>)>, std::sync::Condvar);
+    let pair: Arc<Slot<T>> = Arc::new((
+        std::sync::Mutex::new((false, None)),
+        std::sync::Condvar::new(),
+    ));
+    let worker_pair = Arc::clone(&pair);
+
+    struct SignalDone<T>(Arc<Slot<T>>);
+    impl<T> Drop for SignalDone<T> {
+        fn drop(&mut self) {
+            let (lock, cvar) = &*self.0;
+            let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+            state.0 = true;
+            cvar.notify_all();
+        }
+    }
+
+    let boxed: Box<dyn FnOnce(&mut Option<WgpuCompositor>) + Send + 'env> =
+        Box::new(move |slot| {
+            let signal = SignalDone(worker_pair);
+            let outcome = match slot.as_mut() {
+                Some(gpu) => Ok(draw(gpu)),
+                None => Err(NO_RENDERER.to_owned()),
+            };
+            let (lock, _) = &*signal.0;
+            lock.lock().unwrap_or_else(|p| p.into_inner()).1 = Some(outcome);
+        });
+    // SAFETY: `WaitGuard` below blocks the current stack frame until `SignalDone`
+    // drops on the worker thread (or `tx.send` fails and drops `task` immediately),
+    // so `'env` strictly outlives the boxed closure's execution and drop.
+    let task: HeadlessTask = unsafe { std::mem::transmute(boxed) };
+
+    if tx.send(task).is_err() {
+        return Err(NO_RENDERER.to_owned());
+    }
+
+    struct WaitGuard<'a, T>(&'a Slot<T>);
+    impl<T> Drop for WaitGuard<'_, T> {
+        fn drop(&mut self) {
+            let (lock, cvar) = self.0;
+            let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+            while !state.0 {
+                state = cvar.wait(state).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+    }
+    let guard = WaitGuard(&pair);
+    drop(guard);
+
+    let (lock, _) = &*pair;
+    let outcome = lock.lock().unwrap_or_else(|p| p.into_inner()).1.take();
+    outcome.unwrap_or_else(|| Err("headless GPU composite panicked".to_owned()))
 }
 
 /// Composites every frame of the timeline into a soundless video file.
+#[allow(clippy::too_many_arguments)]
 fn render_picture(
     request: &ExportRequest,
     compositor: Option<WgpuCompositor>,
@@ -1742,8 +1861,10 @@ fn render_picture(
     visible: &[&ExportClip],
     transitions: Vec<TransitionSpan>,
     destination: &Path,
+    faststart: bool,
     reporter: &mut Reporter<'_>,
 ) -> Result<(), String> {
+    let lent_compositor = compositor.is_some();
     let effect_offset = quantise(request.effect_time_offset, rate);
     let mut compositor = match compositor {
         Some(lent) => lent,
@@ -1767,23 +1888,7 @@ fn render_picture(
             request.width, request.height, adapter.name
         ));
     }
-    let BuiltTimeline {
-        timeline,
-        stills,
-        decode_sizes,
-        tracks,
-        treatments,
-        transitions,
-        geometry,
-        shapes,
-        ranges,
-        chains,
-        reveal_maps,
-        cutouts,
-        stabilized,
-        highlight: _,
-        backdrops,
-    } = build_timeline(request, rate, visible, transitions);
+    let built = build_timeline(request, rate, visible, transitions);
 
     let mut options = EncodeOptions {
         crf: request.crf,
@@ -1805,13 +1910,46 @@ fn render_picture(
     // cannot write ten bits, rather than the export failing.
     let hdr = request.hdr && signal != Signal::Sdr && !request.codec.keeps_alpha();
     compositor.deliver_hdr(hdr);
+    let allow_bypass = !lent_compositor && !hdr && signal == Signal::Sdr && !request.codec.keeps_alpha();
+
+    enum DecodedItem {
+        Yuv {
+            index: i64,
+            yuv: RawYuv,
+        },
+        Passthrough {
+            index: i64,
+            frame: Frame,
+        },
+        Compose {
+            index: i64,
+            time: Rational,
+            plan: FramePlan,
+        },
+    }
+
+    enum ReadyFrame {
+        Yuv {
+            index: i64,
+            yuv: RawYuv,
+        },
+        Rgba {
+            index: i64,
+            frame: Frame,
+        },
+    }
+
+    enum PassOutcome {
+        Done,
+        RetrySoftware {
+            index: i64,
+            error: concat_media::Error,
+        },
+        Failed(String),
+    }
 
     // How many devices have died under this export so far; see `recovered`.
-    let mut losses = 0;
-    // A clip whose speed changes, or runs backwards, cannot be followed by a
-    // paced decoder: each of its frames is sought by its own source time,
-    // through a pool that keeps the reader rolling where it can.
-    let sought = concat_media::ReaderPool::with_defaults();
+    let mut losses = 0u32;
 
     // Each pass renders the whole cut from its first frame. There is a
     // second only when the first one's hardware encoder stopped taking
@@ -1825,16 +1963,24 @@ fn render_picture(
             "rendering"
         };
         let mut encoder = if hdr {
-            Encoder::create_hdr(
+            Encoder::create_hdr_with_faststart(
                 destination,
                 request.width,
                 request.height,
                 rate,
                 &options,
                 signal,
+                faststart,
             )
         } else {
-            Encoder::create(destination, request.width, request.height, rate, &options)
+            Encoder::create_with_faststart(
+                destination,
+                request.width,
+                request.height,
+                rate,
+                &options,
+                faststart,
+            )
         }
         .map_err(|error| failed_encoding(&error, &options))?;
         log::info!(
@@ -1847,210 +1993,480 @@ fn render_picture(
             }
         );
 
-        // When progress was last said; see `progress_due`.
-        let mut said = std::time::Instant::now();
+        let out_range = options.color_range;
+        let cancel = reporter.cancel;
+        let built = &built;
+        let mut moved_compositor = Some((compositor, losses));
+        let mut gpu_returned: Option<Result<(WgpuCompositor, u32), String>> = None;
 
-        // One decoder per clip, opened at its in-point the first time the clip is
-        // needed and dropped the moment it leaves the playhead. Every decoder is
-        // opened at `output rate / clip speed`, so pulling exactly one frame per
-        // output frame keeps each of them in step with the plan's source times
-        // without any seeking - including retimed clips.
-        let mut decoders: HashMap<ClipId, Decoder> = HashMap::new();
+        let pass_outcome = std::thread::scope(|scope| -> PassOutcome {
+            let (to_gpu_tx, to_gpu_rx) =
+                std::sync::mpsc::sync_channel::<Result<DecodedItem, String>>(2);
+            let (to_enc_tx, to_enc_rx) =
+                std::sync::mpsc::sync_channel::<Result<ReadyFrame, String>>(2);
 
-        for index in 0..total_frames {
-            reporter.cancelled()?;
+            let dec_spawn = std::thread::Builder::new()
+                .name("concat-export-dec".to_owned())
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    let BuiltTimeline {
+                        timeline,
+                        stills,
+                        decode_sizes,
+                        tracks,
+                        treatments,
+                        transitions,
+                        geometry,
+                        shapes,
+                        ranges,
+                        chains,
+                        reveal_maps,
+                        cutouts,
+                        stabilized,
+                        highlight: _,
+                        backdrops,
+                    } = built;
+                    let sought = concat_media::ReaderPool::with_defaults();
+                    let mut decoders: HashMap<ClipId, Decoder> = HashMap::new();
 
-            let time = rate.time_of_frame(index);
-            let plan = plan_frame(&timeline, time);
-
-            let mut layers: Vec<PlannedLayer> = Vec::with_capacity(plan.layers.len());
-            for layer in &plan.layers {
-                if !layer.paced {
-                    let (decode_width, decode_height) = decode_sizes
-                        .get(&layer.clip)
-                        .copied()
-                        .unwrap_or((request.width, request.height));
-                    // A frame that cannot be read ends the export with the
-                    // reason, as it does on the paced path below. A time past
-                    // the media's end is not that: the pool answers it with the
-                    // last frame. This path used to drop a failed frame on the
-                    // floor, so a reversed or retimed clip whose file had gone
-                    // bad exported as a missing layer and nobody was told.
-                    let frame = sought
-                        .frame_at(
-                            &layer.media,
-                            layer.source_time,
-                            decode_width,
-                            decode_height,
-                            stills.contains(&layer.clip),
-                            None,
-                            None,
-                            ranges.get(&layer.clip).copied(),
-                            // Deep where the frame goes to the GPU as it is: a
-                            // cutout cuts eight bits.
-                            !cutouts.contains_key(&layer.clip),
-                        )
-                        .map_err(|error| error.to_string())?;
-                    let frame = cutouts
-                        .get(&layer.clip)
-                        .and_then(|job| job.cut(&frame, layer.source_time))
-                        .map_or(frame, std::sync::Arc::new);
-                    layers.push(filled(
-                        layer,
-                        frame,
-                        tracks.get(&layer.clip).copied().unwrap_or(0),
-                        passes_at(&chains, &reveal_maps, &timeline, layer.clip, time),
-                        geometry.get(&layer.clip),
-                        shapes_at(&shapes, layer, time, rate),
-                        stabilized.get(&layer.clip),
-                    ));
-                    continue;
-                }
-                let decoder = match decoders.entry(layer.clip) {
-                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        // Aspect-correct: decode at the source's fitted size and
-                        // let the compositor place it, rather than stretching to
-                        // the frame and losing the picture's shape.
+                    let open_paced = |clip: ClipId,
+                                      media: &Path,
+                                      source_time: Rational,
+                                      speed: Rational|
+                     -> Result<Decoder, String> {
                         let (decode_width, decode_height) = decode_sizes
-                            .get(&layer.clip)
+                            .get(&clip)
                             .copied()
                             .unwrap_or((request.width, request.height));
-
-                        // A retimed clip advances the source by `speed / fps`
-                        // seconds per output frame, so the decoder must emit
-                        // frames exactly that far apart: a rate of `fps / speed`.
-                        // (At 2x, 300 output frames cover 20s of source - the
-                        // decoder emits 15 frames per source second, not 60.)
-                        let decode_rate = if layer.speed == Rational::ONE {
+                        let decode_rate = if speed == Rational::ONE {
                             rate
                         } else {
-                            FrameRate::new(rate.fps() / layer.speed)
+                            FrameRate::new(rate.fps() / speed)
                         };
-
-                        // Deep - an HDR clip in its own signal, converted on
-                        // the GPU - unless a cutout has to cut it in eight bits;
-                        // the decoder keeps eight bits for a chain itself.
-                        let mut options = DecodeOptions::default()
-                            .starting_at(layer.source_time)
+                        let mut dec_opts = DecodeOptions::default()
+                            .starting_at(source_time)
                             .scaled_to(decode_width, decode_height)
                             .at_rate(decode_rate)
-                            .in_range(ranges.get(&layer.clip).copied())
-                            .deep(!cutouts.contains_key(&layer.clip));
+                            .in_range(ranges.get(&clip).copied())
+                            .deep(!cutouts.contains_key(&clip));
+                        if stills.contains(&clip) {
+                            dec_opts = dec_opts.repeating().starting_at(Rational::ZERO);
+                        }
+                        Decoder::open(media, &dec_opts).map_err(|error| error.to_string())
+                    };
 
-                        // A still is a one-frame stream. Without looping it would
-                        // contribute a single frame and then disappear.
-                        if stills.contains(&layer.clip) {
-                            options = options.repeating().starting_at(Rational::ZERO);
+                    for index in 0..total_frames {
+                        if cancel.load(Ordering::Relaxed) {
+                            let _ = to_gpu_tx.send(Err("export cancelled".to_owned()));
+                            break;
                         }
 
-                        entry.insert(
-                            Decoder::open(&layer.media, &options)
-                                .map_err(|error| error.to_string())?,
-                        )
+                        let time = rate.time_of_frame(index);
+                        let plan = plan_frame(&timeline, time);
+
+                        // Retire decoders whose clip has ended BEFORE opening any new clip's
+                        // decoder so cuts never hold two MediaCodec seats at once.
+                        decoders
+                            .retain(|clip, _| plan.layers.iter().any(|layer| layer.clip == *clip));
+
+                        // Fast path: single opaque upright SDR layer covering the canvas with
+                        // no shaders, crops, flips, masks, transitions, or treatments.
+                        if allow_bypass && plan.layers.len() == 1 {
+                            let layer = &plan.layers[0];
+                            let (decode_width, decode_height) = decode_sizes
+                                .get(&layer.clip)
+                                .copied()
+                                .unwrap_or((request.width, request.height));
+                            let geom_identity = geometry
+                                .get(&layer.clip)
+                                .is_none_or(|g| g.crop.is_none() && !g.flip_h && !g.flip_v);
+                            if layer.paced
+                                && !stills.contains(&layer.clip)
+                                && layer.weight() >= 1.0
+                                && layer.blend == Blend::Normal
+                                && layer.transform == Transform::default()
+                                && layer.overscan == 1.0
+                                && layer.mask.is_none()
+                                && layer.shape.is_none()
+                                && geom_identity
+                                && (decode_width, decode_height) == (request.width, request.height)
+                                && !cutouts.contains_key(&layer.clip)
+                                && !stabilized.contains_key(&layer.clip)
+                                && !treatments.iter().any(|t| t.covers(time))
+                                && !transitions.iter().any(|s| s.covers(time))
+                                && passes_at(&chains, &reveal_maps, &timeline, layer.clip, time)
+                                    .is_empty()
+                                && shapes_at(&shapes, layer, time, rate).is_empty()
+                            {
+                                let decoder = match decoders.entry(layer.clip) {
+                                    std::collections::hash_map::Entry::Occupied(entry) => {
+                                        entry.into_mut()
+                                    }
+                                    std::collections::hash_map::Entry::Vacant(entry) => {
+                                        match open_paced(
+                                            layer.clip,
+                                            &layer.media,
+                                            layer.source_time,
+                                            layer.speed,
+                                        ) {
+                                            Ok(dec) => entry.insert(dec),
+                                            Err(err) => {
+                                                let _ = to_gpu_tx.send(Err(err));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                };
+                                let is_opaque = decoder.is_opaque();
+                                match decoder.next_export_frame(
+                                    request.width,
+                                    request.height,
+                                    out_range,
+                                ) {
+                                    Ok(Some(ExportFrame::Yuv(yuv))) => {
+                                        if to_gpu_tx
+                                            .send(Ok(DecodedItem::Yuv { index, yuv }))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    Ok(Some(ExportFrame::Rgba(rgba))) => {
+                                        let item = if is_opaque
+                                            && rgba.depth() == Depth::Eight
+                                            && rgba.signal() == Signal::Sdr
+                                            && rgba.width() == request.width
+                                            && rgba.height() == request.height
+                                        {
+                                            DecodedItem::Passthrough { index, frame: rgba }
+                                        } else {
+                                            let layers = with_backdrops(
+                                                vec![filled(
+                                                    layer,
+                                                    Arc::new(rgba),
+                                                    tracks.get(&layer.clip).copied().unwrap_or(0),
+                                                    Vec::new(),
+                                                    geometry.get(&layer.clip),
+                                                    Vec::new(),
+                                                    None,
+                                                )],
+                                                &backdrops,
+                                                |clip| {
+                                                    !stills.contains(&clip)
+                                                        && !cutouts.contains_key(&clip)
+                                                },
+                                                &sought,
+                                                (request.width, request.height),
+                                            );
+                                            DecodedItem::Compose {
+                                                index,
+                                                time,
+                                                plan: FramePlan {
+                                                    time,
+                                                    width: request.width,
+                                                    height: request.height,
+                                                    canvas: plan.canvas,
+                                                    layers,
+                                                    treatments: Vec::new(),
+                                                    output: signal,
+                                                },
+                                            }
+                                        };
+                                        if to_gpu_tx.send(Ok(item)).is_err() {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    Ok(None) => {
+                                        let empty_plan = FramePlan {
+                                            time,
+                                            width: request.width,
+                                            height: request.height,
+                                            canvas: plan.canvas,
+                                            layers: Vec::new(),
+                                            treatments: Vec::new(),
+                                            output: signal,
+                                        };
+                                        if to_gpu_tx
+                                            .send(Ok(DecodedItem::Compose {
+                                                index,
+                                                time,
+                                                plan: empty_plan,
+                                            }))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        let _ = to_gpu_tx.send(Err(error.to_string()));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut layers: Vec<PlannedLayer> = Vec::with_capacity(plan.layers.len());
+                        for layer in &plan.layers {
+                            if !layer.paced {
+                                let (decode_width, decode_height) = decode_sizes
+                                    .get(&layer.clip)
+                                    .copied()
+                                    .unwrap_or((request.width, request.height));
+                                let frame = match sought.frame_at(
+                                    &layer.media,
+                                    layer.source_time,
+                                    decode_width,
+                                    decode_height,
+                                    stills.contains(&layer.clip),
+                                    None,
+                                    None,
+                                    ranges.get(&layer.clip).copied(),
+                                    !cutouts.contains_key(&layer.clip),
+                                ) {
+                                    Ok(frame) => frame,
+                                    Err(error) => {
+                                        let _ = to_gpu_tx.send(Err(error.to_string()));
+                                        return;
+                                    }
+                                };
+                                let frame = cutouts
+                                    .get(&layer.clip)
+                                    .and_then(|job| job.cut(&frame, layer.source_time))
+                                    .map_or(frame, std::sync::Arc::new);
+                                layers.push(filled(
+                                    layer,
+                                    frame,
+                                    tracks.get(&layer.clip).copied().unwrap_or(0),
+                                    passes_at(&chains, &reveal_maps, &timeline, layer.clip, time),
+                                    geometry.get(&layer.clip),
+                                    shapes_at(&shapes, layer, time, rate),
+                                    stabilized.get(&layer.clip),
+                                ));
+                                continue;
+                            }
+                            let decoder = match decoders.entry(layer.clip) {
+                                std::collections::hash_map::Entry::Occupied(entry) => {
+                                    entry.into_mut()
+                                }
+                                std::collections::hash_map::Entry::Vacant(entry) => {
+                                    match open_paced(
+                                        layer.clip,
+                                        &layer.media,
+                                        layer.source_time,
+                                        layer.speed,
+                                    ) {
+                                        Ok(dec) => entry.insert(dec),
+                                        Err(err) => {
+                                            let _ = to_gpu_tx.send(Err(err));
+                                            return;
+                                        }
+                                    }
+                                }
+                            };
+
+                            let decoded = match decoder.next_frame() {
+                                Ok(frame) => frame,
+                                Err(error) => {
+                                    let _ = to_gpu_tx.send(Err(error.to_string()));
+                                    return;
+                                }
+                            };
+                            if let Some(frame) = decoded {
+                                let frame = match cutouts
+                                    .get(&layer.clip)
+                                    .and_then(|job| job.cut(&frame, layer.source_time))
+                                {
+                                    Some(cut) => cut,
+                                    None => frame,
+                                };
+                                layers.push(filled(
+                                    layer,
+                                    std::sync::Arc::new(frame),
+                                    tracks.get(&layer.clip).copied().unwrap_or(0),
+                                    passes_at(&chains, &reveal_maps, &timeline, layer.clip, time),
+                                    geometry.get(&layer.clip),
+                                    shapes_at(&shapes, layer, time, rate),
+                                    stabilized.get(&layer.clip),
+                                ));
+                            }
+                        }
+
+                        let frame_plan = FramePlan {
+                            time,
+                            width: request.width,
+                            height: request.height,
+                            canvas: plan.canvas,
+                            layers: with_backdrops(
+                                layers,
+                                &backdrops,
+                                |clip| !stills.contains(&clip) && !cutouts.contains_key(&clip),
+                                &sought,
+                                (request.width, request.height),
+                            ),
+                            treatments: Vec::new(),
+                            output: signal,
+                        };
+                        if to_gpu_tx
+                            .send(Ok(DecodedItem::Compose {
+                                index,
+                                time,
+                                plan: frame_plan,
+                            }))
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                };
+                });
 
-                // A source that has run out contributes nothing rather than
-                // aborting the export - a clip trimmed past its media's end is a
-                // mistake in the edit, not a failure of the renderer.
-                if let Some(frame) = decoder.next_frame().map_err(|error| error.to_string())? {
-                    // The cutout, on the decoded picture before it is placed:
-                    // the same frame both compositors then draw.
-                    let frame = match cutouts
-                        .get(&layer.clip)
-                        .and_then(|job| job.cut(&frame, layer.source_time))
-                    {
-                        Some(cut) => cut,
-                        None => frame,
-                    };
-                    layers.push(filled(
-                        layer,
-                        std::sync::Arc::new(frame),
-                        tracks.get(&layer.clip).copied().unwrap_or(0),
-                        passes_at(&chains, &reveal_maps, &timeline, layer.clip, time),
-                        geometry.get(&layer.clip),
-                        shapes_at(&shapes, layer, time, rate),
-                        stabilized.get(&layer.clip),
-                    ));
+            let (mut gpu, mut gpu_losses) = moved_compositor.take().expect("compositor");
+            let gpu_spawn = std::thread::Builder::new()
+                .name("concat-export-gpu".to_owned())
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, move || -> Result<(WgpuCompositor, u32), String> {
+                    while let Ok(msg) = to_gpu_rx.recv() {
+                        let ready = match msg {
+                            Err(err) => {
+                                let _ = to_enc_tx.send(Err(err));
+                                break;
+                            }
+                            Ok(DecodedItem::Yuv { index, yuv }) => ReadyFrame::Yuv { index, yuv },
+                            Ok(DecodedItem::Passthrough { index, frame }) => {
+                                ReadyFrame::Rgba { index, frame }
+                            }
+                            Ok(DecodedItem::Compose {
+                                index,
+                                time,
+                                plan: frame_plan,
+                            }) => {
+                                let mut composed = composite_treated(
+                                    &mut EffectClock {
+                                        inner: &mut gpu,
+                                        offset: effect_offset,
+                                    },
+                                    &frame_plan,
+                                    &built.treatments,
+                                    &built.transitions,
+                                );
+                                while gpu.lost() {
+                                    gpu_losses += 1;
+                                    let adapter = gpu.adapter_info();
+                                    log::error!(
+                                        "export: the GPU device on {} was lost drawing frame {index} of {total_frames} \
+                                         ({:.3}s into the cut); the frame is drawn again on the next device",
+                                        adapter.name,
+                                        time.as_f64(),
+                                    );
+                                    match recovered(gpu_losses, hdr) {
+                                        Ok(fresh) => gpu = fresh,
+                                        Err(err) => {
+                                            let _ = to_enc_tx.send(Err(err.clone()));
+                                            return Err(err);
+                                        }
+                                    }
+                                    composed = composite_treated(
+                                        &mut EffectClock {
+                                            inner: &mut gpu,
+                                            offset: effect_offset,
+                                        },
+                                        &frame_plan,
+                                        &built.treatments,
+                                        &built.transitions,
+                                    );
+                                }
+                                ReadyFrame::Rgba {
+                                    index,
+                                    frame: composed,
+                                }
+                            }
+                        };
+                        if to_enc_tx.send(Ok(ready)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok((gpu, gpu_losses))
+                });
+
+            if let Err(err) = dec_spawn {
+                drop(to_enc_rx);
+                if let Ok(handle) = gpu_spawn {
+                    gpu_returned = handle.join().ok();
                 }
+                return PassOutcome::Failed(format!("could not spawn decode thread: {err}"));
             }
-
-            let frame_plan = FramePlan {
-                time,
-                width: request.width,
-                height: request.height,
-                canvas: plan.canvas,
-                layers: with_backdrops(
-                    layers,
-                    &backdrops,
-                    |clip| !stills.contains(&clip) && !cutouts.contains_key(&clip),
-                    &sought,
-                    (request.width, request.height),
-                ),
-                treatments: Vec::new(),
-                output: output_of(request.color_space),
+            let gpu_handle = match gpu_spawn {
+                Ok(handle) => handle,
+                Err(err) => {
+                    drop(to_enc_rx);
+                    return PassOutcome::Failed(format!("could not spawn GPU thread: {err}"));
+                }
             };
-            // The plan is kept for a second drawing: a frame drawn on a device
-            // that died under it is black, and is drawn again on the device
-            // that takes over. Both drawings borrow it - the layers' pictures
-            // were never copied, and now their passes are not either.
-            let mut composed = composite_treated(
-                &mut EffectClock {
-                    inner: &mut compositor,
-                    offset: effect_offset,
-                },
-                &frame_plan,
-                &treatments,
-                &transitions,
+
+            let mut said = std::time::Instant::now();
+            let outcome = loop {
+                if let Err(err) = reporter.cancelled() {
+                    break PassOutcome::Failed(err);
+                }
+                let Some(msg) = to_enc_rx.recv().ok() else {
+                    break PassOutcome::Done;
+                };
+                let (index, write_result) = match msg {
+                    Err(err) => break PassOutcome::Failed(err),
+                    Ok(ReadyFrame::Yuv { index, yuv }) => (index, encoder.write_yuv_frame(&yuv)),
+                    Ok(ReadyFrame::Rgba { index, frame }) => (index, encoder.write_frame(&frame)),
+                };
+                if let Err(error) = write_result {
+                    break PassOutcome::RetrySoftware { index, error };
+                }
+                if progress_due(index, said.elapsed()) {
+                    reporter.emit(index, total_frames, stage);
+                    said = std::time::Instant::now();
+                }
+            };
+            // Drop receiver first so upstream GPU and decode threads unblock
+            // immediately and release their MediaCodec seats before join.
+            drop(to_enc_rx);
+            gpu_returned = Some(
+                gpu_handle
+                    .join()
+                    .unwrap_or_else(|_| Err("export GPU thread panicked".to_owned())),
             );
-            while compositor.lost() {
-                losses += 1;
-                let adapter = compositor.adapter_info();
-                log::error!(
-                    "export: the GPU device on {} was lost drawing frame {index} of {total_frames} \
-                 ({:.3}s into the cut); the frame is drawn again on the next device",
-                    adapter.name,
-                    time.as_f64(),
-                );
-                compositor = recovered(losses, hdr)?;
-                composed = composite_treated(
-                    &mut EffectClock {
-                        inner: &mut compositor,
-                        offset: effect_offset,
-                    },
-                    &frame_plan,
-                    &treatments,
-                    &transitions,
-                );
-            }
-            if let Err(error) = encoder.write_frame(&composed) {
-                // The stopped encoder is closed before the file is opened
-                // again, so the chip has its session back.
+            outcome
+        });
+
+        let restored = match gpu_returned {
+            Some(Ok(pair)) => Some(pair),
+            Some(Err(err)) => return Err(err),
+            None => None,
+        };
+
+        match pass_outcome {
+            PassOutcome::Failed(err) => return Err(err),
+            PassOutcome::RetrySoftware { index, error } => {
                 drop(encoder);
                 again_in_software(&error, &mut options, index, total_frames)?;
+                let (restored_gpu, restored_losses) =
+                    restored.ok_or_else(|| "export GPU compositor missing".to_owned())?;
+                compositor = restored_gpu;
+                losses = restored_losses;
                 reporter.emit(0, total_frames, RENDERING_IN_SOFTWARE);
                 continue 'pass;
             }
-
-            // Retire decoders whose clip has finished, so a long timeline does not
-            // hold an ffmpeg process open for every clip it has ever passed.
-            let live: Vec<ClipId> = plan.layers.iter().map(|layer| layer.clip).collect();
-            decoders.retain(|clip, _| live.contains(clip));
-
-            if progress_due(index, said.elapsed()) {
-                reporter.emit(index, total_frames, stage);
-                said = std::time::Instant::now();
-            }
-        }
-
-        match encoder.finish() {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                drop(encoder);
-                again_in_software(&error, &mut options, total_frames, total_frames)?;
-                reporter.emit(0, total_frames, RENDERING_IN_SOFTWARE);
-            }
+            PassOutcome::Done => match encoder.finish() {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    drop(encoder);
+                    again_in_software(&error, &mut options, total_frames, total_frames)?;
+                    let (restored_gpu, restored_losses) =
+                        restored.ok_or_else(|| "export GPU compositor missing".to_owned())?;
+                    compositor = restored_gpu;
+                    losses = restored_losses;
+                    reporter.emit(0, total_frames, RENDERING_IN_SOFTWARE);
+                }
+            },
         }
     }
 }
@@ -4623,5 +5039,95 @@ mod tests {
         let (end, frames) = timeline_extent(&down, FrameRate::THIRTY, 0.0);
         assert_eq!(end, Rational::new(299, 30));
         assert_eq!(frames, 299, "no black frame past the end");
+    }
+
+    #[test]
+    fn untreated_cuts_and_composited_overlays_seamlessly_round_trip_through_pipeline() {
+        let dir = std::env::temp_dir().join(format!("concat-export-fastpath-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src_a = dir.join("clip_a.mp4");
+        let src_b = dir.join("clip_b.mp4");
+        let src_ov = dir.join("overlay.mp4");
+        let out = dir.join("out.mp4");
+
+        let opts = EncodeOptions {
+            crf: 16,
+            ..EncodeOptions::default()
+        };
+        let write_solid = |path: &Path, rgba: [u8; 4], frames: usize| {
+            let mut enc = Encoder::create(path, 128, 128, FrameRate::THIRTY, &opts).unwrap();
+            let f = Frame::from_rgba(128, 128, rgba.repeat(128 * 128)).unwrap();
+            for _ in 0..frames {
+                enc.write_frame(&f).unwrap();
+            }
+            enc.finish().unwrap();
+        };
+        write_solid(&src_a, [20, 210, 30, 255], 12);
+        write_solid(&src_b, [30, 50, 220, 255], 12);
+        write_solid(&src_ov, [220, 30, 30, 255], 6);
+
+        let mut clip_a = clip("video", 0, 0.0, 0.2, 0.1);
+        clip_a.path = src_a.to_string_lossy().into_owned();
+        clip_a.media_width = Some(128);
+        clip_a.media_height = Some(128);
+
+        let mut clip_b = clip("video", 0, 0.2, 0.3, 0.0);
+        clip_b.path = src_b.to_string_lossy().into_owned();
+        clip_b.media_width = Some(128);
+        clip_b.media_height = Some(128);
+
+        // Track 1 overlay covers only 0.2..0.3s (first 3 frames of clip_b),
+        // so clip_b starts on GPU compositing and then switches mid-clip back
+        // to zero-copy RawYuv bypass for 0.3..0.5s!
+        let mut ov = clip("video", 1, 0.2, 0.1, 0.0);
+        ov.path = src_ov.to_string_lossy().into_owned();
+        ov.media_width = Some(128);
+        ov.media_height = Some(128);
+
+        let request = ExportRequest {
+            canvas: [0, 0, 0, 255],
+            output: out.to_string_lossy().into_owned(),
+            width: 128,
+            height: 128,
+            rate_num: 30,
+            rate_den: 1,
+            crf: 18,
+            preset: "ultrafast".into(),
+            codec: VideoCodec::H264,
+            ten_bit: false,
+            rate_mode: RateMode::Vbr,
+            bitrate_kbps: 0,
+            color_range: concat_media::ColorRange::Limited,
+            color_space: ColorSpace::Sdr,
+            hdr: false,
+            effect_time_offset: 0.0,
+            clips: vec![clip_a, clip_b, ov],
+        };
+        let cancel = AtomicBool::new(false);
+        let mut progress = |_: i64, _: i64, _: &'static str| {};
+        render_on(
+            &request,
+            None,
+            Reporter {
+                progress: &mut progress,
+                cancel: &cancel,
+            },
+        )
+        .expect("export succeeds");
+
+        let mut dec = Decoder::open(&out, &DecodeOptions::default()).unwrap();
+        let mut decoded = Vec::new();
+        while let Some(f) = dec.next_frame().unwrap() {
+            decoded.push(f.pixels()[..4].to_vec());
+        }
+        assert_eq!(decoded.len(), 15);
+        // Frames 0..6: green (RawYuv bypass on clip_a)
+        assert!(decoded[2][1] > 180 && decoded[2][0] < 60, "frame 2: {:?}", decoded[2]);
+        // Frames 6..9: red overlay composited on GPU over clip_b
+        assert!(decoded[7][0] > 180 && decoded[7][2] < 60, "frame 7: {:?}", decoded[7]);
+        // Frames 9..15: blue (clip_b switched back to RawYuv bypass mid-clip!)
+        assert!(decoded[12][2] > 180 && decoded[12][0] < 60, "frame 12: {:?}", decoded[12]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

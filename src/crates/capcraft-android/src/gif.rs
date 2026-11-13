@@ -65,24 +65,34 @@ pub fn start_gif_export(
     let (width, height) = gif_size(view.width, view.height, settings.short_side);
     std::thread::Builder::new()
         .name("capcraft-gif".to_owned())
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let cancel = job.cancel_handle();
-            let result = write(
-                &session,
-                &settings,
-                width,
-                height,
-                view.duration_us,
-                &|fraction| {
-                    listener.on_progress(fraction);
-                    !cancel.load(Ordering::Relaxed)
-                },
-            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                write(
+                    &session,
+                    &settings,
+                    width,
+                    height,
+                    view.duration_us,
+                    &|fraction| {
+                        listener.on_progress(fraction);
+                        !cancel.load(Ordering::Relaxed)
+                    },
+                )
+            }));
             match result {
-                Ok(()) => listener.on_done(settings.output.clone()),
-                Err(message) => {
+                Ok(Ok(())) => listener.on_done(settings.output.clone()),
+                Ok(Err(message)) => {
                     let _ = std::fs::remove_file(&settings.output);
                     listener.on_failed(message, job.cancelled());
+                }
+                Err(_) => {
+                    let _ = std::fs::remove_file(&settings.output);
+                    listener.on_failed(
+                        "GIF export failed unexpectedly.".to_owned(),
+                        job.cancelled(),
+                    );
                 }
             }
             drop(job);

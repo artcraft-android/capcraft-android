@@ -170,9 +170,23 @@ pub struct DecodeOptions {
     /// pre-chain runs, since those are FFmpeg filters on eight bits. See
     /// [`Frame::signal`].
     pub deep: bool,
+    /// Eight bits a sample will do: for a reader whose pictures end up in
+    /// eight bits whatever the file holds - a proxy or a scrub copy being
+    /// written. A phone's chip is then left to hand a ten-bit stream back
+    /// in eight, half the bytes to copy out of it and to convert, which is
+    /// most of what such a frame costs. Nothing changes in software, and
+    /// nothing for a reader that keeps the source [deep](Self::deep).
+    pub eight_bit: bool,
 }
 
 impl DecodeOptions {
+    /// Whether the chip may squeeze a deep stream to eight bits for this
+    /// reader: [`DecodeOptions::eight_bit`], unless it keeps the source
+    /// deep.
+    fn squeezed(&self) -> bool {
+        self.eight_bit && !self.deep
+    }
+
     /// Seeks to `start` before decoding.
     pub fn starting_at(mut self, start: Rational) -> Self {
         self.start = Some(start);
@@ -245,6 +259,12 @@ impl DecodeOptions {
     /// Keeps a wide or HDR source deep; see [`DecodeOptions::deep`].
     pub fn deep(mut self, deep: bool) -> Self {
         self.deep = deep;
+        self
+    }
+
+    /// Lets the chip hand back eight bits; see [`DecodeOptions::eight_bit`].
+    pub fn eight_bit(mut self, eight_bit: bool) -> Self {
+        self.eight_bit = eight_bit;
         self
     }
 
@@ -672,6 +692,27 @@ pub struct Decoder {
     position: Option<Rational>,
     /// What the stream says its colour is.
     color: ColorSignal,
+    /// Whether the input stream carries no alpha plane (so every converted
+    /// RGBA pixel has alpha 255).
+    opaque: bool,
+}
+
+/// An un-composited BT.709 YUV frame from [`Decoder::next_export_frame`],
+/// ready for [`crate::Encoder::write_yuv_frame`] without an RGBA round-trip.
+pub struct RawYuv(pub(crate) Video);
+
+// SAFETY: `RawYuv` owns an exclusive `AVFrame` header whose underlying plane
+// buffers are reference-counted via FFmpeg's atomic `AVBufferRef`.
+unsafe impl Send for RawYuv {}
+
+/// One frame produced for an export pipeline: either BT.709 YUV ready for
+/// direct encoding when the frame needs no RGBA filter or GPU shader, or
+/// converted RGBA(64) pixels.
+pub enum ExportFrame {
+    /// BT.709 YUV matching the target range and aspect ratio.
+    Yuv(RawYuv),
+    /// Converted RGBA or RGBA64LE [`Frame`].
+    Rgba(Frame),
 }
 
 impl Decoder {
@@ -718,6 +759,45 @@ impl Decoder {
                 Pixel::from(ffmpeg::sys::AVPixelFormat(raw)),
             )
         };
+        // The caller's word over the file's, where the caller has one: the
+        // file's tag is what the override exists to correct. Where neither
+        // says, the codec's convention does; see `ColorRange::implied`.
+        // Read off the stream, not the opened codec: MediaCodec's wrapper
+        // writes the chip's own idea of the colour into the codec as it
+        // starts - limited range on a stream that says nothing, NV12 for
+        // the pixels - which is not what the file says.
+        // SAFETY: a live stream's codec parameters; plain enum fields.
+        let (tagged, primaries, transfer, matrix) = unsafe {
+            let raw = stream.parameters().as_ptr();
+            (
+                ffmpeg::color::Range::from((*raw).color_range),
+                ffmpeg::color::Primaries::from((*raw).color_primaries),
+                ffmpeg::color::TransferCharacteristic::from((*raw).color_trc),
+                ffmpeg::color::Space::from((*raw).color_space),
+            )
+        };
+        let implied = options.color_range.is_none() && tagged == ffmpeg::color::Range::Unspecified;
+        let color = ColorSignal {
+            primaries,
+            transfer,
+            matrix,
+            range: match options.color_range {
+                Some(range) => range.as_ffmpeg(),
+                None if implied => ColorRange::implied(codec, format).as_ffmpeg(),
+                None => tagged,
+            },
+            implied,
+        };
+        let alpha_dec = alpha_decoder(&stream);
+        let opaque = alpha_dec.is_none()
+            && format.descriptor().is_none_or(|desc| {
+                // SAFETY: `desc` points into libavutil's static table.
+                (unsafe { (*desc.as_ptr()).flags } as u64)
+                    & (ffmpeg::sys::AV_PIX_FMT_FLAG_ALPHA as u64)
+                    == 0
+            });
+        let needs_deep = deep_output(options, Some(&color)).is_some();
+
         let software = || Self::open_codec(path, &stream, options, Codec::Software);
         // A WebM alpha layer is a plane the built-in VP8 and VP9 decoders
         // do not read, and no hwaccel hands it back either: the picture
@@ -725,10 +805,7 @@ impl Decoder {
         // in software, so a track that says it has one goes there and to
         // no device.
         // https://github.com/jub0t/Concat/issues/429
-        let (decoder, accelerated) = match (
-            alpha_decoder(&stream),
-            options.hardware.device_for(codec, format),
-        ) {
+        let (decoder, accelerated) = match (alpha_dec, options.hardware.device_for(codec, format)) {
             (Some(name), _) => match Self::open_codec(path, &stream, options, Codec::Named(name)) {
                 Ok((decoder, _)) => (decoder, None),
                 Err(error) => {
@@ -749,20 +826,58 @@ impl Decoder {
                 // scrub copy being written - which the CPU makes in no time:
                 // on the chip it held a seat the picture a person watches
                 // needed, and the preview decoded on the CPU.
+                // Unless the stream is a deep one being copied in eight
+                // bits: that the CPU does not make in no time - a 4K
+                // ten-bit frame took it four times what it takes the chip.
                 let small = options.size.is_some_and(|(width, height)| {
                     u64::from(width) * u64::from(height) < hardware::MEDIACODEC_SMALLEST
-                });
-                let wrapped = hardware::mediacodec_decoder(codec, format)
-                    .filter(|_| !options.keyframes_only && !small)
-                    .filter(|&name| {
-                        hardware::mediacodec_works(name, || {
-                            first_picture_within(path, name, hardware::MEDIACODEC_FIRST_PICTURE)
-                        })
+                }) && !(options.squeezed() && hardware::deep(format));
+                let try_format = |name: &'static str, wanted: Pixel| {
+                    let trial = hardware::mediacodec_trial(name, wanted);
+                    hardware::mediacodec_works(trial, || {
+                        first_picture_within(
+                            path,
+                            name,
+                            wanted,
+                            hardware::MEDIACODEC_FIRST_PICTURE,
+                        )
                     })
-                    .and_then(|name| hardware::mediacodec_seat().map(|seat| (name, seat)));
-                match wrapped {
-                    Some((name, seat)) => {
-                        match Self::open_codec(path, &stream, options, Codec::Named(name)) {
+                };
+                let chosen = hardware::mediacodec_decoder(codec, format)
+                    .filter(|_| !options.keyframes_only && !small)
+                    .and_then(|name| {
+                        let primary = if options.squeezed() {
+                            Pixel::YUV420P
+                        } else {
+                            format
+                        };
+                        if try_format(name, primary) {
+                            return Some((name, options.squeezed()));
+                        }
+                        // Pre-Android-13 devices have no COLOR_FormatYUVP010:
+                        // when the output ends in eight bits anyway (SDR/log
+                        // rather than HDR), let the chip decode to eight-bit
+                        // NV12 instead of falling back to slow CPU HEVC.
+                        if !options.squeezed()
+                            && hardware::deep(format)
+                            && !needs_deep
+                            && try_format(name, Pixel::YUV420P)
+                        {
+                            return Some((name, true));
+                        }
+                        None
+                    })
+                    .and_then(|(name, squeeze)| {
+                        hardware::mediacodec_seat().map(|seat| (name, squeeze, seat))
+                    });
+                match chosen {
+                    Some((name, squeeze, seat)) => {
+                        let mut open_opts = options.clone();
+                        if squeeze {
+                            open_opts.deep = false;
+                            open_opts.eight_bit = true;
+                        }
+                        match Self::open_codec(path, &stream, &open_opts, Codec::Named(name)) {
                             Ok((decoder, _)) => {
                                 hardware::note_wrapped(device, name);
                                 (
@@ -806,35 +921,6 @@ impl Decoder {
             },
             (None, None) => software()?,
         };
-        // The caller's word over the file's, where the caller has one: the
-        // file's tag is what the override exists to correct. Where neither
-        // says, the codec's convention does; see `ColorRange::implied`.
-        // Read off the stream, not the opened codec: MediaCodec's wrapper
-        // writes the chip's own idea of the colour into the codec as it
-        // starts - limited range on a stream that says nothing, NV12 for
-        // the pixels - which is not what the file says.
-        // SAFETY: a live stream's codec parameters; plain enum fields.
-        let (tagged, primaries, transfer, matrix) = unsafe {
-            let raw = stream.parameters().as_ptr();
-            (
-                ffmpeg::color::Range::from((*raw).color_range),
-                ffmpeg::color::Primaries::from((*raw).color_primaries),
-                ffmpeg::color::TransferCharacteristic::from((*raw).color_trc),
-                ffmpeg::color::Space::from((*raw).color_space),
-            )
-        };
-        let implied = options.color_range.is_none() && tagged == ffmpeg::color::Range::Unspecified;
-        let color = ColorSignal {
-            primaries,
-            transfer,
-            matrix,
-            range: match options.color_range {
-                Some(range) => range.as_ffmpeg(),
-                None if implied => ColorRange::implied(codec, format).as_ffmpeg(),
-                None => tagged,
-            },
-            implied,
-        };
 
         let (width, height) = match options.size {
             Some(size) => size,
@@ -876,6 +962,7 @@ impl Decoder {
             produced: 0,
             position: None,
             color,
+            opaque,
         };
         if let Some(start) = options.start
             && !start.is_zero()
@@ -907,7 +994,16 @@ impl Decoder {
         unsafe {
             let raw = context.as_mut_ptr();
             (*raw).thread_type = ffmpeg::sys::FF_THREAD_FRAME | ffmpeg::sys::FF_THREAD_SLICE;
-            (*raw).thread_count = i32::from(options.threads);
+            let threads = if cfg!(target_os = "android") && options.threads == 0 {
+                // Unbounded frame threading (0 -> 9..16 threads per decoder on
+                // 8-core Snapdragon SoCs) multiplies 4K reference-frame pools
+                // across warm readers; four threads keeps seeks fast and memory
+                // bounded.
+                4
+            } else {
+                i32::from(options.threads)
+            };
+            (*raw).thread_count = threads;
         }
         let (accelerated, named) = match codec {
             Codec::Software => (None, None),
@@ -929,6 +1025,15 @@ impl Decoder {
                 // SAFETY: the context is not opened yet; a plain rational.
                 unsafe {
                     (*context.as_mut_ptr()).pkt_timebase = stream.time_base().into();
+                }
+                // The wrapper asks the chip for ten bits when the stream
+                // says it has them (see `scripts/ffmpeg-patches`). Told
+                // eight, it asks for nothing, and the chip squeezes.
+                if options.squeezed() {
+                    // SAFETY: the context is not opened yet; a plain enum.
+                    unsafe {
+                        (*context.as_mut_ptr()).pix_fmt = Pixel::YUV420P.into();
+                    }
                 }
                 (None, Some(found))
             }
@@ -1363,10 +1468,35 @@ impl Decoder {
         let row = width as usize * if deep.is_some() { 8 } else { 4 };
         let stride = filtered.stride(0);
         let data = filtered.data(0);
-        let mut pixels = Vec::with_capacity(row * height as usize);
-        for y in 0..height as usize {
-            pixels.extend_from_slice(&data[y * stride..y * stride + row]);
+        if stride < row || height == 0 || width == 0 {
+            return Err(Error::Probe {
+                path: self.path.clone(),
+                detail: format!(
+                    "the filtergraph returned an invalid plane ({width}x{height}, stride {stride})"
+                ),
+            });
         }
+        let needed = (height as usize - 1)
+            .saturating_mul(stride)
+            .saturating_add(row);
+        if data.len() < needed {
+            return Err(Error::Probe {
+                path: self.path.clone(),
+                detail: format!(
+                    "the filtergraph plane buffer is truncated ({} < {needed})",
+                    data.len()
+                ),
+            });
+        }
+        let pixels = if stride == row {
+            data[..row * height as usize].to_vec()
+        } else {
+            let mut pixels = Vec::with_capacity(row * height as usize);
+            for y in 0..height as usize {
+                pixels.extend_from_slice(&data[y * stride..y * stride + row]);
+            }
+            pixels
+        };
         let frame = match deep {
             Some(signal) => Frame::from_rgba64(width, height, pixels, signal),
             None => Frame::from_rgba(width, height, pixels),
@@ -1379,6 +1509,21 @@ impl Decoder {
 
     fn build_graph(&self, format: Pixel, width: u32, height: u32) -> Result<filter::Graph> {
         let mut graph = filter::Graph::new();
+        // Keep filter slice threads matched to big cores on mobile so 8-core
+        // big.LITTLE SoCs do not stall every frame waiting on slow Silver cores.
+        // SAFETY: `graph` owns a freshly allocated AVFilterGraph before setup.
+        unsafe {
+            let threads = if self.options.threads > 0 {
+                i32::from(self.options.threads)
+            } else if cfg!(target_os = "android") {
+                4
+            } else {
+                0
+            };
+            if threads > 0 {
+                (*graph.as_mut_ptr()).nb_threads = threads;
+            }
+        }
         let args = format!(
             "video_size={width}x{height}:pix_fmt={}:time_base={}/{}:pixel_aspect=1/1",
             Into::<ffmpeg::sys::AVPixelFormat>::into(format).0,
@@ -1421,34 +1566,34 @@ impl Decoder {
         Ok(graph)
     }
 
-    /// Without pacing: every source frame, in order.
-    fn next_unpaced(&mut self) -> Result<Option<Frame>> {
+    /// Without pacing: advances to the next raw source frame in order.
+    fn step_unpaced_source(&mut self) -> Result<Option<Video>> {
         let Some(source) = self.next_source()? else {
             if self.options.looping
                 && let Some(last) = self.current.as_ref()
             {
                 self.position = last.pts;
-                let frame = share(&last.frame);
-                return Ok(Some(self.convert(&frame)?));
+                return Ok(Some(share(&last.frame)));
             }
             return Ok(None);
         };
         self.position = source.pts;
-        // The buffer source takes the picture it is handed, and a repeating
-        // decoder needs that picture again after the end: it converts a
-        // reference and keeps the original, as the paced path does.
-        let frame = if self.options.looping {
-            let reference = share(&source.frame);
-            self.convert(&reference)?
-        } else {
-            self.convert(&source.frame)?
-        };
+        let frame = share(&source.frame);
         self.current = Some(source);
         Ok(Some(frame))
     }
 
-    /// With pacing: the source frame on screen at the next output instant.
-    fn next_paced(&mut self, rate: FrameRate) -> Result<Option<Frame>> {
+    /// Without pacing: every source frame, in order.
+    fn next_unpaced(&mut self) -> Result<Option<Frame>> {
+        let Some(frame) = self.step_unpaced_source()? else {
+            return Ok(None);
+        };
+        Ok(Some(self.convert(&frame)?))
+    }
+
+    /// With pacing: advances to the raw source frame on screen at the next
+    /// output instant.
+    fn step_paced_source(&mut self, rate: FrameRate) -> Result<Option<Video>> {
         let target = self.origin + rate.frame_duration() * Rational::from_int(self.tick as i64);
 
         // Advance until `pending` is the first frame after the target, so
@@ -1499,7 +1644,14 @@ impl Decoder {
         }
         self.position = Some(target);
         self.tick += 1;
-        let frame = share(&current.frame);
+        Ok(Some(share(&current.frame)))
+    }
+
+    /// With pacing: the source frame on screen at the next output instant.
+    fn next_paced(&mut self, rate: FrameRate) -> Result<Option<Frame>> {
+        let Some(frame) = self.step_paced_source(rate)? else {
+            return Ok(None);
+        };
         Ok(Some(self.convert(&frame)?))
     }
 }
@@ -1508,6 +1660,65 @@ impl Decoder {
     /// What the stream says its colour is; see [`ColorSignal`].
     pub fn color(&self) -> ColorSignal {
         self.color
+    }
+
+    /// Whether every converted RGBA pixel from this stream is guaranteed opaque.
+    pub const fn is_opaque(&self) -> bool {
+        self.opaque
+    }
+
+    /// Advances one frame for an untreated export layer: returns [`ExportFrame::Yuv`]
+    /// when the decoded frame is upright BT.709 YUV in `out_range` at the exact
+    /// aspect-fitted `(target_width, target_height)` (avoiding `YUV -> RGBA -> GPU -> RGBA -> YUV`),
+    /// and otherwise converts through the filtergraph to [`ExportFrame::Rgba`].
+    pub fn next_export_frame(
+        &mut self,
+        target_width: u32,
+        target_height: u32,
+        out_range: ColorRange,
+    ) -> Result<Option<ExportFrame>> {
+        if self
+            .options
+            .max_frames
+            .is_some_and(|limit| self.produced >= limit)
+        {
+            return Ok(None);
+        }
+        let Some(raw) = (match self.options.frame_rate {
+            Some(rate) => self.step_paced_source(rate)?,
+            None => self.step_unpaced_source()?,
+        }) else {
+            return Ok(None);
+        };
+        let in_full = match self.options.color_range {
+            Some(range) => range == ColorRange::Full,
+            None if self.color.implied => self.color.range == ffmpeg::color::Range::JPEG,
+            None => {
+                raw.color_range() == ffmpeg::color::Range::JPEG
+                    || matches!(raw.format(), Pixel::YUVJ420P)
+                    || self.color.range == ffmpeg::color::Range::JPEG
+            }
+        };
+        let can_yuv = self.opaque
+            && self.rotation == 0
+            && self.options.pre_chain.is_none()
+            && self.options.filter_chain.is_none()
+            && self.width == target_width
+            && self.height == target_height
+            && !self.color.is_wide()
+            && self.color.matrix == ffmpeg::color::Space::BT709
+            && in_full == (out_range == ColorRange::Full)
+            && matches!(
+                raw.format(),
+                Pixel::NV12 | Pixel::YUV420P | Pixel::P010LE | Pixel::YUV420P10LE
+            );
+        if can_yuv {
+            self.produced += 1;
+            return Ok(Some(ExportFrame::Yuv(RawYuv(raw))));
+        }
+        let rgba = self.convert(&raw)?;
+        self.produced += 1;
+        Ok(Some(ExportFrame::Rgba(rgba)))
     }
 }
 
@@ -1553,11 +1764,19 @@ impl FrameSource for Decoder {
 /// wedged try is left behind on its thread, and the reader never waits on
 /// it past the deadline. A try that answers late still has its say, for
 /// the readers that come after.
-fn first_picture_within(path: &Path, name: &'static str, wait: std::time::Duration) -> bool {
+fn first_picture_within(
+    path: &Path,
+    name: &'static str,
+    format: Pixel,
+    wait: std::time::Duration,
+) -> bool {
+    let trial = hardware::mediacodec_trial(name, format);
+    let deep = hardware::deep(format);
     let path = path.to_path_buf();
     let (answer, answered) = std::sync::mpsc::channel();
     let tried = std::thread::Builder::new()
         .name("mediacodec-first-picture".to_owned())
+        .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let attempt = || -> Option<()> {
                 let mut input = ffmpeg::format::input(&path).ok()?;
@@ -1566,7 +1785,7 @@ fn first_picture_within(path: &Path, name: &'static str, wait: std::time::Durati
                     let (codec, _) = Decoder::open_codec(
                         &path,
                         &stream,
-                        &DecodeOptions::default(),
+                        &DecodeOptions::default().eight_bit(!deep),
                         Codec::Named(name),
                     )
                     .ok()?;
@@ -1574,16 +1793,25 @@ fn first_picture_within(path: &Path, name: &'static str, wait: std::time::Durati
                 };
                 let mut held = None;
                 let read = || feed::read_packet(&mut input, index);
-                feed::next_frame(&mut codec, &mut held, read)
-                    .ok()?
-                    .map(|_| ())
+                let picture = feed::next_frame(&mut codec, &mut held, read).ok()??;
+                if deep && !hardware::deep(picture.format()) {
+                    log::warn!(
+                        "MediaCodec's {name} gave {:?} for a ten-bit stream",
+                        picture.format()
+                    );
+                    return None;
+                }
+                Some(())
             };
-            let works = attempt().is_some();
+            let works = std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt))
+                .ok()
+                .flatten()
+                .is_some();
             let _ = answer.send(works);
             // Late or not, what it found is the verdict from now on: a
             // decoder that was only slow to start is not written off for
             // the life of the process.
-            hardware::mediacodec_answered(name, works);
+            hardware::mediacodec_answered(trial, works);
         });
     tried.is_ok() && answered.recv_timeout(wait).unwrap_or(false)
 }
@@ -2382,7 +2610,12 @@ mod tests {
                 Pixel::YUV420P,
             )
             .expect("a codec MediaCodec takes");
-            let answered = first_picture_within(&path, name, std::time::Duration::from_secs(60));
+            let answered = first_picture_within(
+                &path,
+                name,
+                Pixel::YUV420P,
+                std::time::Duration::from_secs(60),
+            );
             eprintln!(
                 "{name}: first picture {} in {:?}",
                 if answered { "came" } else { "did not come" },

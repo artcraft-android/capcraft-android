@@ -47,6 +47,24 @@ pub fn init() {
     });
 }
 
+/// Hands the Android process's `JavaVM` pointer to `libavcodec` so its
+/// `--enable-jni --enable-mediacodec` codec-list discovery and wrappers can
+/// query Android's `MediaCodecList` cleanly on Snapdragon and other SoCs.
+///
+/// # Safety
+///
+/// `vm` must be a valid `JavaVM*` that outlives the process.
+#[cfg(target_os = "android")]
+pub unsafe fn set_android_java_vm(vm: *mut c_void) {
+    unsafe extern "C" {
+        fn av_jni_set_java_vm(vm: *mut c_void, log_ctx: *mut c_void) -> c_int;
+    }
+    if !vm.is_null() {
+        // SAFETY: `vm` lives for the duration of the Android process.
+        let _ = unsafe { av_jni_set_java_vm(vm, std::ptr::null_mut()) };
+    }
+}
+
 /// The `va_list` a log callback is handed, spelt as the bindings spell it
 /// in a parameter. On x86_64's System V ABI - Linux, and Intel Macs - C's
 /// `va_list` is an array of one `__va_list_tag`, and an array in a

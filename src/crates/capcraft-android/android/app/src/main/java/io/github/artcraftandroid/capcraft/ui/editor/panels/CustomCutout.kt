@@ -84,23 +84,31 @@ private fun readStrokes(vm: EditorViewModel, clipId: String) {
     CutoutBrush.reading = "Reading the stroke" to 0f
     val listener = object : SpeechListener {
         override fun onProgress(fraction: Float, stage: String) {
-            CutoutBrush.reading = (if (stage == "download") "Downloading the brush model" else "Reading the stroke") to fraction
+            vm.viewModelScope.launch(Dispatchers.Main) {
+                CutoutBrush.reading = (if (stage == "download") "Downloading the brush model" else "Reading the stroke") to fraction
+            }
         }
 
         override fun onDone(result: TimelineView?) {
-            CutoutBrush.reading = null
-            result?.let { view -> vm.viewModelScope.launch(Dispatchers.Main) { vm.applyView(view) } }
+            vm.viewModelScope.launch(Dispatchers.Main) {
+                CutoutBrush.reading = null
+                result?.let { view -> vm.applyView(view) }
+            }
         }
 
         override fun onFailed(message: String) {
-            CutoutBrush.reading = null
-            vm.message = message
+            vm.viewModelScope.launch(Dispatchers.Main) {
+                CutoutBrush.reading = null
+                vm.message = message
+            }
         }
     }
     vm.viewModelScope.launch(Threads.commands) {
         runCatching { s.readSmartStrokes(clipId, listener) }.onFailure { e ->
-            CutoutBrush.reading = null
-            vm.message = e.userMessage
+            withContext(Dispatchers.Main) {
+                CutoutBrush.reading = null
+                vm.message = e.userMessage
+            }
         }
     }
 }

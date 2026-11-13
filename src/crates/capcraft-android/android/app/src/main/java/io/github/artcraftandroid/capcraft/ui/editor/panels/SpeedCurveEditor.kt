@@ -64,7 +64,10 @@ private fun meanOf(points: List<Pair<Double, Double>>): Double {
  */
 @Composable
 fun SpeedCurveEditor(vm: EditorViewModel, clip: ClipView, start: List<Pair<Double, Double>>, onBack: () -> Unit) {
-    var points by remember(clip.id) { mutableStateOf(start.sortedBy { it.first }) }
+    var points by remember(clip.id) {
+        val sorted = start.sortedBy { it.first }
+        mutableStateOf(if (sorted.size >= 2) sorted else listOf(0.0 to 1.0, 1.0 to 1.0))
+    }
     var chosen by remember(clip.id) { mutableIntStateOf(-1) }
     val sourceSeconds = clip.durationUs * clip.speed / 1e6
     val playheadAt = ((vm.playhead - clip.startUs).toDouble() / clip.durationUs.coerceAtLeast(1)).coerceIn(0.0, 1.0)
@@ -92,10 +95,11 @@ fun SpeedCurveEditor(vm: EditorViewModel, clip: ClipView, start: List<Pair<Doubl
                     if (removable) {
                         send(points.filterIndexed { i, _ -> i != chosen }, null)
                         chosen = -1
-                    } else {
+                    } else if (points.size >= 2) {
                         // a new point on the curve where the playhead is, unless one is already there
                         if (points.none { abs(it.first - playheadAt) < 0.03 }) {
-                            val i = points.indexOfFirst { it.first > playheadAt }.coerceAtLeast(1)
+                            val found = points.indexOfFirst { it.first > playheadAt }
+                            val i = if (found < 0) points.lastIndex else found.coerceIn(1, points.lastIndex)
                             val (a, sa) = points[i - 1]
                             val (b, sb) = points[i]
                             val f = ((playheadAt - a) / (b - a).coerceAtLeast(1e-6)).coerceIn(0.0, 1.0)
@@ -138,16 +142,20 @@ fun SpeedCurveEditor(vm: EditorViewModel, clip: ClipView, start: List<Pair<Doubl
                         onDragCancel = { dragging = -1; vm.endGesture() },
                     ) { change, _ ->
                         val i = dragging
-                        if (i < 0) return@detectDragGestures
-                        val w = size.width.toFloat()
-                        val h = size.height.toFloat()
-                        val p = change.position
                         val now = latest
+                        if (i !in now.indices) return@detectDragGestures
+                        val w = size.width.toFloat().coerceAtLeast(1f)
+                        val h = size.height.toFloat().coerceAtLeast(1f)
+                        val p = change.position
                         // the ends stay at the clip's ends; the others stay between their neighbours
                         val at = when (i) {
                             0 -> 0.0
                             now.size - 1 -> 1.0
-                            else -> (p.x / w).toDouble().coerceIn(now[i - 1].first + 0.02, now[i + 1].first - 0.02)
+                            else -> {
+                                val lo = now[i - 1].first + 0.02
+                                val hi = now[i + 1].first - 0.02
+                                if (lo <= hi) (p.x / w).toDouble().coerceIn(lo, hi) else (now[i - 1].first + now[i + 1].first) / 2.0
+                            }
                         }
                         var speed = yToSpeed(1 - (p.y / h).toDouble())
                         if (abs(speed - 1.0) < 0.06) speed = 1.0

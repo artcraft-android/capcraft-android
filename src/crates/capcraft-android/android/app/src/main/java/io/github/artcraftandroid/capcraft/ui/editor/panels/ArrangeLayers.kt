@@ -117,10 +117,11 @@ fun ArrangeLayersPanel(vm: EditorViewModel) {
                                                     drag += amount.x
                                                 },
                                                 onDragEnd = {
+                                                    if (layers.isEmpty()) { drag = 0f; return@detectDragGesturesAfterLongPress }
                                                     val to = (i + (drag / slot).roundToInt()).coerceIn(0, layers.lastIndex)
                                                     drag = 0f
                                                     // to the left is in front of the one there, to the right behind it
-                                                    if (to != i) put(c, layers[to], above = to < i)
+                                                    if (to != i && to in layers.indices) put(c, layers[to], above = to < i)
                                                 },
                                                 onDragCancel = { drag = 0f },
                                             )

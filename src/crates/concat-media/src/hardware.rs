@@ -209,12 +209,16 @@ pub fn hardware_wins(device: HwDevice, codec: ffmpeg::codec::Id, format: Pixel) 
     if device == HwDevice::MediaCodec {
         return mediacodec_decoder(codec, format).is_some();
     }
+    codec != ffmpeg::codec::Id::H264 || deep(format)
+}
+
+/// Whether a picture in `format` has more than eight bits a sample.
+pub(crate) fn deep(format: Pixel) -> bool {
     // SAFETY: a descriptor points into libavutil's static table, and every
     // pixel format has at least one component.
-    let deep = format
+    format
         .descriptor()
-        .is_some_and(|descriptor| unsafe { (*descriptor.as_ptr()).comp[0].depth } > 8);
-    codec != ffmpeg::codec::Id::H264 || deep
+        .is_some_and(|descriptor| unsafe { (*descriptor.as_ptr()).comp[0].depth } > 8)
 }
 
 /// The libavcodec decoder that drives MediaCodec for a stream of `codec`
@@ -228,25 +232,43 @@ pub fn hardware_wins(device: HwDevice, codec: ffmpeg::codec::Id, format: Pixel) 
 /// or planar 4:2:0 with the chip's stride and crop already undone -
 /// frames the filtergraph takes as it takes a software decoder's.
 ///
-/// Eight-bit 4:2:0 only. Ten-bit HEVC comes back from the chip as P010,
-/// which FFmpeg's wrapper has no mapping for (it fails), or squeezed to
-/// eight bits by some vendors (which would quietly lose the HDR the deep
-/// path keeps); it stays in software until that is settled on a phone.
+/// Eight-bit 4:2:0, and ten-bit HEVC: what a phone, an action camera or a
+/// drone records in a log or HDR profile, and at 4K more than a phone's
+/// cores decode at the rate it plays. The chip hands it back as P010, which
+/// FFmpeg's wrapper has no mapping for as released: the build carries one
+/// (`scripts/ffmpeg-patches`), and asks the chip for P010 by name, since
+/// without the request Android 13 and later squeeze the picture to eight
+/// bits. A chip that squeezes it anyway is caught by the first try, which
+/// for a deep stream wants a deep picture (see [`mediacodec_trial`]), and
+/// the stream stays in software with all its bits. Ten-bit VP9 and AV1 have
+/// not been tried on a phone and stay where they were.
 /// VP8, MPEG-4 Part 2 and MPEG-2 have wrappers too, but are rare on a
 /// phone and cheap in software. AV1 goes to the chip, or to the
 /// platform's own software decoder where the chip has none: this FFmpeg
 /// has no AV1 decoder of its own.
 pub fn mediacodec_decoder(codec: ffmpeg::codec::Id, format: Pixel) -> Option<&'static str> {
     use ffmpeg::codec::Id;
-    if !matches!(format, Pixel::YUV420P | Pixel::YUVJ420P) {
-        return None;
-    }
-    match codec {
-        Id::H264 => Some("h264_mediacodec"),
-        Id::HEVC => Some("hevc_mediacodec"),
-        Id::VP9 => Some("vp9_mediacodec"),
-        Id::AV1 => Some("av1_mediacodec"),
+    match (codec, format) {
+        (Id::HEVC, Pixel::YUV420P10LE) => Some("hevc_mediacodec"),
+        (_, Pixel::YUV420P | Pixel::YUVJ420P) => match codec {
+            Id::H264 => Some("h264_mediacodec"),
+            Id::HEVC => Some("hevc_mediacodec"),
+            Id::VP9 => Some("vp9_mediacodec"),
+            Id::AV1 => Some("av1_mediacodec"),
+            _ => None,
+        },
         _ => None,
+    }
+}
+
+/// What the first try of MediaCodec's decoder `name` on a stream in
+/// `format` is remembered under; see [`Verdicts`]. A deep stream is a try
+/// of its own: the chip's ten-bit path is a different one from its
+/// eight-bit path, and one failing says nothing of the other.
+pub(crate) fn mediacodec_trial(name: &'static str, format: Pixel) -> &'static str {
+    match (name, deep(format)) {
+        ("hevc_mediacodec", true) => "hevc_mediacodec (ten-bit)",
+        _ => name,
     }
 }
 
@@ -265,7 +287,7 @@ pub fn mediacodec_decoder(codec: ffmpeg::codec::Id, format: Pixel) -> Option<&'s
 /// them or a scrub elsewhere. So three; the fourth reader on decodes on
 /// the CPU as before, and a seat comes free when its reader closes or
 /// falls back.
-pub const MEDIACODEC_READERS: usize = 3;
+pub const MEDIACODEC_READERS: usize = 2;
 
 /// Pictures smaller than this, in pixels, are decoded in software even on
 /// a phone: a thumbnail or a scrub copy being written wants its frames at
@@ -413,7 +435,7 @@ pub(crate) fn mediacodec_works(name: &'static str, try_it: impl FnOnce() -> bool
         let works = try_it();
         if !works {
             log::warn!(
-                "MediaCodec's {name} gave no picture within {:?}; that codec decodes in software",
+                "MediaCodec's {name} gave no usable picture within {:?}; that codec decodes in software",
                 MEDIACODEC_FIRST_PICTURE
             );
         }
@@ -727,9 +749,12 @@ mod tests {
         assert!(hardware_wins(phone, Id::H264, Pixel::YUV420P));
         assert!(hardware_wins(phone, Id::HEVC, Pixel::YUVJ420P));
         assert!(hardware_wins(phone, Id::AV1, Pixel::YUV420P));
-        // Ten bits and 4:2:2 stay on the CPU, and so do codecs it has no
-        // decoder for here.
-        assert!(!hardware_wins(phone, Id::HEVC, Pixel::YUV420P10LE));
+        // Ten-bit HEVC is the chip's too; other deep streams and 4:2:2
+        // stay on the CPU, and so do codecs it has no decoder for here.
+        assert!(hardware_wins(phone, Id::HEVC, Pixel::YUV420P10LE));
+        assert!(!hardware_wins(phone, Id::HEVC, Pixel::YUV422P10LE));
+        assert!(!hardware_wins(phone, Id::H264, Pixel::YUV420P10LE));
+        assert!(!hardware_wins(phone, Id::VP9, Pixel::YUV420P10LE));
         assert!(!hardware_wins(phone, Id::H264, Pixel::YUV422P));
         assert!(!hardware_wins(phone, Id::PRORES, Pixel::YUV422P10LE));
         assert!(!hardware_wins(phone, Id::MPEG4, Pixel::YUV420P));
@@ -749,7 +774,22 @@ mod tests {
             mediacodec_decoder(Id::HEVC, Pixel::YUV420P),
             Some("hevc_mediacodec")
         );
-        assert_eq!(mediacodec_decoder(Id::HEVC, Pixel::YUV420P10LE), None);
+        assert_eq!(
+            mediacodec_decoder(Id::HEVC, Pixel::YUV420P10LE),
+            Some("hevc_mediacodec")
+        );
+        assert_eq!(
+            mediacodec_trial("hevc_mediacodec", Pixel::YUV420P),
+            "hevc_mediacodec"
+        );
+        assert_ne!(
+            mediacodec_trial("hevc_mediacodec", Pixel::YUV420P10LE),
+            "hevc_mediacodec"
+        );
+        assert_eq!(
+            mediacodec_trial("h264_mediacodec", Pixel::YUV420P),
+            "h264_mediacodec"
+        );
         crate::ffi::init();
         let h264 = decoder::find(Id::H264).expect("an H.264 decoder");
         assert_eq!(

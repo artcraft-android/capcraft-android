@@ -349,6 +349,23 @@ private fun publishPhoto(context: Context, picture: Bitmap): Uri? = runCatching 
     uri
 }.getOrNull()
 
+/** Copies `file` into `uri` via kernel `FileUtils.copy` (falling back to buffered stream copy). */
+private fun copyFileToMediaStore(resolver: android.content.ContentResolver, file: File, uri: Uri): Boolean {
+    val fast = runCatching {
+        resolver.openFileDescriptor(uri, "w")?.use { dst ->
+            android.os.ParcelFileDescriptor.open(file, android.os.ParcelFileDescriptor.MODE_READ_ONLY).use { src ->
+                android.os.FileUtils.copy(src.fileDescriptor, dst.fileDescriptor)
+                true
+            }
+        } ?: false
+    }.getOrDefault(false)
+    if (fast) return true
+    return resolver.openOutputStream(uri)?.use { out ->
+        file.inputStream().use { it.copyTo(out, 1 shl 20) }
+        true
+    } ?: false
+}
+
 /** Copies a finished GIF into Pictures/CapCraft and deletes the cache copy. */
 private fun publishGif(context: Context, file: File): Uri? = runCatching {
     val values = ContentValues().apply {
@@ -360,7 +377,7 @@ private fun publishGif(context: Context, file: File): Uri? = runCatching {
     val resolver = context.contentResolver
     val uri = resolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)
         ?: return@runCatching null
-    resolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out, 1 shl 16) } }
+    if (!copyFileToMediaStore(resolver, file, uri)) return@runCatching null
     values.clear()
     values.put(MediaStore.Images.Media.IS_PENDING, 0)
     resolver.update(uri, values, null, null)
@@ -379,7 +396,7 @@ private fun publish(context: Context, file: File): Uri? = runCatching {
     val resolver = context.contentResolver
     val uri = resolver.insert(MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)
         ?: return@runCatching null
-    resolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out, 1 shl 16) } }
+    if (!copyFileToMediaStore(resolver, file, uri)) return@runCatching null
     values.clear()
     values.put(MediaStore.Video.Media.IS_PENDING, 0)
     resolver.update(uri, values, null, null)

@@ -5,6 +5,8 @@ import android.content.ComponentCallbacks2
 import android.system.Os
 import io.github.artcraftandroid.capcraft.core.init
 import io.github.artcraftandroid.capcraft.core.trimMemory
+import io.github.artcraftandroid.capcraft.ui.common.MediaPick
+import io.github.artcraftandroid.capcraft.ui.editor.Thumbs
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -25,8 +27,8 @@ class CapCraftApplication : Application() {
                 Os.setenv("TMPDIR", cacheDir.absolutePath, true)
                 Os.setenv("HOME", filesDir.absolutePath, true)
                 File(cacheDir, "exports").mkdirs()
-                init(filesDir.absolutePath, cacheDir.absolutePath)
                 NativeContext.start(this@CapCraftApplication)
+                init(filesDir.absolutePath, cacheDir.absolutePath)
                 engineLoaded = true
             }
         }
@@ -35,10 +37,20 @@ class CapCraftApplication : Application() {
     @Volatile
     private var engineLoaded = false
 
+    @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN && engineLoaded) {
-            scope.launch { runCatching { trimMemory() } }
+        val critical = level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+            level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
+        val low = critical ||
+            level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+            level == ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN
+        if (low) {
+            Thumbs.trim(clearAll = critical)
+            MediaPick.trim(clearAll = true)
+            if (engineLoaded) {
+                scope.launch { runCatching { trimMemory() } }
+            }
         }
     }
 }

@@ -99,19 +99,24 @@ fun TransitionGlyph(
 private fun DrawScope.side(picture: ImageBitmap?, color: Color, x: Float = 0f, alpha: Float = 1f) {
     val w = size.width
     val h = size.height
-    if (picture == null) {
+    if (w <= 0f || h <= 0f) return
+    if (picture == null || picture.width <= 0 || picture.height <= 0) {
         drawRect(color, topLeft = Offset(x, 0f), size = size, alpha = alpha)
         return
     }
     val k = maxOf(w / picture.width, h / picture.height)
-    val sw = (w / k).roundToInt().coerceIn(1, picture.width)
-    val sh = (h / k).roundToInt().coerceIn(1, picture.height)
+    val rawSw = (w / k).roundToInt().coerceIn(1, picture.width)
+    val rawSh = (h / k).roundToInt().coerceIn(1, picture.height)
+    val ox = ((picture.width - rawSw) / 2).coerceIn(0, picture.width - 1)
+    val oy = ((picture.height - rawSh) / 2).coerceIn(0, picture.height - 1)
+    val sw = rawSw.coerceIn(1, picture.width - ox)
+    val sh = rawSh.coerceIn(1, picture.height - oy)
     drawImage(
         picture,
-        srcOffset = IntOffset((picture.width - sw) / 2, (picture.height - sh) / 2),
+        srcOffset = IntOffset(ox, oy),
         srcSize = IntSize(sw, sh),
         dstOffset = IntOffset(x.roundToInt(), 0),
-        dstSize = IntSize(w.roundToInt(), h.roundToInt()),
+        dstSize = IntSize(w.roundToInt().coerceAtLeast(1), h.roundToInt().coerceAtLeast(1)),
         alpha = alpha,
     )
 }

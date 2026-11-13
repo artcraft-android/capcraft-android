@@ -29,9 +29,14 @@ pub mod scrub;
 pub mod svg;
 pub mod treat;
 
-pub use decode::{ColorRange, ColorSignal, DecodeOptions, Decoder, FrameSource, SeekableSource};
+pub use decode::{
+    ColorRange, ColorSignal, DecodeOptions, Decoder, ExportFrame, FrameSource, RawYuv,
+    SeekableSource,
+};
 pub use encode::{EncodeOptions, Encoder, FrameSink, RateMode, VideoCodec, jpeg};
 pub use error::{Error, Result};
+#[cfg(target_os = "android")]
+pub use ffi::set_android_java_vm;
 pub use ffi::{init, linked_version};
 pub use hardware::{HwDevice, HwPolicy, hardware_decode, set_hardware_decode};
 pub use peaks::{Peaks, Pyramid};

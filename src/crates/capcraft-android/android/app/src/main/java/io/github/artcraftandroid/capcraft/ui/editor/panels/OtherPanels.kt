@@ -629,7 +629,7 @@ fun BackgroundPanel(vm: EditorViewModel, tab: Int) {
                     BgTile(selected = current == null, onClick = { set(null) }) { Glyph(LucideIcons.CircleSlash, Palette.DockText, size = 22.dp) }
                     BgTile(selected = kind == "image", onClick = {
                         io.github.artcraftandroid.capcraft.ui.common.MediaPick.open(io.github.artcraftandroid.capcraft.ui.common.MediaKinds.IMAGE, multiple = false) {
-                            vm.setBackgroundImage(it.first(), targetId)
+                            it.firstOrNull()?.let { uri -> vm.setBackgroundImage(uri, targetId) }
                         }
                     }) { Glyph(LucideIcons.Plus, Palette.DockText, size = 24.dp) }
                 }

@@ -22,6 +22,7 @@ import io.github.artcraftandroid.capcraft.core.play
 import io.github.artcraftandroid.capcraft.core.positionUs
 import io.github.artcraftandroid.capcraft.core.seek
 import io.github.artcraftandroid.capcraft.core.still
+import io.github.artcraftandroid.capcraft.core.trimMemory
 import io.github.artcraftandroid.capcraft.engine.Media
 import io.github.artcraftandroid.capcraft.engine.Threads
 import io.github.artcraftandroid.capcraft.engine.toBitmap
@@ -970,9 +971,13 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
         withContext(Threads.commands) { runCatching { session?.save() } }
     }
 
-    /** Saves now and lets the player go; a project left with nothing on it is deleted. */
+    /** Saves now and lets the player and session go; a project left with nothing on it is deleted. */
     suspend fun close() {
         saveJob?.cancel()
+        val closing = session
+        session = null
+        lastFrame = null
+        Thumbs.trim(clearAll = true)
         val empty = timeline?.rows?.all { it.clips.isEmpty() } ?: false
         withContext(Threads.commands) {
             runCatching { pause() }
@@ -980,16 +985,23 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
             if (empty) {
                 runCatching { io.github.artcraftandroid.capcraft.core.deleteProject(path) }
             } else {
-                runCatching { session?.save() }
+                runCatching { closing?.save() }
             }
+            runCatching { closing?.destroy() }
+            runCatching { trimMemory() }
         }
     }
 
     override fun onCleared() {
         super.onCleared()
-        runCatching { session?.save() }
-        runCatching { clearPlayback() }
-        session?.destroy()
+        val closing = session
+        session = null
+        lastFrame = null
+        if (closing != null) {
+            runCatching { closing.save() }
+            runCatching { clearPlayback() }
+            runCatching { closing.destroy() }
+        }
     }
 
     class Factory(private val app: Application, private val path: String) : ViewModelProvider.Factory {
