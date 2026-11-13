@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -69,6 +70,7 @@ import io.github.artcraftandroid.capcraft.ui.Type
 import io.github.artcraftandroid.capcraft.ui.common.Toast
 import io.github.artcraftandroid.capcraft.ui.editor.panels.PanelHost
 import io.github.artcraftandroid.capcraft.ui.export.ExportScreen
+import io.github.artcraftandroid.capcraft.ui.i18n.tr
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.conflate
@@ -236,13 +238,14 @@ private fun TopBar(vm: EditorViewModel, onClose: () -> Unit, onExport: () -> Uni
         Box(
             Modifier
                 .height(32.dp)
-                .width(65.dp)
+                .defaultMinSize(minWidth = 65.dp)
                 .clip(RoundedCornerShape(6.dp))
                 .background(Palette.Accent)
-                .clickable(onClick = onExport),
+                .clickable(onClick = onExport)
+                .padding(horizontal = 12.dp),
             contentAlignment = Alignment.Center,
         ) {
-            Text("Export", style = Type.BodyStrong.copy(color = Palette.OnAccent, fontSize = 15.sp, fontWeight = FontWeight.Medium))
+            Text(tr("Export"), style = Type.BodyStrong.copy(color = Palette.OnAccent, fontSize = 15.sp, fontWeight = FontWeight.Medium), maxLines = 1)
         }
         Spacer(Modifier.width(16.dp))
     }
@@ -300,7 +303,7 @@ fun Preview(vm: EditorViewModel, modifier: Modifier) {
             }
         }
         if (t.rows.all { it.clips.isEmpty() }) {
-            Text("Add media to start editing", style = Type.Small)
+            Text(tr("Add media to start editing"), style = Type.Small)
         }
     }
 }
@@ -581,7 +584,7 @@ private fun Busy(label: String) {
         ) {
             CircularProgressIndicator(color = Palette.Accent, modifier = Modifier.size(32.dp), strokeWidth = 2.5.dp)
             Spacer(Modifier.height(12.dp))
-            Text(label, style = Type.Body)
+            Text(tr(label), style = Type.Body)
         }
     }
 }

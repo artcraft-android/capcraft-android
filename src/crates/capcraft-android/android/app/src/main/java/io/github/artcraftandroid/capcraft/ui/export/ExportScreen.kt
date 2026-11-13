@@ -68,6 +68,8 @@ import io.github.artcraftandroid.capcraft.ui.Type
 import io.github.artcraftandroid.capcraft.ui.editor.EditorViewModel
 import io.github.artcraftandroid.capcraft.ui.editor.exportKbps
 import io.github.artcraftandroid.capcraft.ui.editor.exportResolutionOf
+import io.github.artcraftandroid.capcraft.ui.i18n.AppLanguage
+import io.github.artcraftandroid.capcraft.ui.i18n.tr
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -127,7 +129,7 @@ fun ExportScreen(vm: EditorViewModel, onClose: () -> Unit, onHome: () -> Unit) {
             }
             cover = picture
             val uri = picture?.let { withContext(Dispatchers.IO) { publishPhoto(context, it) } }
-            stage = if (uri != null) Stage.Done(uri) else Stage.Failed("The photo could not be saved.")
+            stage = if (uri != null) Stage.Done(uri) else Stage.Failed(AppLanguage.translate("The photo could not be saved."))
             return@LaunchedEffect
         }
         cover = withContext(Threads.preview) {
@@ -154,13 +156,13 @@ fun ExportScreen(vm: EditorViewModel, onClose: () -> Unit, onHome: () -> Unit) {
             override fun onDone(path: String) {
                 scope.launch {
                     val uri = withContext(Dispatchers.IO) { if (gif) publishGif(appContext, File(path)) else publish(appContext, File(path)) }
-                    ExportService.finish(appContext, if (gif) "Saved to Pictures" else "Saved to your device")
+                    ExportService.finish(appContext, AppLanguage.translate(if (gif) "Saved to Pictures" else "Saved to your device"))
                     stage = Stage.Done(uri)
                 }
             }
 
             override fun onFailed(message: String, cancelled: Boolean) {
-                ExportService.finish(appContext, if (cancelled) null else "Export failed")
+                ExportService.finish(appContext, if (cancelled) null else AppLanguage.translate("Export failed"))
                 scope.launch(Dispatchers.Main) {
                     if (cancelled) onClose() else stage = Stage.Failed(message)
                 }
@@ -216,7 +218,7 @@ fun ExportScreen(vm: EditorViewModel, onClose: () -> Unit, onHome: () -> Unit) {
             }
             Spacer(Modifier.weight(1f))
             if (stage is Stage.Done) {
-                Text("Done", style = Type.BodyStrong, modifier = Modifier.clickable(onClick = onHome).padding(12.dp))
+                Text(tr("Done"), style = Type.BodyStrong, modifier = Modifier.clickable(onClick = onHome).padding(12.dp))
             }
         }
         Column(Modifier.fillMaxWidth().weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -265,7 +267,7 @@ fun ExportScreen(vm: EditorViewModel, onClose: () -> Unit, onHome: () -> Unit) {
                         Box(Modifier.weight(1f).height(1.dp).background(Color(0x33FFFFFF)))
                         Glyph(LucideIcons.Lightbulb, Palette.TextSecondary, size = 16.dp, modifier = Modifier.padding(horizontal = 8.dp))
                         Text(
-                            "You can leave CapCraft while the video saves",
+                            tr("You can leave CapCraft while the video saves"),
                             style = Type.Small.copy(textAlign = TextAlign.Center),
                             modifier = Modifier.width(240.dp),
                         )
@@ -276,18 +278,18 @@ fun ExportScreen(vm: EditorViewModel, onClose: () -> Unit, onHome: () -> Unit) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Glyph(LucideIcons.CircleCheck, Palette.Accent, size = 20.dp)
                         Spacer(Modifier.width(6.dp))
-                        Text(if (vm.exportGif || vm.exportPhoto) "Saved to Pictures" else "Saved to your device", style = Type.BodyStrong.copy(fontSize = 16.sp))
+                        Text(tr(if (vm.exportGif || vm.exportPhoto) "Saved to Pictures" else "Saved to your device"), style = Type.BodyStrong.copy(fontSize = 16.sp))
                     }
                     Spacer(Modifier.height(26.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(36.dp)) {
-                        ShareTarget(LucideIcons.Share2, "Share") { st.uri?.let { share(context, it) } }
-                        ShareTarget(LucideIcons.ExternalLink, "Open") { st.uri?.let { open(context, it, vm.exportGif, vm.exportPhoto) } }
+                        ShareTarget(LucideIcons.Share2, tr("Share")) { st.uri?.let { share(context, it) } }
+                        ShareTarget(LucideIcons.ExternalLink, tr("Open")) { st.uri?.let { open(context, it, vm.exportGif, vm.exportPhoto) } }
                     }
                 }
                 is Stage.Failed -> {
-                    Text("Export failed", style = Type.Title)
+                    Text(tr("Export failed"), style = Type.Title)
                     Spacer(Modifier.height(8.dp))
-                    Text(st.message, style = Type.Small.copy(textAlign = TextAlign.Center), modifier = Modifier.padding(horizontal = 32.dp))
+                    Text(tr(st.message), style = Type.Small.copy(textAlign = TextAlign.Center), modifier = Modifier.padding(horizontal = 32.dp))
                     Spacer(Modifier.height(20.dp))
                     Box(
                         Modifier.clip(RoundedCornerShape(8.dp)).background(Palette.Accent).clickable {
@@ -295,7 +297,7 @@ fun ExportScreen(vm: EditorViewModel, onClose: () -> Unit, onHome: () -> Unit) {
                             stage = Stage.Running(0f)
                             attempt++
                         }.padding(horizontal = 24.dp, vertical = 10.dp),
-                    ) { Text("Try again", style = Type.BodyStrong.copy(color = Color.White)) }
+                    ) { Text(tr("Try again"), style = Type.BodyStrong.copy(color = Color.White)) }
                 }
             }
         }
@@ -303,7 +305,7 @@ fun ExportScreen(vm: EditorViewModel, onClose: () -> Unit, onHome: () -> Unit) {
             Box(
                 Modifier.padding(16.dp).fillMaxWidth().height(44.dp).clip(RoundedCornerShape(8.dp)).background(Color(0x22FFFFFF)).clickable(onClick = onHome),
                 contentAlignment = Alignment.Center,
-            ) { Text("New project", style = Type.BodyStrong) }
+            ) { Text(tr("New project"), style = Type.BodyStrong) }
         }
     }
 }

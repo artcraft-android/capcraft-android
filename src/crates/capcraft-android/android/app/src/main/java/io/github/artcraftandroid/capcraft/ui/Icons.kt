@@ -4,13 +4,16 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.PathParser
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 
 /** The stroke weight CapCraft draws Lucide's 24-unit icons with: a little lighter than Lucide's 2. */
@@ -41,8 +44,12 @@ internal fun material(name: String, vararg paths: String): ImageVector {
     return b.build()
 }
 
-/** An icon at [size], tinted. */
+private val RTL_MIRRORED_ICONS = setOf("chevron-left", "chevron-right", "chevrons-left", "arrow-left")
+
+/** An icon at [size], tinted (auto-mirroring directional navigation chevrons in RTL layouts). */
 @Composable
 fun Glyph(image: ImageVector, tint: Color, modifier: Modifier = Modifier, size: Dp = 24.dp, description: String? = null) {
-    Icon(image, contentDescription = description, tint = tint, modifier = modifier.size(size))
+    val rtlMirror = LocalLayoutDirection.current == LayoutDirection.Rtl && image.name in RTL_MIRRORED_ICONS
+    val finalModifier = if (rtlMirror) modifier.size(size).scale(scaleX = -1f, scaleY = 1f) else modifier.size(size)
+    Icon(image, contentDescription = description, tint = tint, modifier = finalModifier)
 }

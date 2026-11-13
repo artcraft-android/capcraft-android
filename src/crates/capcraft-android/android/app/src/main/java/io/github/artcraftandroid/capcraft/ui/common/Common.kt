@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import io.github.artcraftandroid.capcraft.ui.Palette
 import io.github.artcraftandroid.capcraft.ui.Type
+import io.github.artcraftandroid.capcraft.ui.i18n.tr
 import kotlinx.coroutines.delay
 
 /** A list of actions sliding up from the bottom, with a Cancel row. */
@@ -71,10 +72,10 @@ fun ActionSheet(
             ) {
                 if (title != null || body != null) {
                     Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp)) {
-                        title?.let { Text(it, style = Type.BodyStrong, maxLines = 1) }
+                        title?.let { Text(tr(it), style = Type.BodyStrong, maxLines = 1) }
                         body?.let {
                             Spacer(Modifier.height(6.dp))
-                            Text(it, style = Type.Small)
+                            Text(tr(it), style = Type.Small)
                         }
                     }
                     Divider()
@@ -86,14 +87,14 @@ fun ActionSheet(
                             .clickable { onDismiss(); action() }
                             .padding(horizontal = 20.dp, vertical = 15.dp),
                     ) {
-                        Text(label, style = Type.Body.copy(color = if (label in destructive) Palette.Danger else Palette.Text))
+                        Text(tr(label), style = Type.Body.copy(color = if (label in destructive) Palette.Danger else Palette.Text))
                     }
                 }
                 Box(Modifier.fillMaxWidth().height(8.dp).background(Palette.Black))
                 Box(
                     Modifier.fillMaxWidth().clickable(onClick = onDismiss).padding(vertical = 15.dp),
                     contentAlignment = Alignment.Center,
-                ) { Text("Cancel", style = Type.Body) }
+                ) { Text(tr("Cancel"), style = Type.Body) }
             }
         }
     }
@@ -122,7 +123,7 @@ fun ConfirmDialog(
                 .background(Palette.Panel),
         ) {
             Column(Modifier.padding(start = 20.dp, end = 20.dp, top = 22.dp, bottom = 18.dp)) {
-                Text(text, style = Type.BodyStrong.copy(textAlign = TextAlign.Center), modifier = Modifier.fillMaxWidth())
+                Text(tr(text), style = Type.BodyStrong.copy(textAlign = TextAlign.Center), modifier = Modifier.fillMaxWidth())
                 content?.let {
                     Spacer(Modifier.height(16.dp))
                     it()
@@ -131,10 +132,10 @@ fun ConfirmDialog(
             Divider()
             Row(Modifier.fillMaxWidth().height(48.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
                 Box(Modifier.weight(1f).fillMaxSize().clickable(onClick = onDismiss), contentAlignment = Alignment.Center) {
-                    Text("Cancel", style = Type.Body.copy(color = Palette.TextSecondary))
+                    Text(tr("Cancel"), style = Type.Body.copy(color = Palette.TextSecondary))
                 }
                 Box(Modifier.weight(1f).fillMaxSize().clickable(onClick = onConfirm), contentAlignment = Alignment.Center) {
-                    Text(confirm, style = Type.BodyStrong.copy(color = if (destructive) Palette.Danger else Palette.Accent))
+                    Text(tr(confirm), style = Type.BodyStrong.copy(color = if (destructive) Palette.Danger else Palette.Accent))
                 }
             }
         }
@@ -156,7 +157,7 @@ fun Toast(message: String?, bottom: androidx.compose.ui.unit.Dp = 120.dp, onGone
                     .clip(RoundedCornerShape(8.dp))
                     .background(Color(0xE6333333))
                     .padding(horizontal = 16.dp, vertical = 10.dp),
-            ) { Text(message, style = Type.Body) }
+            ) { Text(tr(message), style = Type.Body) }
         }
     }
 }

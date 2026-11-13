@@ -87,6 +87,11 @@ import io.github.artcraftandroid.capcraft.ui.LucideIcons
 import io.github.artcraftandroid.capcraft.ui.MaterialIcons
 import io.github.artcraftandroid.capcraft.ui.Palette
 import io.github.artcraftandroid.capcraft.ui.Type
+import io.github.artcraftandroid.capcraft.ui.i18n.AppLanguage
+import io.github.artcraftandroid.capcraft.ui.i18n.LanguagePack
+import io.github.artcraftandroid.capcraft.ui.i18n.LocalLanguagePack
+import io.github.artcraftandroid.capcraft.ui.i18n.tr
+import io.github.artcraftandroid.capcraft.ui.i18n.trf
 import io.github.artcraftandroid.capcraft.ui.common.Toast
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -226,6 +231,7 @@ fun HomeScreen(
     var message by remember { mutableStateOf<String?>(null) }
     var licences by remember { mutableStateOf(false) }
     var about by remember { mutableStateOf(false) }
+    var language by remember { mutableStateOf(false) }
     /** 0 Edit, 1 Projects, 2 Me. */
     var tab by remember { mutableIntStateOf(0) }
     var searching by remember { mutableStateOf(false) }
@@ -255,7 +261,7 @@ fun HomeScreen(
     // Light bars over the light pages, light icons over the picture at the top of Edit and over the
     // dark pages; dark again for the editor.
     val activity = LocalContext.current as? ComponentActivity
-    val overPicture = tab == 0 && !licences && !about
+    val overPicture = tab == 0 && !licences && !about && !language
     val dark = Home.dark
     DisposableEffect(activity, overPicture, dark) {
         activity?.enableEdgeToEdge(
@@ -396,7 +402,12 @@ fun HomeScreen(
                         onShowTrash = { showingTrash = it; managing = null },
                         onTrashMenu = { trashMenu = it },
                     )
-                    else -> MeTab(onLicences = { licences = true }, onAbout = { about = true }, onCleared = { message = it })
+                    else -> MeTab(
+                        onLanguage = { language = true },
+                        onLicences = { licences = true },
+                        onAbout = { about = true },
+                        onCleared = { message = it },
+                    )
                 }
             }
             val picked = managing
@@ -437,9 +448,14 @@ fun HomeScreen(
 
         if (deletingMany) {
             val picked = managing.orEmpty()
+            val prompt = if (picked.size == 1) {
+                tr("Move this project to the Trash? It's kept there for 30 days.")
+            } else {
+                trf("Move %d projects to the Trash? They're kept there for 30 days.", picked.size)
+            }
             HomeConfirm(
-                text = "Move ${picked.size} project${if (picked.size == 1) "" else "s"} to the Trash? They're kept there for 30 days.",
-                confirm = "Move",
+                text = prompt,
+                confirm = tr("Move"),
                 onDismiss = { deletingMany = false },
             ) {
                 deletingMany = false
@@ -479,8 +495,8 @@ fun HomeScreen(
         }
         deleting?.let { p ->
             HomeConfirm(
-                text = "Move this project to the Trash? It's kept there for 30 days.",
-                confirm = "Move",
+                text = tr("Move this project to the Trash? It's kept there for 30 days."),
+                confirm = tr("Move"),
                 onDismiss = { deleting = null },
             ) {
                 deleting = null
@@ -510,8 +526,8 @@ fun HomeScreen(
         }
         purging?.let { p ->
             HomeConfirm(
-                text = "Delete this project for good? This can't be undone.",
-                confirm = "Delete",
+                text = tr("Delete this project for good? This can't be undone."),
+                confirm = tr("Delete"),
                 onDismiss = { purging = null },
             ) {
                 purging = null
@@ -524,6 +540,7 @@ fun HomeScreen(
         }
         if (about) AboutScreen(onBack = { about = false })
         if (licences) LicencesScreen(onBack = { licences = false })
+        if (language) LanguageScreen(onBack = { language = false }, onNotice = { message = it })
         Toast(message) { message = null }
     }
 }
@@ -552,10 +569,10 @@ private fun EditTab(
                 }
                 Spacer(Modifier.height(176.dp))
                 Column(Modifier.padding(horizontal = 16.dp).clickable(onClick = onNewVideo)) {
-                    Text("Ready when you are", style = ink(14f, color = Color.White.copy(alpha = 0.92f)))
+                    Text(tr("Ready when you are"), style = ink(14f, color = Color.White.copy(alpha = 0.92f)))
                     Spacer(Modifier.height(2.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("Make your next video", style = ink(21f, FontWeight.Bold, Color.White))
+                        Text(tr("Make your next video"), style = ink(21f, FontWeight.Bold, Color.White))
                         Spacer(Modifier.width(6.dp))
                         Box(Modifier.size(18.dp).clip(RoundedCornerShape(4.dp)).background(Color.White.copy(alpha = 0.3f)), contentAlignment = Alignment.Center) {
                             Glyph(LucideIcons.ChevronRight, Color.White, size = 14.dp)
@@ -564,10 +581,10 @@ private fun EditTab(
                 }
                 Spacer(Modifier.height(16.dp))
                 Row(Modifier.fillMaxWidth().height(112.dp).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    CreateCard("New video", Modifier.weight(1.7f), onNewVideo) {
+                    CreateCard(tr("New video"), Modifier.weight(1.7f), onNewVideo) {
                         Glyph(LucideIcons.Plus, Home.OnInk, size = 18.dp)
                     }
-                    CreateCard("Edit photo", Modifier.weight(1f), onCaptions) {
+                    CreateCard(tr("Edit photo"), Modifier.weight(1f), onCaptions) {
                         Glyph(LucideIcons.Image, Home.OnInk, size = 16.dp)
                     }
                 }
@@ -601,7 +618,7 @@ private fun EditTab(
                     ) {
                         Glyph(s.icon, Home.Ink, size = 26.dp)
                         Spacer(Modifier.height(10.dp))
-                        Text(s.label, style = ink(13f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(tr(s.label), style = ink(13f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
                 repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
@@ -624,7 +641,7 @@ private fun ToolsSheet(title: String, tools: List<Triple<String, String, String>
             .clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null) {},
     ) {
         Column(Modifier.align(Alignment.BottomStart).fillMaxWidth().navigationBarsPadding().padding(start = 24.dp, end = 24.dp, bottom = 24.dp)) {
-            Text(title, style = ink(22f, FontWeight.Bold))
+            Text(tr(title), style = ink(22f, FontWeight.Bold))
             Spacer(Modifier.height(18.dp))
             tools.forEach { (id, name, line) ->
                 Row(
@@ -648,8 +665,8 @@ private fun ToolsSheet(title: String, tools: List<Triple<String, String, String>
                     }
                     Spacer(Modifier.width(16.dp))
                     Column {
-                        Text(name, style = ink(16f, FontWeight.Medium))
-                        Text(line, style = ink(13f, color = Home.Muted))
+                        Text(tr(name), style = ink(16f, FontWeight.Medium))
+                        Text(tr(line), style = ink(13f, color = Home.Muted))
                     }
                 }
                 Spacer(Modifier.height(8.dp))
@@ -775,7 +792,7 @@ private fun ProjectsTab(
                         Glyph(LucideIcons.Search, Home.Muted, size = 18.dp)
                         Spacer(Modifier.width(8.dp))
                         Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
-                            if (query.isEmpty()) Text("Search projects", style = ink(15f, color = Home.Muted))
+                            if (query.isEmpty()) Text(tr("Search projects"), style = ink(15f, color = Home.Muted))
                             BasicTextField(
                                 value = query,
                                 onValueChange = { query = it },
@@ -787,12 +804,12 @@ private fun ProjectsTab(
                         }
                     }
                     Text(
-                        "Cancel",
+                        tr("Cancel"),
                         style = ink(15f),
                         modifier = Modifier.clickable { query = ""; onSearching(false) }.padding(horizontal = 10.dp, vertical = 8.dp),
                     )
                 } else {
-                    Text("Projects", style = ink(22f, FontWeight.Bold), modifier = Modifier.weight(1f))
+                    Text(tr("Projects"), style = ink(22f, FontWeight.Bold), modifier = Modifier.weight(1f))
                     Box(Modifier.size(44.dp).clip(RoundedCornerShape(22.dp)).clickable { onSearching(true) }, contentAlignment = Alignment.Center) {
                         Glyph(LucideIcons.Search, Home.Ink, size = 24.dp, description = "Search projects")
                     }
@@ -806,7 +823,7 @@ private fun ProjectsTab(
                         Modifier.clickable { onShowTrash(isTrash) }.padding(horizontal = 10.dp, vertical = 8.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
-                        Text(label, style = ink(15f, if (on) FontWeight.SemiBold else FontWeight.Normal, if (on) Home.Ink else Home.Muted))
+                        Text(tr(label), style = ink(15f, if (on) FontWeight.SemiBold else FontWeight.Normal, if (on) Home.Ink else Home.Muted))
                         Spacer(Modifier.height(6.dp))
                         Box(Modifier.size(28.dp, 2.dp).background(if (on) Home.Ink else Color.Transparent))
                     }
@@ -815,7 +832,7 @@ private fun ProjectsTab(
             Box(Modifier.fillMaxWidth().height(1.dp).background(Home.Hairline))
             if (showingTrash) {
                 Text(
-                    "Projects here are deleted for good after 30 days.",
+                    tr("Projects here are deleted for good after 30 days."),
                     style = ink(13f, color = Home.Muted),
                     modifier = Modifier.padding(start = 16.dp, top = 10.dp, bottom = 4.dp),
                 )
@@ -823,7 +840,7 @@ private fun ProjectsTab(
                 when {
                     bin == null -> Unit
                     bin.isEmpty() -> Box(Modifier.fillMaxWidth().padding(top = 96.dp), contentAlignment = Alignment.Center) {
-                        Text("The Trash is empty", style = ink(14f, color = Home.Muted))
+                        Text(tr("The Trash is empty"), style = ink(14f, color = Home.Muted))
                     }
                     else -> LazyColumn(Modifier.fillMaxSize()) {
                         items(bin, key = { it.path }) { p -> ProjectRow(p, ticked = null, onOpen = { onTrashMenu(p) }, onMenu = { onTrashMenu(p) }) }
@@ -839,14 +856,18 @@ private fun ProjectsTab(
                                 .border(if (i == kind) 1.5.dp else 1.dp, if (i == kind) Home.Ink else Home.Hairline, RoundedCornerShape(8.dp))
                                 .clickable { kind = i }.padding(horizontal = 18.dp),
                             contentAlignment = Alignment.Center,
-                        ) { Text(name, style = ink(14f, if (i == kind) FontWeight.Medium else FontWeight.Normal)) }
+                        ) { Text(tr(name), style = ink(14f, if (i == kind) FontWeight.Medium else FontWeight.Normal)) }
                     }
                 }
                 val count = shown?.size ?: projects.size
                 Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text("$count project${if (count == 1) "" else "s"}", style = ink(16f, FontWeight.Medium), modifier = Modifier.weight(1f))
                     Text(
-                        if (managing == null) "Select" else "Done",
+                        if (count == 1) trf("%d project", count) else trf("%d projects", count),
+                        style = ink(16f, FontWeight.Medium),
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        tr(if (managing == null) "Select" else "Done"),
                         style = ink(15f, color = Home.Muted),
                         modifier = Modifier.clickable { onManaging(if (managing == null) emptySet() else null) }.padding(8.dp),
                     )
@@ -857,7 +878,7 @@ private fun ProjectsTab(
                     CircularProgressIndicator(color = Palette.Accent, modifier = Modifier.size(28.dp), strokeWidth = 2.dp)
                 }
                 shown.isEmpty() -> Box(Modifier.fillMaxWidth().padding(top = 96.dp), contentAlignment = Alignment.Center) {
-                    Text(if (searching && query.isNotBlank()) "No projects found" else "No projects yet", style = ink(14f, color = Home.Muted))
+                    Text(tr(if (searching && query.isNotBlank()) "No projects found" else "No projects yet"), style = ink(14f, color = Home.Muted))
                 }
                 else -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 88.dp)) {
                     items(shown, key = { it.path }) { p ->
@@ -890,7 +911,7 @@ private fun ProjectsTab(
                     Glyph(LucideIcons.Plus, Palette.Accent, size = 16.dp)
                 }
                 Spacer(Modifier.width(8.dp))
-                Text("Create", style = ink(17f, FontWeight.Medium, Color.White))
+                Text(tr("Create"), style = ink(17f, FontWeight.Medium, Color.White))
             }
         }
     }
@@ -967,10 +988,10 @@ private fun SelectBar(all: Boolean, count: Int, onAll: () -> Unit, onDelete: () 
     Column(Modifier.fillMaxWidth().background(Home.Background).navigationBarsPadding()) {
         Box(Modifier.fillMaxWidth().height(1.dp).background(Home.Hairline))
         Row(Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(if (all) "Deselect all" else "Select all", style = ink(15f), modifier = Modifier.clickable(onClick = onAll).padding(8.dp))
+            Text(tr(if (all) "Deselect all" else "Select all"), style = ink(15f), modifier = Modifier.clickable(onClick = onAll).padding(8.dp))
             Spacer(Modifier.weight(1f))
             Text(
-                "Delete ($count)",
+                trf("Delete (%d)", count),
                 style = ink(15f, FontWeight.SemiBold, if (count == 0) Home.Muted else Palette.Danger),
                 modifier = Modifier.clickable(enabled = count > 0, onClick = onDelete).padding(8.dp),
             )
@@ -1017,7 +1038,7 @@ private fun BottomBar(tab: Int, latest: ProjectSummary?, onTab: (Int) -> Unit) {
                         else -> Glyph(icon, if (on) Home.Ink else Home.Muted, size = 23.dp)
                     }
                     Spacer(Modifier.height(3.dp))
-                    Text(label, style = ink(11f, if (on) FontWeight.SemiBold else FontWeight.Normal, if (on) Home.Ink else Home.Muted))
+                    Text(tr(label), style = ink(11f, if (on) FontWeight.SemiBold else FontWeight.Normal, if (on) Home.Ink else Home.Muted))
                 }
             }
         }
@@ -1028,35 +1049,47 @@ private fun BottomBar(tab: Int, latest: ProjectSummary?, onTab: (Int) -> Unit) {
 
 /** The app's settings: one tall row a setting, its value or a chevron at the right. */
 @Composable
-private fun MeTab(onLicences: () -> Unit, onAbout: () -> Unit, onCleared: (String) -> Unit) {
+private fun MeTab(
+    onLanguage: () -> Unit,
+    onLicences: () -> Unit,
+    onAbout: () -> Unit,
+    onCleared: (String) -> Unit,
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val version = remember { appVersion(context) }
+    val activePack = LocalLanguagePack.current
+    val langValue = if (AppLanguage.selectedId == AppLanguage.SYSTEM_ID) {
+        trf("System default (%s)", activePack.nativeName)
+    } else {
+        activePack.nativeName
+    }
     var cache by remember { mutableStateOf<Long?>(null) }
     var clearing by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { cache = withContext(Threads.commands) { cacheSize(context) } }
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
         Row(Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("Settings", style = ink(22f, FontWeight.Bold))
+            Text(tr("Settings"), style = ink(22f, FontWeight.Bold))
         }
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
-            SettingRow("Clear cache", cache?.let(::size) ?: "") { clearing = true }
-            SettingRow("Licences", null, onLicences)
-            SettingRow("About CapCraft", null, onAbout)
-            SettingRow("Version", version, null)
+            SettingRow(tr("Language"), langValue, showChevron = true, onClick = onLanguage)
+            SettingRow(tr("Clear cache"), cache?.let(::size) ?: "") { clearing = true }
+            SettingRow(tr("Licences"), null, onClick = onLicences)
+            SettingRow(tr("About CapCraft"), null, onClick = onAbout)
+            SettingRow(tr("Version"), version, onClick = null)
         }
     }
     if (clearing) {
         HomeConfirm(
-            text = "Clear the cache? Previews and waveforms are made again when needed; projects are kept.",
-            confirm = "Clear",
+            text = tr("Clear the cache? Previews and waveforms are made again when needed; projects are kept."),
+            confirm = tr("Clear"),
             onDismiss = { clearing = false },
         ) {
             clearing = false
             scope.launch {
                 val freed = withContext(Threads.commands) { clearCaches(context) }
                 cache = withContext(Threads.commands) { cacheSize(context) }
-                onCleared("Cleared ${size(freed)}")
+                onCleared(AppLanguage.translate("Cleared %s", size(freed)))
             }
         }
     }
@@ -1067,12 +1100,178 @@ private fun appVersion(context: android.content.Context): String =
 
 /** One settings row: the label, then a value or (when it opens something) a chevron. */
 @Composable
-private fun SettingRow(label: String, value: String?, onClick: (() -> Unit)?) {
+private fun SettingRow(
+    label: String,
+    value: String?,
+    showChevron: Boolean = false,
+    onClick: (() -> Unit)?,
+) {
     Column(Modifier.fillMaxWidth().then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)) {
         Row(Modifier.fillMaxWidth().height(60.dp).padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(label, style = ink(16f), modifier = Modifier.weight(1f))
             if (!value.isNullOrEmpty()) Text(value, style = ink(15f, color = Home.Muted))
-            if (onClick != null && value == null) Glyph(LucideIcons.ChevronRight, Home.Muted, size = 20.dp)
+            if (onClick != null && (value == null || showChevron)) {
+                if (!value.isNullOrEmpty()) Spacer(Modifier.width(4.dp))
+                Glyph(LucideIcons.ChevronRight, Home.Muted, size = 20.dp)
+            }
+        }
+        Box(Modifier.fillMaxWidth().padding(horizontal = 20.dp).height(1.dp).background(Home.Hairline))
+    }
+}
+
+/**
+ * Language picker and modular custom JSON language pack manager (#2, #14, #22).
+ * Supports System default, built-in packs (`en`, `ja`, `ar` with RTL), importing custom `.json`
+ * community packs into `filesDir/lang-packs/`, exporting the English `.json` template, and removing
+ * custom packs.
+ */
+@Composable
+private fun LanguageScreen(onBack: () -> Unit, onNotice: (String) -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    AppLanguage.ensureLoaded(context)
+    val selectedId = AppLanguage.selectedId
+    val builtIns = AppLanguage.builtInPacks
+    val customs = AppLanguage.customPacks
+    val systemResolved = AppLanguage.resolveActive(AppLanguage.SYSTEM_ID, builtIns, customs)
+
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val result = withContext(Threads.commands) {
+                runCatching {
+                    val raw = context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                        ?: error("Empty file")
+                    AppLanguage.importPack(context, raw, uri.lastPathSegment).getOrThrow()
+                }
+            }
+            result.onSuccess { pack ->
+                onNotice(AppLanguage.translate("Imported %s (%d strings)", pack.nativeName, pack.strings.size))
+            }.onFailure { err ->
+                onNotice(AppLanguage.translate("Could not read language pack: %s", err.message ?: "invalid JSON"))
+            }
+        }
+    }
+
+    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val saved = withContext(Threads.commands) {
+                runCatching {
+                    val template = AppLanguage.templateJson(context)
+                    context.contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use { it.write(template) }
+                        ?: error("Cannot write destination")
+                }.isSuccess
+            }
+            if (saved) onNotice(AppLanguage.translate("Template saved"))
+        }
+    }
+
+    Page(tr("Language"), onBack) {
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
+            LanguageChoiceRow(
+                title = tr("System default"),
+                subtitle = systemResolved.nativeName,
+                selected = selectedId == AppLanguage.SYSTEM_ID,
+                onSelect = { AppLanguage.select(context, AppLanguage.SYSTEM_ID) },
+            )
+            SectionTitle(tr("Built-in languages"))
+            builtIns.forEach { pack ->
+                LanguageChoiceRow(
+                    title = pack.nativeName,
+                    subtitle = if (pack.nativeName != pack.name) "${pack.name} (${pack.code})" else pack.code,
+                    selected = selectedId == pack.id,
+                    onSelect = { AppLanguage.select(context, pack.id) },
+                )
+            }
+            SectionTitle(tr("Custom language packs"))
+            if (customs.isEmpty()) {
+                Text(
+                    tr("No custom language packs installed."),
+                    style = ink(13f, color = Home.Muted),
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+                )
+            } else {
+                customs.forEach { pack ->
+                    LanguageChoiceRow(
+                        title = pack.nativeName,
+                        subtitle = "${pack.name} (${pack.code}) · ${pack.strings.size}",
+                        selected = selectedId == pack.id,
+                        onSelect = { AppLanguage.select(context, pack.id) },
+                        onRemove = {
+                            val removedName = pack.nativeName
+                            AppLanguage.removeCustomPack(context, pack)
+                            onNotice(AppLanguage.translate("Removed %s", removedName))
+                        },
+                    )
+                }
+            }
+            Spacer(Modifier.height(14.dp))
+            LanguageActionRow(LucideIcons.Upload, tr("Import language pack (.json)")) {
+                importLauncher.launch(arrayOf("application/json", "text/*", "*/*"))
+            }
+            LanguageActionRow(LucideIcons.Download, tr("Export template (.json)")) {
+                exportLauncher.launch("capcraft-lang-template.json")
+            }
+            Text(
+                tr("Community translations use plain JSON files. Export the template, translate its strings, and import the file here."),
+                style = ink(12.5f, color = Home.Muted),
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun SectionTitle(title: String) {
+    Text(
+        title,
+        style = ink(12.5f, FontWeight.SemiBold, Home.Muted),
+        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 6.dp),
+    )
+}
+
+@Composable
+private fun LanguageChoiceRow(
+    title: String,
+    subtitle: String,
+    selected: Boolean,
+    onSelect: () -> Unit,
+    onRemove: (() -> Unit)? = null,
+) {
+    Column(Modifier.fillMaxWidth().clickable(onClick = onSelect)) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(title, style = ink(16f, if (selected) FontWeight.SemiBold else FontWeight.Normal))
+                if (subtitle.isNotEmpty()) {
+                    Spacer(Modifier.height(2.dp))
+                    Text(subtitle, style = ink(13f, color = Home.Muted))
+                }
+            }
+            if (selected) {
+                Glyph(LucideIcons.Check, Palette.Accent, size = 20.dp)
+            }
+            if (onRemove != null) {
+                Spacer(Modifier.width(8.dp))
+                Box(Modifier.size(36.dp).clickable(onClick = onRemove), contentAlignment = Alignment.Center) {
+                    Glyph(LucideIcons.Trash2, Home.Muted, size = 18.dp, description = tr("Delete"))
+                }
+            }
+        }
+        Box(Modifier.fillMaxWidth().padding(horizontal = 20.dp).height(1.dp).background(Home.Hairline))
+    }
+}
+
+@Composable
+private fun LanguageActionRow(icon: ImageVector, label: String, onClick: () -> Unit) {
+    Column(Modifier.fillMaxWidth().clickable(onClick = onClick)) {
+        Row(Modifier.fillMaxWidth().height(54.dp).padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+            Glyph(icon, Palette.Accent, size = 20.dp)
+            Spacer(Modifier.width(12.dp))
+            Text(label, style = ink(15f, FontWeight.Medium, Palette.Accent))
         }
         Box(Modifier.fillMaxWidth().padding(horizontal = 20.dp).height(1.dp).background(Home.Hairline))
     }
@@ -1101,26 +1300,25 @@ private const val SOURCE_URL = "https://github.com/artcraft-android/capcraft-and
 private fun AboutScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val version = remember { appVersion(context) }
-    Page("About CapCraft", onBack) {
+    Page(tr("About CapCraft"), onBack) {
         Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             Spacer(Modifier.height(24.dp))
             Text("CapCraft", style = ink(26f, FontWeight.Bold))
             Spacer(Modifier.height(6.dp))
-            Text("Version $version", style = ink(13f, color = Home.Muted))
+            Text(trf("Version %s", version), style = ink(13f, color = Home.Muted))
             Spacer(Modifier.height(28.dp))
             Text(
-                "A free video editor that keeps your work on your phone. Built on Concat's engine; free " +
-                    "software under the GNU Affero General Public License, version 3 or later.",
+                tr("A free video editor that keeps your work on your phone. Built on Concat's engine; free software under the GNU Affero General Public License, version 3 or later."),
                 style = ink(13f, color = Home.Muted).copy(textAlign = androidx.compose.ui.text.style.TextAlign.Center),
             )
             Spacer(Modifier.height(16.dp))
             Text(
-                "Not affiliated with or endorsed by ByteDance or CapCut.",
+                tr("Not affiliated with or endorsed by ByteDance or CapCut."),
                 style = ink(13f, color = Home.Muted).copy(textAlign = androidx.compose.ui.text.style.TextAlign.Center),
             )
             Spacer(Modifier.height(28.dp))
             // the source, as the licence asks of every copy handed on
-            Text("Source code", style = ink(13f, color = Home.Muted))
+            Text(tr("Source code"), style = ink(13f, color = Home.Muted))
             Spacer(Modifier.height(4.dp))
             Text(
                 SOURCE_URL.removePrefix("https://"),
@@ -1169,11 +1367,11 @@ private fun LicencesScreen(onBack: () -> Unit) {
         "LICENSE-material-symbols.txt" to "Material Symbols",
     )
     var open by remember { mutableStateOf<String?>(null) }
-    Page(files.firstOrNull { it.first == open }?.second ?: "Licences", onBack = { if (open != null) open = null else onBack() }) {
+    Page(tr(files.firstOrNull { it.first == open }?.second ?: "Licences"), onBack = { if (open != null) open = null else onBack() }) {
         val file = open
         if (file == null) {
             files.forEach { (name, title) ->
-                SettingRow(title, null) { open = name }
+                SettingRow(tr(title), null) { open = name }
             }
         } else {
             val text = remember(file) {
@@ -1214,10 +1412,10 @@ private fun Scrim(onDismiss: () -> Unit, alignment: Alignment, content: @Composa
 private fun ago(ms: Long): String {
     val minutes = (System.currentTimeMillis() - ms) / 60_000
     return when {
-        minutes < 1 -> "just now"
-        minutes < 60 -> "${minutes}m ago"
-        minutes < 60 * 24 -> "${minutes / 60}h ago"
-        minutes < 60 * 24 * 30 -> "${minutes / (60 * 24)}d ago"
+        minutes < 1 -> AppLanguage.translate("just now")
+        minutes < 60 -> AppLanguage.translate("%dm ago", minutes)
+        minutes < 60 * 24 -> AppLanguage.translate("%dh ago", minutes / 60)
+        minutes < 60 * 24 * 30 -> AppLanguage.translate("%dd ago", minutes / (60 * 24))
         else -> stamp(ms).substringBefore(' ')
     }
 }
@@ -1238,14 +1436,14 @@ private fun TrashSheet(p: ProjectSummary, onDismiss: () -> Unit, onRestore: () -
                 }
                 Spacer(Modifier.width(12.dp))
                 Column {
-                    Text(p.name.ifBlank { "Untitled" }, style = ink(15f, FontWeight.Medium), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(p.name.ifBlank { tr("Untitled") }, style = ink(15f, FontWeight.Medium), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Spacer(Modifier.height(2.dp))
                     Text(size(p.sizeBytes), style = ink(12f, color = Home.Muted))
                 }
             }
             Box(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp).height(1.dp).background(Home.Hairline))
-            SheetRow(LucideIcons.RotateCcw, "Restore", onRestore)
-            SheetRow(LucideIcons.Trash2, "Delete for good", onDelete)
+            SheetRow(LucideIcons.RotateCcw, tr("Restore"), onRestore)
+            SheetRow(LucideIcons.Trash2, tr("Delete for good"), onDelete)
         }
     }
 }
@@ -1266,15 +1464,15 @@ private fun ProjectSheet(p: ProjectSummary, onDismiss: () -> Unit, onRename: () 
                 }
                 Spacer(Modifier.width(12.dp))
                 Column {
-                    Text(p.name.ifBlank { "Untitled" }, style = ink(15f, FontWeight.Medium), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(p.name.ifBlank { tr("Untitled") }, style = ink(15f, FontWeight.Medium), maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Spacer(Modifier.height(2.dp))
-                    Text("${size(p.sizeBytes)} · Updated ${ago(p.modifiedMs)}", style = ink(12f, color = Home.Muted))
+                    Text(trf("%s · Updated %s", size(p.sizeBytes), ago(p.modifiedMs)), style = ink(12f, color = Home.Muted))
                 }
             }
             Box(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp).height(1.dp).background(Home.Hairline))
-            SheetRow(LucideIcons.Pencil, "Rename", onRename)
-            SheetRow(LucideIcons.Copy, "Duplicate", onDuplicate)
-            SheetRow(LucideIcons.Trash2, "Delete", onDelete)
+            SheetRow(LucideIcons.Pencil, tr("Rename"), onRename)
+            SheetRow(LucideIcons.Copy, tr("Duplicate"), onDuplicate)
+            SheetRow(LucideIcons.Trash2, tr("Delete"), onDelete)
         }
     }
 }
@@ -1300,7 +1498,7 @@ private fun RenameSheet(current: String, onDismiss: () -> Unit, onDone: (String)
                 .navigationBarsPadding().imePadding().padding(horizontal = 16.dp).padding(bottom = 12.dp),
         ) {
             Box(Modifier.fillMaxWidth().height(50.dp), contentAlignment = Alignment.Center) {
-                Text("Rename", style = ink(16f, FontWeight.Bold))
+                Text(tr("Rename"), style = ink(16f, FontWeight.Bold))
                 Box(Modifier.align(Alignment.CenterEnd).size(40.dp).clickable(onClick = onDismiss), contentAlignment = Alignment.CenterEnd) {
                     Glyph(LucideIcons.X, Home.Ink, size = 22.dp, description = "Close")
                 }
@@ -1332,7 +1530,7 @@ private fun RenameSheet(current: String, onDismiss: () -> Unit, onDone: (String)
                     .background(if (ok) Palette.Accent else Palette.Accent.copy(alpha = 0.4f))
                     .clickable(enabled = ok) { onDone(text.text.trim()) },
                 contentAlignment = Alignment.Center,
-            ) { Text("Confirm", style = ink(15f, FontWeight.Medium, Color.White)) }
+            ) { Text(tr("Confirm"), style = ink(15f, FontWeight.Medium, Color.White)) }
         }
     }
 }
@@ -1351,7 +1549,7 @@ private fun HomeConfirm(text: String, confirm: String, onDismiss: () -> Unit, on
                 Box(
                     Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(6.dp)).background(Home.Field).clickable(onClick = onDismiss),
                     contentAlignment = Alignment.Center,
-                ) { Text("Cancel", style = ink(15f, FontWeight.Medium)) }
+                ) { Text(tr("Cancel"), style = ink(15f, FontWeight.Medium)) }
                 Box(
                     Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(6.dp)).background(Palette.Accent).clickable(onClick = onConfirm),
                     contentAlignment = Alignment.Center,

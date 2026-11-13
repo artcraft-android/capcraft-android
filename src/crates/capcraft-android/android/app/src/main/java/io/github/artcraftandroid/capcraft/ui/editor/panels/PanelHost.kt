@@ -68,6 +68,7 @@ import io.github.artcraftandroid.capcraft.ui.editor.EditorMetrics
 import io.github.artcraftandroid.capcraft.ui.editor.EditorViewModel
 import io.github.artcraftandroid.capcraft.ui.editor.Panel
 import io.github.artcraftandroid.capcraft.ui.editor.Thumbs
+import io.github.artcraftandroid.capcraft.ui.i18n.tr
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.ln
@@ -178,7 +179,7 @@ fun PanelFrame(
                 Box(Modifier.weight(1f)) { header() }
             } else {
                 Box(Modifier.weight(1f)) { left?.invoke() }
-                Text(title, style = Type.BodyStrong.copy(fontSize = 16.sp, color = Palette.DockText))
+                Text(tr(title), style = Type.BodyStrong.copy(fontSize = 16.sp, color = Palette.DockText))
             }
             Box(Modifier.then(if (header != null) Modifier.padding(end = 12.dp) else Modifier.weight(1f)), contentAlignment = Alignment.CenterEnd) {
                 Box(Modifier.size(44.dp).clickable(onClick = onDone), contentAlignment = Alignment.Center) {
@@ -396,7 +397,7 @@ fun Tabs(labels: List<String>, selected: Int, onSelect: (Int) -> Unit) {
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Text(
-                    label,
+                    tr(label),
                     style = Type.Body.copy(
                         color = if (i == selected) Palette.Text else Palette.TextSecondary,
                         fontWeight = if (i == selected) FontWeight.SemiBold else FontWeight.Normal,

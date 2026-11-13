@@ -40,6 +40,7 @@ import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
@@ -47,6 +48,7 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.artcraftandroid.capcraft.core.ClipView
@@ -56,6 +58,8 @@ import io.github.artcraftandroid.capcraft.engine.clock
 import io.github.artcraftandroid.capcraft.engine.seconds1
 import io.github.artcraftandroid.capcraft.ui.LucideIcons
 import io.github.artcraftandroid.capcraft.ui.Palette
+import io.github.artcraftandroid.capcraft.ui.i18n.AppLanguage
+import io.github.artcraftandroid.capcraft.ui.i18n.LocalLanguagePack
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
@@ -305,6 +309,15 @@ private class Layout(
 
 @Composable
 fun Timeline(vm: EditorViewModel, modifier: Modifier) {
+    // Keep NLE timeline timecode & scrub coordinates left-to-right even when UI layout direction is RTL.
+    val langId = LocalLanguagePack.current.id
+    androidx.compose.runtime.CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+        TimelineContent(vm, modifier, langId)
+    }
+}
+
+@Composable
+private fun TimelineContent(vm: EditorViewModel, modifier: Modifier, @Suppress("UNUSED_PARAMETER") langId: String) {
     val density = LocalDensity.current
     val dp = density.density
     val touchSlop = LocalViewConfiguration.current.touchSlop
@@ -649,7 +662,7 @@ fun Timeline(vm: EditorViewModel, modifier: Modifier) {
                     translate(r.left + 7 * dp, r.top + (r.height - s) / 2) {
                         with(hintPlus) { draw(Size(s, s), colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(Palette.TextSecondary)) }
                     }
-                    val label = measurer.measure(text, TextStyle(color = Palette.TextSecondary, fontSize = 12.sp))
+                    val label = measurer.measure(AppLanguage.translate(text), TextStyle(color = Palette.TextSecondary, fontSize = 12.sp))
                     drawText(label, topLeft = Offset(r.left + 7 * dp + s + 5 * dp, r.top + (r.height - label.size.height) / 2))
                     val tile = layout.hintTile(r)
                     if (tile.right > 0) {
@@ -858,7 +871,7 @@ private fun DrawScope.drawLeadingTiles(
             with(pencil) { draw(Size(p, p), colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(Color.White)) }
         }
         val label = measurer.measure(
-            "Cover",
+            AppLanguage.translate("Cover"),
             TextStyle(color = Color.White, fontSize = 11.sp, shadow = androidx.compose.ui.graphics.Shadow(Color(0x99000000), blurRadius = 4f)),
         )
         drawText(label, topLeft = Offset(cover.left + (cover.width - label.size.width) / 2, cover.top + 29 * dp))
@@ -970,7 +983,7 @@ private fun DrawScope.drawClip(
                 // what it treats shows once its kind is open, as the reference keeps the resting row to names
                 if (!filter && layout.open != null) {
                     val all = vm.rowOf(clip.id)?.allVideos == true
-                    x = drawChip(if (all) "All videos" else "Main video", x, inner, Color(0xD9FFFFFF), fill, measurer, dp)
+                    x = drawChip(AppLanguage.translate(if (all) "All videos" else "Main video"), x, inner, Color(0xD9FFFFFF), fill, measurer, dp)
                 }
                 drawChip(clip.name, x, inner, Color(0x24000000), Color(0xE6FFFFFF), measurer, dp)
             }
