@@ -41,7 +41,7 @@ const STILL_SECONDS: f64 = 5.0;
 pub enum Motion {
     /// At rest: the files themselves, the exact frame.
     Still,
-    /// Playing, or written out frame after frame: the files themselves,
+    /// Playing: each file's proxy where it has one, else the file itself,
     /// and the frames ahead decoded early.
     Playing,
     /// The playhead under a finger: each file's scrub copy where it has
@@ -838,6 +838,85 @@ impl MobileSession {
 }
 
 impl MobileSession {
+    /// [`MobileSession::frame`], with the copy of each file chosen by `proxy`
+    /// rather than by `motion`: a GIF is rendered from the files themselves.
+    pub(crate) fn frame_reading(
+        &self,
+        time_us: i64,
+        width: u32,
+        height: u32,
+        motion: Motion,
+        proxy: bool,
+    ) -> Result<Picture, MobileError> {
+        let context = context()?;
+        let (width, height) = (even(width), even(height));
+        let (clips, settings, color_space) = {
+            let mut state = self.lock();
+            let settings = state.session.settings();
+            let revision = state.revision;
+            let cached = state.flat.as_ref().is_some_and(|(at, w, h, _)| {
+                *at == revision && *w == settings.width && *h == settings.height
+            });
+            let clips = if cached {
+                state
+                    .flat
+                    .as_ref()
+                    .map(|entry| Arc::clone(&entry.3))
+                    .unwrap_or_default()
+            } else {
+                let clips = Arc::new(monitor_clips(&state.session, &settings));
+                state.flat = Some((
+                    revision,
+                    settings.width,
+                    settings.height,
+                    Arc::clone(&clips),
+                ));
+                clips
+            };
+            (clips, settings, state.session.video().color_space)
+        };
+        let spec = FrameSpec {
+            time: seconds(time_us).max(0.0),
+            width,
+            height,
+            moving: motion == Motion::Playing,
+            proxy,
+            scrub: motion == Motion::Scrubbing,
+            paused: motion == Motion::Still,
+            color_space,
+            canvas: settings.canvas,
+        };
+        let rgba = context
+            .monitor
+            .frame(Arc::clone(&clips), &settings, spec)
+            .map_err(MobileError::Failed)?;
+        // A drag goes either way, and its next instant is a cheap read of
+        // the scrub copy: nothing is decoded ahead of it. At rest, what is
+        // decoded ahead is what a play pressed next will ask for first -
+        // the proxy's frames from here on - so its reader is open and on
+        // the spot by then: bringing it there took the first third of a
+        // second of every play.
+        let ahead = match motion {
+            Motion::Playing => Some(spec),
+            Motion::Still => Some(FrameSpec {
+                proxy: true,
+                paused: false,
+                ..spec
+            }),
+            Motion::Scrubbing => None,
+        };
+        if let Some(spec) = ahead {
+            let monitor = context.monitor.clone();
+            std::thread::spawn(move || {
+                monitor.prefetch(clips, &settings, spec, concat_media::prefetch::AHEAD)
+            });
+        }
+        Ok(Picture {
+            width,
+            height,
+            rgba,
+        })
+    }
     /// Takes every range of `ranges` (seconds) out of the main track, the
     /// last first so the earlier ones stay where they were, as one undo step.
     pub(crate) fn cut_ranges(&self, ranges: &[(f64, f64)]) -> Result<TimelineView, MobileError> {
@@ -1126,63 +1205,7 @@ impl MobileSession {
         height: u32,
         motion: Motion,
     ) -> Result<Picture, MobileError> {
-        let context = context()?;
-        let (width, height) = (even(width), even(height));
-        let (clips, settings, color_space) = {
-            let mut state = self.lock();
-            let settings = state.session.settings();
-            let revision = state.revision;
-            let cached = state.flat.as_ref().is_some_and(|(at, w, h, _)| {
-                *at == revision && *w == settings.width && *h == settings.height
-            });
-            let clips = if cached {
-                state
-                    .flat
-                    .as_ref()
-                    .map(|entry| Arc::clone(&entry.3))
-                    .unwrap_or_default()
-            } else {
-                let clips = Arc::new(monitor_clips(&state.session, &settings));
-                state.flat = Some((
-                    revision,
-                    settings.width,
-                    settings.height,
-                    Arc::clone(&clips),
-                ));
-                clips
-            };
-            (clips, settings, state.session.video().color_space)
-        };
-        let spec = FrameSpec {
-            time: seconds(time_us).max(0.0),
-            width,
-            height,
-            moving: motion == Motion::Playing,
-            proxy: false,
-            scrub: motion == Motion::Scrubbing,
-            color_space,
-            canvas: settings.canvas,
-        };
-        let rgba = context
-            .monitor
-            .frame(Arc::clone(&clips), &settings, spec)
-            .map_err(MobileError::Failed)?;
-        // A drag goes either way, and its next instant is a cheap read of
-        // the scrub copy: nothing is decoded ahead of it.
-        let ahead = match motion {
-            Motion::Playing => concat_media::prefetch::AHEAD,
-            Motion::Still => 2,
-            Motion::Scrubbing => 0,
-        };
-        if ahead > 0 {
-            let monitor = context.monitor.clone();
-            std::thread::spawn(move || monitor.prefetch(clips, &settings, spec, ahead));
-        }
-        Ok(Picture {
-            width,
-            height,
-            rgba,
-        })
+        self.frame_reading(time_us, width, height, motion, motion == Motion::Playing)
     }
 
     /// The keyframe button: a key at `time_us` on every property the clip
@@ -1375,6 +1398,7 @@ impl MobileSession {
             moving: false,
             proxy: false,
             scrub: false,
+            paused: false,
             color_space,
             canvas: settings.canvas,
         };

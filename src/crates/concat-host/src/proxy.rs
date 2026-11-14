@@ -30,7 +30,9 @@ const PIXELS_WITHOUT_PROXY: u64 = 1920 * 1080;
 /// The proxy's long side is the original's divided by this, and never
 /// shorter than [`SHORTEST_LONG_SIDE`].
 const DIVISOR: u32 = 4;
-const SHORTEST_LONG_SIDE: u32 = 960;
+/// A phone's monitor is about this many pixels across: a 4K file's quarter,
+/// 960, was drawn a third larger than it was, and soft.
+const SHORTEST_LONG_SIDE: u32 = 1280;
 
 /// Whether a `width` by `height` file is worth a proxy.
 pub fn wanted(width: u32, height: u32) -> bool {
@@ -72,6 +74,10 @@ pub fn path_for(
     if hdr {
         "hdr".hash(&mut hasher);
     }
+    // A keyframe every second, where earlier builds wrote one every two
+    // or left it to the encoder, and the long side no shorter than it is
+    // now: those copies are written again.
+    ("keyframes-1s", SHORTEST_LONG_SIDE).hash(&mut hasher);
     if let Ok(modified) = meta.modified()
         && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
     {
@@ -132,6 +138,9 @@ pub fn ensure(
     }
     let source = media.to_owned();
     let size = size_for(width, height);
+    if let Ok(mut awaited) = awaited().lock() {
+        awaited.insert(source.clone());
+    }
     crate::scheduler().submit(Priority::Proxy, move || {
         match write(&source, &target, size, range) {
             Ok(()) => {
@@ -142,12 +151,28 @@ pub fn ensure(
             }
             Err(error) => log::warn!("{source}: no proxy: {error}"),
         }
+        if let Ok(mut awaited) = awaited().lock() {
+            awaited.remove(&source);
+        }
         writing
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&target);
     });
     true
+}
+
+/// The files whose proxy is queued or being written.
+fn awaited() -> &'static Mutex<HashSet<String>> {
+    static AWAITED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    AWAITED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Whether `media` is waiting for its proxy: queued or being written.
+pub fn pending(media: &str) -> bool {
+    awaited()
+        .lock()
+        .is_ok_and(|awaited| awaited.contains(media))
 }
 
 /// The proxies being written now, by target, so one is never queued
@@ -186,7 +211,8 @@ pub fn sweep(project: &Path, keep: &HashSet<PathBuf>) -> usize {
 }
 
 /// Writes the proxy of `source`, read as `range`, at `size` to `target`:
-/// H.264, a fast preset, two threads, in software, into a temporary name
+/// H.264, a fast preset, two threads, in software (decoded on the chip on
+/// a phone), into a temporary name
 /// that is moved into place only when whole, so a copy that is there is a
 /// copy that is complete. The copy is tagged video range and converted to
 /// match, so it is read as it is and needs no correction of its own. An
@@ -213,12 +239,19 @@ pub fn write(
     // Written beside the target under a name the muxer still knows the
     // format of, and moved into place only when whole.
     let partial = target.with_extension("part.mp4");
-    let options = DecodeOptions::default()
+    // On a phone the chip decodes, where it has a seat free, and hands a
+    // ten-bit picture back in eight, which is all an SDR copy keeps: a 4K
+    // ten-bit file was read at 51 frames a second that way and 17 on the
+    // cores. Two threads where the cores do it after all.
+    let mut options = DecodeOptions::default()
         .scaled_to(width, height)
-        .in_software()
         .threaded(2)
         .in_range(range)
-        .deep(hdr);
+        .deep(hdr)
+        .eight_bit(true);
+    if !cfg!(target_os = "android") {
+        options = options.in_software();
+    }
     let mut decoder = Decoder::open(source, &options).map_err(|error| error.to_string())?;
     let encoding = EncodeOptions {
         codec: if hdr {
@@ -239,6 +272,7 @@ pub fn write(
         hardware: hdr,
         threads: 2,
         software_only: false,
+        keyframe_seconds: 1,
     };
     let mut encoder = if hdr {
         Encoder::create_hdr(&partial, width, height, rate, &encoding, signal)
@@ -251,6 +285,7 @@ pub fn write(
             encoder
                 .write_frame(&frame)
                 .map_err(|error| error.to_string())?;
+            crate::preview::give_way();
         }
         encoder.finish().map_err(|error| error.to_string())
     })();
@@ -271,6 +306,53 @@ pub fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A proxy has a keyframe every second: a play starts anywhere, and
+    /// its first frame is decoded from the keyframe before it.
+    #[test]
+    fn a_proxy_has_a_keyframe_every_second() {
+        use concat_core::frame::Frame;
+        use concat_core::time::{FrameRate, Rational};
+        use concat_media::SeekableSource;
+        let dir = std::env::temp_dir().join(format!("concat-proxy-gop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let media = dir.join("clip.mp4");
+        {
+            let mut encoder = Encoder::create(
+                &media,
+                640,
+                360,
+                FrameRate::THIRTY,
+                &EncodeOptions::default(),
+            )
+            .expect("encodes");
+            // One slow ramp, so no scene cut asks for a keyframe of its own.
+            for index in 0..120u32 {
+                let mut frame = Frame::black(640, 360);
+                frame.fill([(index + 60) as u8, 90, 90, 255]);
+                encoder.write_frame(&frame).expect("writes");
+            }
+            encoder.finish().expect("finishes");
+        }
+        let target = dir.join("proxy.mp4");
+        write(&media.to_string_lossy(), &target, (320, 180), None).expect("writes the proxy");
+        let mut decoder =
+            Decoder::open(&target, &DecodeOptions::default().nearest_keyframes()).expect("opens");
+        for second in 1..4 {
+            let asked = f64::from(second) + 0.9;
+            decoder
+                .seek(Rational::approximate(asked).expect("a time"))
+                .expect("seeks");
+            decoder.next_frame().expect("decodes").expect("a frame");
+            let landed = decoder.position().expect("a stamp").as_f64();
+            assert!(
+                landed > asked - 1.0 - 0.05 && landed <= asked,
+                "the keyframe before {asked} s is at {landed} s"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// An HDR file's proxy keeps its signal: HEVC, HLG as the file is,
     /// its grey coming back as the same signal - under a name of its own,
@@ -350,12 +432,12 @@ mod tests {
 
     #[test]
     fn a_proxy_is_a_quarter_of_the_long_side_but_never_tiny_or_larger() {
-        assert_eq!(size_for(3840, 2160), (960, 540));
         assert_eq!(size_for(7680, 4320), (1920, 1080));
+        // A file whose quarter is under the floor gets the floor: 4K too.
+        assert_eq!(size_for(3840, 2160), (1280, 720));
+        assert_eq!(size_for(2560, 1440), (1280, 720));
         // A tall file keeps its way up.
-        assert_eq!(size_for(2160, 3840), (540, 960));
-        // A file too small for a quarter gets the floor, never upscaled.
-        assert_eq!(size_for(2560, 1440), (960, 540));
+        assert_eq!(size_for(2160, 3840), (720, 1280));
         assert_eq!(size_for(640, 480), (640, 480));
         // Odd sizes come out even, and nothing is ever under two.
         let (w, h) = size_for(3841, 2161);
@@ -403,7 +485,7 @@ mod tests {
         let proxy = existing(&project, &source, None).expect("the proxy was written");
         let info = concat_media::probe(&proxy).expect("probes");
         let video = info.video.expect("has pictures");
-        assert_eq!((video.width, video.height), (960, 540));
+        assert_eq!((video.width, video.height), (1280, 720));
         let pool = crate::scheduler().pool();
         assert_eq!(
             pool.proxy_of(Path::new(&source)).as_deref(),

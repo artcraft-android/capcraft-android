@@ -32,6 +32,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -105,6 +106,9 @@ sealed interface Panel {
 }
 
 /** Where the timeline keeps beat marks, by media id. */
+/** How long a play waits for its first picture before the clock starts without it, milliseconds. */
+private const val PRIME_MS = 600L
+
 private const val BEATS = "capcraftBeats"
 
 /** The app's settings file, and the linkage switch in it. */
@@ -537,14 +541,35 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
         if (playing) stop() else start()
     }
 
+    /**
+     * Makes the picture a play from an instant starts with, set by the monitor while it is on screen: the clock starts
+     * once it is made, so the play begins on its first frame rather than a third of a second in.
+     */
+    var primer: (suspend (Long) -> Unit)? = null
+
+    /** A play is on its way: its first picture is being made. */
+    private var starting = false
+
     fun start() {
         val end = timeline?.durationUs ?: 0L
-        if (end <= 0) return
+        if (end <= 0 || starting) return
         val from = if (playhead >= end - 30_000) 0L else playhead
+        starting = true
         viewModelScope.launch {
-            withContext(Threads.commands) { runCatching { play(from) } }
-            playhead = from
-            playing = true
+            try {
+                // the picture goes on being made past the wait, and the play catches it up as it always did
+                primer?.let { prime ->
+                    val began = System.nanoTime()
+                    val made = launch { prime(from) }
+                    val inTime = withTimeoutOrNull(PRIME_MS) { made.join() } != null
+                    android.util.Log.d("CapCraft", "play primed in %d ms%s".format((System.nanoTime() - began) / 1_000_000, if (inTime) "" else ", not waited for"))
+                }
+                withContext(Threads.commands) { runCatching { play(from) } }
+                playhead = from
+                playing = true
+            } finally {
+                starting = false
+            }
         }
     }
 

@@ -3,8 +3,10 @@
 
 //! Each video's scrub copy, read while the playhead is dragged: written in
 //! the background into the project's cache, one at a time, from the moment
-//! the video is added or the project opens. Playback and the playhead at
-//! rest read the files themselves. See `concat_host::scrub`.
+//! the video is added or the project opens. Playback reads each video's
+//! proxy, a quarter-size H.264 copy written on the same lane after the scrub
+//! copies; the playhead at rest and the export read the files themselves.
+//! See `concat_host::scrub` and `concat_host::proxy`.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -44,8 +46,9 @@ fn videos(session: &Session) -> Vec<(String, Video)> {
         .collect()
 }
 
-/// Queues the copy of every video not in `seen`, then adds it there. A
-/// copy already written is adopted at once.
+/// Queues the scrub copy and the proxy of every video not in `seen`, then
+/// adds it there. A copy already written is adopted at once; a proxy is
+/// only written for a video larger than full HD.
 pub(crate) fn see_to(session: &Session, seen: &mut HashSet<String>) {
     let project = Path::new(session.path());
     for (id, video) in videos(session) {
@@ -58,12 +61,20 @@ pub(crate) fn see_to(session: &Session, seen: &mut HashSet<String>) {
                 video.range,
                 video.hdr,
             );
+            concat_host::proxy::ensure(
+                project,
+                &video.path,
+                video.width,
+                video.height,
+                video.range,
+                video.hdr,
+            );
         }
     }
 }
 
-/// Removes the copies of media no longer in the project, or read as a
-/// range they no longer are: nothing else clears them.
+/// Removes the scrub copies and proxies of media no longer in the project,
+/// or read as a range they no longer are: nothing else clears them.
 pub(crate) fn sweep(session: &Session) {
     let project = Path::new(session.path());
     let keep: HashSet<_> = videos(session)
@@ -76,5 +87,15 @@ pub(crate) fn sweep(session: &Session) {
             "{swept} stale scrub copies swept from {}",
             project.display()
         );
+    }
+    let keep: HashSet<_> = videos(session)
+        .iter()
+        .filter_map(|(_, video)| {
+            concat_host::proxy::path_for(project, &video.path, video.range, video.hdr)
+        })
+        .collect();
+    let swept = concat_host::proxy::sweep(project, &keep);
+    if swept > 0 {
+        log::info!("{swept} stale proxies swept from {}", project.display());
     }
 }

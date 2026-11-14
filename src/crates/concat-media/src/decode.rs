@@ -170,9 +170,23 @@ pub struct DecodeOptions {
     /// pre-chain runs, since those are FFmpeg filters on eight bits. See
     /// [`Frame::signal`].
     pub deep: bool,
+    /// Eight bits a sample will do: for a reader whose pictures end up in
+    /// eight bits whatever the file holds - a proxy or a scrub copy being
+    /// written. A phone's chip is then left to hand a ten-bit stream back
+    /// in eight, half the bytes to copy out of it and to convert, which is
+    /// most of what such a frame costs. Nothing changes in software, and
+    /// nothing for a reader that keeps the source [deep](Self::deep).
+    pub eight_bit: bool,
 }
 
 impl DecodeOptions {
+    /// Whether the chip may squeeze a deep stream to eight bits for this
+    /// reader: [`DecodeOptions::eight_bit`], unless it keeps the source
+    /// deep.
+    fn squeezed(&self) -> bool {
+        self.eight_bit && !self.deep
+    }
+
     /// Seeks to `start` before decoding.
     pub fn starting_at(mut self, start: Rational) -> Self {
         self.start = Some(start);
@@ -245,6 +259,12 @@ impl DecodeOptions {
     /// Keeps a wide or HDR source deep; see [`DecodeOptions::deep`].
     pub fn deep(mut self, deep: bool) -> Self {
         self.deep = deep;
+        self
+    }
+
+    /// Lets the chip hand back eight bits; see [`DecodeOptions::eight_bit`].
+    pub fn eight_bit(mut self, eight_bit: bool) -> Self {
+        self.eight_bit = eight_bit;
         self
     }
 
@@ -749,14 +769,32 @@ impl Decoder {
                 // scrub copy being written - which the CPU makes in no time:
                 // on the chip it held a seat the picture a person watches
                 // needed, and the preview decoded on the CPU.
+                // Unless the stream is a deep one being copied in eight
+                // bits: that the CPU does not make in no time - a 4K
+                // ten-bit frame took it four times what it takes the chip -
+                // and the copies are written one at a time, so they hold
+                // one seat between them.
                 let small = options.size.is_some_and(|(width, height)| {
                     u64::from(width) * u64::from(height) < hardware::MEDIACODEC_SMALLEST
-                });
+                }) && !(options.squeezed() && hardware::deep(format));
                 let wrapped = hardware::mediacodec_decoder(codec, format)
                     .filter(|_| !options.keyframes_only && !small)
                     .filter(|&name| {
-                        hardware::mediacodec_works(name, || {
-                            first_picture_within(path, name, hardware::MEDIACODEC_FIRST_PICTURE)
+                        // A reader that takes eight bits asks nothing of
+                        // the chip's ten-bit path.
+                        let wanted = if options.squeezed() {
+                            Pixel::YUV420P
+                        } else {
+                            format
+                        };
+                        let trial = hardware::mediacodec_trial(name, wanted);
+                        hardware::mediacodec_works(trial, || {
+                            first_picture_within(
+                                path,
+                                name,
+                                wanted,
+                                hardware::MEDIACODEC_FIRST_PICTURE,
+                            )
                         })
                     })
                     .and_then(|name| hardware::mediacodec_seat().map(|seat| (name, seat)));
@@ -929,6 +967,15 @@ impl Decoder {
                 // SAFETY: the context is not opened yet; a plain rational.
                 unsafe {
                     (*context.as_mut_ptr()).pkt_timebase = stream.time_base().into();
+                }
+                // The wrapper asks the chip for ten bits when the stream
+                // says it has them (see `scripts/ffmpeg-patches`). Told
+                // eight, it asks for nothing, and the chip squeezes.
+                if options.squeezed() {
+                    // SAFETY: the context is not opened yet; a plain enum.
+                    unsafe {
+                        (*context.as_mut_ptr()).pix_fmt = Pixel::YUV420P.into();
+                    }
                 }
                 (None, Some(found))
             }
@@ -1546,14 +1593,23 @@ impl FrameSource for Decoder {
 /// Whether MediaCodec's decoder `name` gives the first picture of
 /// `path`'s video within `wait` - [`hardware::MEDIACODEC_FIRST_PICTURE`] for a
 /// reader; see [`hardware::Verdicts`] for why a decoder is asked before it
-/// is trusted.
+/// is trusted. A stream in a deep `format` has to come back deep: a chip
+/// that squeezes ten bits to eight has given a picture, but not the one
+/// the export or an HDR monitor is owed.
 ///
 /// The try runs on a thread of its own, with its own demuxer and codec,
 /// because a decoder that wedges never returns control to the caller; a
 /// wedged try is left behind on its thread, and the reader never waits on
 /// it past the deadline. A try that answers late still has its say, for
 /// the readers that come after.
-fn first_picture_within(path: &Path, name: &'static str, wait: std::time::Duration) -> bool {
+fn first_picture_within(
+    path: &Path,
+    name: &'static str,
+    format: Pixel,
+    wait: std::time::Duration,
+) -> bool {
+    let trial = hardware::mediacodec_trial(name, format);
+    let deep = hardware::deep(format);
     let path = path.to_path_buf();
     let (answer, answered) = std::sync::mpsc::channel();
     let tried = std::thread::Builder::new()
@@ -1566,7 +1622,7 @@ fn first_picture_within(path: &Path, name: &'static str, wait: std::time::Durati
                     let (codec, _) = Decoder::open_codec(
                         &path,
                         &stream,
-                        &DecodeOptions::default(),
+                        &DecodeOptions::default().eight_bit(!deep),
                         Codec::Named(name),
                     )
                     .ok()?;
@@ -1574,16 +1630,22 @@ fn first_picture_within(path: &Path, name: &'static str, wait: std::time::Durati
                 };
                 let mut held = None;
                 let read = || feed::read_packet(&mut input, index);
-                feed::next_frame(&mut codec, &mut held, read)
-                    .ok()?
-                    .map(|_| ())
+                let picture = feed::next_frame(&mut codec, &mut held, read).ok()??;
+                if deep && !hardware::deep(picture.format()) {
+                    log::warn!(
+                        "MediaCodec's {name} gave {:?} for a ten-bit stream",
+                        picture.format()
+                    );
+                    return None;
+                }
+                Some(())
             };
             let works = attempt().is_some();
             let _ = answer.send(works);
             // Late or not, what it found is the verdict from now on: a
             // decoder that was only slow to start is not written off for
             // the life of the process.
-            hardware::mediacodec_answered(name, works);
+            hardware::mediacodec_answered(trial, works);
         });
     tried.is_ok() && answered.recv_timeout(wait).unwrap_or(false)
 }
@@ -1983,6 +2045,7 @@ mod tests {
             hardware: false,
             threads: 0,
             software_only: false,
+            keyframe_seconds: 0,
         };
         let mut encoder = Encoder::create_tagged(
             &path,
@@ -2347,13 +2410,41 @@ mod tests {
         let Some(path) = std::env::var_os("CONCAT_DEVICE_SAMPLE").map(PathBuf::from) else {
             return;
         };
+        // A bare executable has no binder threads, which an app is given,
+        // and without them the codec's callbacks never arrive: every
+        // decoder looked wedged. The call is in a library newer than the
+        // oldest Android this builds for, so it is looked up, not linked.
+        #[cfg(target_os = "android")]
+        // SAFETY: a library of the platform's, and a function of no
+        // arguments it documents for exactly this.
+        unsafe {
+            let binder = libc::dlopen(c"libbinder_ndk.so".as_ptr(), libc::RTLD_NOW);
+            if !binder.is_null() {
+                let start = libc::dlsym(binder, c"ABinderProcess_startThreadPool".as_ptr());
+                if !start.is_null() {
+                    std::mem::transmute::<*mut libc::c_void, extern "C" fn()>(start)();
+                }
+            }
+        }
         let count: usize = std::env::var("CONCAT_DEVICE_FRAMES")
             .ok()
             .and_then(|count| count.parse().ok())
             .unwrap_or(90);
         let out = std::env::var_os("CONCAT_DEVICE_OUT").map(PathBuf::from);
-        let chip = DecodeOptions::default().accelerated(HwDevice::MediaCodec);
-        let cpu = DecodeOptions::default().in_software();
+        // `CONCAT_DEVICE_SIZE=960x540` draws the pictures at a monitor's
+        // size rather than the file's, which is what a preview pays for.
+        let size = std::env::var("CONCAT_DEVICE_SIZE").ok().and_then(|size| {
+            let (width, height) = size.split_once('x')?;
+            Some((width.parse().ok()?, height.parse().ok()?))
+        });
+        // `CONCAT_DEVICE_EIGHT=1` reads as a proxy's writer does.
+        let sized = DecodeOptions {
+            size,
+            eight_bit: std::env::var_os("CONCAT_DEVICE_EIGHT").is_some(),
+            ..DecodeOptions::default()
+        };
+        let chip = sized.clone().accelerated(HwDevice::MediaCodec);
+        let cpu = sized.in_software();
 
         let take = |options: &DecodeOptions| {
             let started = Instant::now();
@@ -2371,23 +2462,53 @@ mod tests {
         // number the first-picture deadline is measured against.
         {
             let started = Instant::now();
-            let name = hardware::mediacodec_decoder(
-                ffmpeg::format::input(&path)
-                    .expect("opens")
+            let (id, format) = {
+                let input = ffmpeg::format::input(&path).expect("opens");
+                let stream = input
                     .streams()
                     .best(ffmpeg::media::Type::Video)
-                    .expect("a video stream")
-                    .parameters()
-                    .id(),
-                Pixel::YUV420P,
-            )
-            .expect("a codec MediaCodec takes");
-            let answered = first_picture_within(&path, name, std::time::Duration::from_secs(60));
+                    .expect("a video stream");
+                let parameters = stream.parameters();
+                // SAFETY: a live stream's codec parameters; for a video
+                // stream `format` holds an AVPixelFormat.
+                let raw = unsafe { (*parameters.as_ptr()).format };
+                (
+                    parameters.id(),
+                    Pixel::from(ffmpeg::sys::AVPixelFormat(raw)),
+                )
+            };
+            let name = hardware::mediacodec_decoder(id, format).expect("a codec MediaCodec takes");
+            let format = if cpu.squeezed() {
+                Pixel::YUV420P
+            } else {
+                format
+            };
+            let answered =
+                first_picture_within(&path, name, format, std::time::Duration::from_secs(60));
             eprintln!(
                 "{name}: first picture {} in {:?}",
                 if answered { "came" } else { "did not come" },
                 started.elapsed()
             );
+        }
+        // Where a frame's time goes: out of the codec, and through the
+        // graph to RGBA.
+        for (label, options) in [("MediaCodec", &chip), ("CPU", &cpu)] {
+            let mut decoder = Decoder::open(&path, options).expect("opens");
+            let (mut decoding, mut converting, mut frames) =
+                (std::time::Duration::ZERO, std::time::Duration::ZERO, 0);
+            while frames < count {
+                let started = Instant::now();
+                let Some(source) = decoder.next_source().expect("decodes") else {
+                    break;
+                };
+                decoding += started.elapsed();
+                let started = Instant::now();
+                decoder.convert(&source.frame).expect("converts");
+                converting += started.elapsed();
+                frames += 1;
+            }
+            eprintln!("{label}: {frames} frames, decode {decoding:?}, convert {converting:?}");
         }
         let (on_chip, chip_frames, chip_took) = take(&chip);
         let (_, cpu_frames, cpu_took) = take(&cpu);

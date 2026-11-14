@@ -91,6 +91,11 @@ pub struct FrameRequest {
     /// the file: for a playhead being dragged. See
     /// [`ReaderPool::adopt_scrub`].
     pub scrub: bool,
+    /// The file itself, for a playhead at rest on a screen: the original
+    /// as ever, except that a phone's chip may hand a ten-bit picture back
+    /// in eight, a few levels off and several times sooner. Never set for
+    /// an export.
+    pub paused: bool,
     /// The levels the file is read as, over its own tag; `None` reads the
     /// tag. See [`DecodeOptions::color_range`]. Never applied to a proxy:
     /// a proxy was written from the corrected picture and tagged true.
@@ -123,6 +128,7 @@ impl FrameRequest {
             chain: None,
             proxy: false,
             scrub: false,
+            paused: false,
             range: None,
             any_size: false,
             deep: false,
@@ -191,19 +197,30 @@ impl FrameRequest {
         self
     }
 
+    /// Reads the file for a playhead at rest on a screen. See
+    /// [`FrameRequest::paused`].
+    pub fn for_pause(mut self, paused: bool) -> Self {
+        self.paused = paused;
+        self
+    }
+
     /// Reads the copy `reading` names where the file has one.
     pub fn reading(self, reading: Reading) -> Self {
         self.from_proxy(reading == Reading::Proxy)
             .for_scrub(reading == Reading::Scrub)
+            .for_pause(reading == Reading::Paused)
     }
 }
 
 /// Which copy of a file a frame is read from.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Reading {
-    /// The file itself: the paused monitor and the export.
+    /// The file itself, to the bit: the export.
     #[default]
     Original,
+    /// The file itself for a playhead at rest on a screen; see
+    /// [`FrameRequest::paused`].
+    Paused,
     /// Its proxy where it has one: a picture that is playing.
     Proxy,
     /// Its scrub copy, else its proxy: a playhead being dragged.
@@ -226,6 +243,10 @@ struct SourceKey {
     /// (see [`DecodeOptions::deep`]) - a different picture from the
     /// tone-mapped eight bits.
     deep: bool,
+    /// Read by a reader that lets the chip hand back eight bits (see
+    /// [`DecodeOptions::eight_bit`]): a picture a few levels off the one
+    /// read in full, so the playhead at rest never takes it for its own.
+    eight: bool,
 }
 
 /// A treated frame's identity: the source frame and what was done to it.
@@ -347,11 +368,9 @@ enum Access {
     Seek,
 }
 
-fn plan_access(current_next: Option<i64>, target: i64) -> Access {
+fn plan_access(current_next: Option<i64>, target: i64, roll: i64) -> Access {
     match current_next {
-        Some(next) if target >= next && target - next <= ROLL_FORWARD_FRAMES => {
-            Access::Roll(target - next)
-        }
+        Some(next) if target >= next && target - next <= roll => Access::Roll(target - next),
         _ => Access::Seek,
     }
 }
@@ -362,14 +381,27 @@ fn plan_access(current_next: Option<i64>, target: i64) -> Access {
 /// frame k often claims after k+1 has already moved the reader's aim, and
 /// treating k as a seek opened a second and a third reader for plain
 /// playback of one file.
-fn claim_cost(aim: i64, target: i64) -> Option<i64> {
-    match plan_access(Some(aim), target) {
+fn claim_cost(aim: i64, target: i64, roll: i64) -> Option<i64> {
+    match plan_access(Some(aim), target, roll) {
         Access::Roll(frames) => Some(frames),
         Access::Seek if target < aim && aim - target <= i64::from(crate::prefetch::AHEAD) => {
             Some(aim - target)
         }
         Access::Seek => None,
     }
+}
+
+/// Whether a phone reads the file of `facts` in eight bits off its chip: a
+/// ten-bit file, asked for by a `screen` - a moving picture or a playhead
+/// at rest - and not one a `deep` reader would keep deep.
+fn squeezes(facts: &MediaFacts, deep: bool, screen: bool) -> bool {
+    facts.deep && screen && !(deep && facts.wide)
+}
+
+/// A proxy's roll: the frames of one second, the distance between its
+/// keyframes, and never more than any file's.
+fn proxy_roll(rate: FrameRate) -> i64 {
+    (rate.fps().as_f64().round() as i64).clamp(1, ROLL_FORWARD_FRAMES)
 }
 
 /// An even size no smaller than two on a side: what the scaler and the
@@ -416,6 +448,7 @@ impl Reader {
         pre: Option<&str>,
         range: Option<ColorRange>,
         deep: bool,
+        eight: bool,
         rate: FrameRate,
         still: bool,
         index: i64,
@@ -427,7 +460,9 @@ impl Reader {
             .starting_at(rate.time_of_frame(index))
             .scaled_to(width, height)
             .in_range(range)
-            .deep(deep);
+            // An eight-bit reader is of a file no reader keeps deep.
+            .deep(deep && !eight)
+            .eight_bit(eight);
         if still {
             // One frame, served for every time, and never sought: a seek
             // on a single-image JPEG leaves FFmpeg's image demuxer with
@@ -507,6 +542,18 @@ struct MediaFacts {
     /// The picture's displayed size, for a file with one: what the levels
     /// are halvings of.
     size: Option<(u32, u32)>,
+    /// More than eight bits a sample; see [`probe::VideoStream::deep`].
+    deep: bool,
+    /// A wide or HDR signal, which a deep reader keeps deep. Any other
+    /// ten-bit file - a camera's log profile - comes out of every reader
+    /// in eight bits.
+    wide: bool,
+    /// How many frames ahead of a reader a frame is rolled to rather than
+    /// sought: [`ROLL_FORWARD_FRAMES`], or a second's worth for a proxy,
+    /// which has a keyframe every second - past that a seek is the
+    /// shorter walk, and rolling two seconds of it held up the first
+    /// frame of a play by a third of a second.
+    roll: i64,
 }
 
 impl MediaFacts {
@@ -534,6 +581,7 @@ type ReaderKey = (
     Option<String>,
     Option<String>,
     Option<ColorRange>,
+    bool,
     bool,
 );
 
@@ -567,7 +615,7 @@ impl Readers {
     /// roll - or a few frames behind, or, when none is and the key already
     /// holds [`READERS_PER_KEY`], its coldest, which will seek. Made the
     /// most recent and aimed at `target`. `None` means open another.
-    fn claim(&mut self, key: &ReaderKey, target: i64) -> Option<Arc<Mutex<Reader>>> {
+    fn claim(&mut self, key: &ReaderKey, target: i64, roll: i64) -> Option<Arc<Mutex<Reader>>> {
         let mine = || {
             self.warm
                 .iter()
@@ -575,7 +623,7 @@ impl Readers {
                 .filter(|(_, warm)| &warm.key == key)
         };
         let near = mine()
-            .filter_map(|(at, warm)| Some((claim_cost(warm.aim, target)?, at)))
+            .filter_map(|(at, warm)| Some((claim_cost(warm.aim, target, roll)?, at)))
             .min()
             .map(|(_, at)| at);
         // At the cap the coldest seeks, as the one reader always did: a
@@ -768,6 +816,9 @@ impl ReaderPool {
                     still: true,
                     frames: None,
                     size: None,
+                    deep: false,
+                    wide: false,
+                    roll: ROLL_FORWARD_FRAMES,
                 }),
             );
         }
@@ -785,6 +836,13 @@ impl ReaderPool {
         if let Ok(mut proxies) = self.proxies.lock() {
             proxies.insert(original.to_path_buf(), proxy);
         }
+    }
+
+    /// Whether `path` is a proxy some file was given.
+    fn is_proxy(&self, path: &Path) -> bool {
+        self.proxies
+            .lock()
+            .is_ok_and(|proxies| proxies.values().any(|proxy| proxy == path))
     }
 
     /// The proxy adopted for `original`, if one was.
@@ -928,6 +986,23 @@ impl ReaderPool {
         // here is FFmpeg, which takes eight bits.
         let deep =
             request.deep && request.any_size && request.pre.is_none() && request.chain.is_none();
+        // A moving picture of a ten-bit file whose stand-in is not written
+        // yet is read off a phone's chip in eight bits, three times as
+        // fast as in ten: the stand-in it asked for would have been eight
+        // bits too. So is the picture of a playhead at rest, which in ten
+        // bits was a second in coming and held up the play pressed after
+        // it. Only there, and only for a deep file: anywhere else the
+        // reader is the same one, and a second key would only open it
+        // twice. A deep request keeps a wide file's ten bits; of any other
+        // file it gets eight whoever reads it, so it does not stand in the
+        // way.
+        let eight = cfg!(target_os = "android")
+            && path == request.path
+            && squeezes(
+                &facts,
+                deep,
+                request.proxy || request.scrub || request.paused,
+            );
         Ok((
             facts,
             SourceKey {
@@ -937,6 +1012,7 @@ impl ReaderPool {
                 index,
                 range,
                 deep,
+                eight,
             },
         ))
     }
@@ -1026,6 +1102,7 @@ impl ReaderPool {
             index,
             range,
             deep: deep && chain.is_none() && pre.is_none(),
+            eight: false,
         };
         if chain.is_none() && pre.is_none() {
             return self.source_frame(&facts, &source_key);
@@ -1055,7 +1132,9 @@ impl ReaderPool {
             self.remember_treated(key, Arc::clone(&frame));
             return Ok(frame);
         }
-        let shared = self.reader(path, width, height, chain, pre, range, false, &facts, index)?;
+        let shared = self.reader(
+            path, width, height, chain, pre, range, false, false, &facts, index,
+        )?;
         let mut reader = shared.lock().map_err(|_| crate::error::Error::NoFrame {
             path: path.to_path_buf(),
         })?;
@@ -1091,7 +1170,8 @@ impl ReaderPool {
             return Ok(frame);
         }
         let shared = self.reader(
-            path, key.width, key.height, None, None, key.range, key.deep, facts, key.index,
+            path, key.width, key.height, None, None, key.range, key.deep, key.eight, facts,
+            key.index,
         )?;
         let mut reader = shared.lock().map_err(|_| crate::error::Error::NoFrame {
             path: path.to_path_buf(),
@@ -1126,7 +1206,7 @@ impl ReaderPool {
     ) -> Result<Option<Arc<Frame>>> {
         let rate = facts.rate;
         let next = (reader.next_index != i64::MIN).then_some(reader.next_index);
-        if !facts.still && plan_access(next, target) == Access::Seek {
+        if !facts.still && plan_access(next, target, facts.roll) == Access::Seek {
             reader.seek(rate, target)?;
         }
 
@@ -1230,6 +1310,9 @@ impl ReaderPool {
                     still: true,
                     frames: None,
                     size: None,
+                    deep: false,
+                    wide: false,
+                    roll: ROLL_FORWARD_FRAMES,
                 }
             } else {
                 let info = probe::probe(path)?;
@@ -1258,6 +1341,16 @@ impl ReaderPool {
                     still: false,
                     frames,
                     size,
+                    deep: info.video.as_ref().is_some_and(|video| video.deep),
+                    wide: info
+                        .video
+                        .as_ref()
+                        .is_some_and(|video| video.signal != concat_core::frame::Signal::Sdr),
+                    roll: if self.is_proxy(path) {
+                        proxy_roll(rate)
+                    } else {
+                        ROLL_FORWARD_FRAMES
+                    },
                 }
             }
         };
@@ -1283,6 +1376,7 @@ impl ReaderPool {
         pre: Option<&str>,
         range: Option<ColorRange>,
         deep: bool,
+        eight: bool,
         facts: &MediaFacts,
         target: i64,
     ) -> Result<Arc<Mutex<Reader>>> {
@@ -1294,6 +1388,7 @@ impl ReaderPool {
             pre.map(str::to_owned),
             range,
             deep,
+            eight,
         );
         {
             let mut readers = self
@@ -1302,7 +1397,7 @@ impl ReaderPool {
                 .map_err(|_| crate::error::Error::NoFrame {
                     path: path.to_path_buf(),
                 })?;
-            if let Some(reader) = readers.claim(&key, target) {
+            if let Some(reader) = readers.claim(&key, target, facts.roll) {
                 return Ok(reader);
             }
         }
@@ -1318,6 +1413,7 @@ impl ReaderPool {
             pre,
             range,
             deep,
+            eight,
             facts.rate,
             facts.still,
             target,
@@ -1328,7 +1424,7 @@ impl ReaderPool {
             .map_err(|_| crate::error::Error::NoFrame {
                 path: path.to_path_buf(),
             })?;
-        if let Some(reader) = readers.claim(&key, target) {
+        if let Some(reader) = readers.claim(&key, target, facts.roll) {
             // Someone else opened a reader for this ground meanwhile, or
             // filled the key; theirs wins.
             return Ok(reader);
@@ -1376,28 +1472,73 @@ pub(crate) mod tests {
     use super::*;
     use crate::encode::{EncodeOptions, Encoder, FrameSink};
 
+    /// A camera's log file is read in eight bits for a screen, deep
+    /// request or not, since no reader keeps it deep; an HDR file keeps
+    /// its ten bits for a deep request; and nothing is squeezed for an
+    /// export or out of an eight-bit file.
+    #[test]
+    fn a_ten_bit_file_is_squeezed_for_a_screen_only() {
+        let facts = |deep, wide| MediaFacts {
+            rate: FrameRate::THIRTY,
+            still: false,
+            frames: None,
+            size: Some((3840, 2160)),
+            deep,
+            wide,
+            roll: ROLL_FORWARD_FRAMES,
+        };
+        let log = facts(true, false);
+        assert!(squeezes(&log, true, true), "a deep request of a log file");
+        assert!(squeezes(&log, false, true));
+        assert!(!squeezes(&log, true, false), "an export");
+        let hdr = facts(true, true);
+        assert!(!squeezes(&hdr, true, true), "an HDR file read deep");
+        assert!(squeezes(&hdr, false, true), "an HDR file in eight bits");
+        assert!(!squeezes(&facts(false, false), false, true), "eight bits");
+    }
+
     #[test]
     fn the_access_policy_rolls_forward_and_seeks_backward() {
         assert_eq!(
-            plan_access(Some(10), 10),
+            plan_access(Some(10), 10, ROLL_FORWARD_FRAMES),
             Access::Roll(0),
             "the very next frame"
         );
         assert_eq!(
-            plan_access(Some(10), 30),
+            plan_access(Some(10), 30, ROLL_FORWARD_FRAMES),
             Access::Roll(20),
             "a short hop ahead"
         );
-        assert_eq!(plan_access(Some(10), 9), Access::Seek, "behind means seek");
         assert_eq!(
-            plan_access(Some(10), 10 + ROLL_FORWARD_FRAMES + 1),
+            plan_access(Some(10), 9, ROLL_FORWARD_FRAMES),
+            Access::Seek,
+            "behind means seek"
+        );
+        assert_eq!(
+            plan_access(Some(10), 10 + ROLL_FORWARD_FRAMES + 1, ROLL_FORWARD_FRAMES),
             Access::Seek,
             "too far ahead means seek"
         );
         assert_eq!(
-            plan_access(None, 5),
+            plan_access(None, 5, ROLL_FORWARD_FRAMES),
             Access::Seek,
             "unknown position means seek"
+        );
+    }
+
+    /// A proxy is rolled a second ahead and sought past that: its
+    /// keyframes are a second apart, so the seek is the shorter walk.
+    #[test]
+    fn a_proxy_is_sought_past_a_second_ahead() {
+        let roll = proxy_roll(FrameRate::THIRTY);
+        assert_eq!(roll, 30);
+        assert_eq!(plan_access(Some(10), 40, roll), Access::Roll(30));
+        assert_eq!(plan_access(Some(10), 41, roll), Access::Seek);
+        assert_eq!(claim_cost(10, 41, roll), None, "another reader, or a seek");
+        assert_eq!(
+            proxy_roll(FrameRate::new(Rational::from_int(120))),
+            ROLL_FORWARD_FRAMES,
+            "never further than any file"
         );
     }
 
@@ -1406,16 +1547,27 @@ pub(crate) mod tests {
     /// further behind is a seek, which another reader may serve better.
     #[test]
     fn a_reader_serves_a_frame_just_behind_it_as_well_as_one_ahead() {
-        assert_eq!(claim_cost(10, 12), Some(2), "just ahead rolls");
         assert_eq!(
-            claim_cost(10, 9),
+            claim_cost(10, 12, ROLL_FORWARD_FRAMES),
+            Some(2),
+            "just ahead rolls"
+        );
+        assert_eq!(
+            claim_cost(10, 9, ROLL_FORWARD_FRAMES),
             Some(1),
             "one behind: its neighbour won the race"
         );
         let ahead = i64::from(crate::prefetch::AHEAD);
-        assert_eq!(claim_cost(10 + ahead, 10), Some(ahead));
-        assert_eq!(claim_cost(11 + ahead, 10), None, "further behind seeks");
-        assert_eq!(claim_cost(10, 10 + ROLL_FORWARD_FRAMES + 1), None);
+        assert_eq!(claim_cost(10 + ahead, 10, ROLL_FORWARD_FRAMES), Some(ahead));
+        assert_eq!(
+            claim_cost(11 + ahead, 10, ROLL_FORWARD_FRAMES),
+            None,
+            "further behind seeks"
+        );
+        assert_eq!(
+            claim_cost(10, 10 + ROLL_FORWARD_FRAMES + 1, ROLL_FORWARD_FRAMES),
+            None
+        );
     }
 
     /// Playing through a variable-rate recording's still stretch shows the
@@ -1476,6 +1628,7 @@ pub(crate) mod tests {
             index,
             range: None,
             deep: false,
+            eight: false,
         };
         cache.insert(key(0), Arc::new(Frame::black(2, 2)));
         cache.insert(key(1), Arc::new(Frame::black(2, 2)));
@@ -1536,6 +1689,7 @@ pub(crate) mod tests {
                 index: 0,
                 range: None,
                 deep: false,
+                eight: false,
             },
             Arc::new(Frame::black(2, 2)),
         );

@@ -15,6 +15,12 @@ object Threads {
     /** The preview: one picture at a time, the newest wins. */
     val preview: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1)
 
+    /**
+     * The picture of a playhead at rest, read from the file itself: a seek into a 4K file takes a few tenths of a
+     * second, and on a thread of its own a play or a drag begun meanwhile does not wait behind it.
+     */
+    val rest: CoroutineDispatcher = Dispatchers.Default.limitedParallelism(1)
+
     /** Timeline filmstrips, waveforms and covers. */
     val thumbnails: CoroutineDispatcher = Dispatchers.IO.limitedParallelism(2)
 }

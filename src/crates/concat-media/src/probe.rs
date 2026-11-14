@@ -43,6 +43,9 @@ pub struct VideoStream {
     /// What the stream's tags say its picture is: HLG or PQ by its
     /// transfer, a wide SDR by its primaries, SDR where they say nothing.
     pub signal: Signal,
+    /// Whether the stream holds more than eight bits a sample: ten-bit
+    /// HEVC from a camera's log or HDR profile, ProRes.
+    pub deep: bool,
 }
 
 /// What an audio stream looks like.
@@ -240,6 +243,11 @@ fn video_stream(stream: &ffmpeg::format::stream::Stream<'_>, path: &Path) -> Res
         cadence: FrameRate::new(cadence),
         color_range: ColorRange::from_ffmpeg(ffmpeg::color::Range::from(range)),
         signal,
+        // SAFETY: a live stream's codec parameters; for a video stream
+        // `format` holds an AVPixelFormat.
+        deep: crate::hardware::deep(ffmpeg::format::Pixel::from(ffmpeg::sys::AVPixelFormat(
+            unsafe { (*parameters.as_ptr()).format },
+        ))),
     })
 }
 
@@ -428,6 +436,7 @@ mod tests {
             hardware: false,
             threads: 0,
             software_only: false,
+            keyframe_seconds: 0,
         };
         let rate = FrameRate::from_int(25);
         for (name, hdr, want) in [

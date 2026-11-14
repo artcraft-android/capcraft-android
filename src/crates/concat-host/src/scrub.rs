@@ -24,13 +24,14 @@ use concat_core::time::{FrameRate, Rational};
 use concat_media::decode::{DecodeOptions, Decoder, FrameSource};
 use concat_media::{ColorRange, FrameSink, ScrubWriter};
 
-/// The copy's long side, never more than the file's: coarse, and shown
-/// only while it moves under a finger. A minute of it is about ten
-/// megabytes.
-const LONG_SIDE: u32 = 480;
-/// The copy keeps at most this many frames a second: a drag lands between
-/// them, and the playhead at rest shows the file's own frame.
-const MOST_FPS: i64 = 15;
+/// The copy's long side, never more than the file's: shown only while it
+/// moves under a finger, at half a phone's monitor across. A minute of it
+/// is about thirty-five megabytes. It was 480 at fifteen frames a second,
+/// which under a slow drag showed every other frame of the file, soft.
+const LONG_SIDE: u32 = 640;
+/// The copy keeps at most this many frames a second: every frame of most
+/// files, so a slow drag steps through them one by one.
+const MOST_FPS: i64 = 30;
 /// Each frame's JPEG quantiser, 2 (best) to 31 (worst).
 const QUALITY: u8 = 6;
 
@@ -66,6 +67,9 @@ pub fn path_for(project: &Path, media: &str, range: Option<ColorRange>) -> Optio
     if let Some(range) = range {
         range.name().hash(&mut hasher);
     }
+    // The copy's size and rate: the smaller copies earlier builds wrote
+    // are written again.
+    (LONG_SIDE, MOST_FPS).hash(&mut hasher);
     if let Ok(modified) = meta.modified()
         && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
     {
@@ -116,6 +120,9 @@ pub fn ensure(
     }
     let source = media.to_owned();
     let size = size_for(width, height);
+    if let Ok(mut awaited) = awaited().lock() {
+        awaited.insert(source.clone());
+    }
     crate::scheduler().submit(concat_media::Priority::Proxy, move || {
         let started = std::time::Instant::now();
         match write(&source, &target, size, range) {
@@ -130,12 +137,28 @@ pub fn ensure(
             }
             Err(error) => log::warn!("{source}: no scrub copy: {error}"),
         }
+        if let Ok(mut awaited) = awaited().lock() {
+            awaited.remove(&source);
+        }
         writing()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&target);
     });
     true
+}
+
+/// The files whose copy is queued or being written.
+fn awaited() -> &'static Mutex<HashSet<String>> {
+    static AWAITED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    AWAITED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Whether `media` is waiting for its scrub copy: queued or being written.
+pub fn pending(media: &str) -> bool {
+    awaited()
+        .lock()
+        .is_ok_and(|awaited| awaited.contains(media))
 }
 
 /// The copies being written now, by target, so one is never queued twice
@@ -173,11 +196,13 @@ pub fn sweep(project: &Path, keep: &HashSet<PathBuf>) -> usize {
 /// Writes the scrub copy of `source`, read as `range`, at `size` to
 /// `target`, through a temporary name moved into place only when whole.
 /// Each slot of the copy's rate takes the file's frame nearest it, so a
-/// sixty-frame file comes out at fifteen and a variable-rate one at an
+/// sixty-frame file comes out at thirty and a variable-rate one at an
 /// even pace. In software: on a phone on every core, as its pictures are too
 /// small to be given one of the chip's few decoders (see
-/// `concat_media::hardware`); elsewhere on two threads, as a proxy is, so
-/// the machine stays usable. Returns the frames written.
+/// `concat_media::hardware`) - but for a ten-bit file, which the chip reads,
+/// in eight bits, several times faster than the cores do; elsewhere on two
+/// threads, as a proxy is, so the machine stays usable. Returns the frames
+/// written.
 pub fn write(
     source: &str,
     target: &Path,
@@ -198,7 +223,8 @@ pub fn write(
     let partial = target.with_extension("part.mov");
     let mut options = DecodeOptions::default()
         .scaled_to(width, height)
-        .in_range(range);
+        .in_range(range)
+        .eight_bit(true);
     if !cfg!(target_os = "android") {
         options = options.in_software().threaded(2);
     }
@@ -214,6 +240,7 @@ pub fn write(
                 .position()
                 .unwrap_or_else(|| rate.time_of_frame(decoded));
             decoded += 1;
+            crate::preview::give_way();
             // Every slot up to this frame's instant, and half a slot past
             // it, shows this frame: the nearest one to each.
             while copy_rate.time_of_frame(writer.written() as i64) <= at + half {
@@ -246,23 +273,24 @@ mod tests {
 
     #[test]
     fn a_scrub_copy_is_small_and_never_larger_than_the_file() {
-        assert_eq!(size_for(3840, 2160), (480, 270));
-        assert_eq!(size_for(1080, 1920), (270, 480));
+        assert_eq!(size_for(3840, 2160), (640, 360));
+        assert_eq!(size_for(1080, 1920), (360, 640));
         assert_eq!(size_for(320, 180), (320, 180));
         let (w, h) = size_for(1921, 1081);
         assert!(w % 2 == 0 && h % 2 == 0);
     }
 
     #[test]
-    fn a_fast_file_is_copied_at_fifteen() {
-        let fifteen = FrameRate::from_int(15);
-        assert_eq!(rate_for(FrameRate::SIXTY), fifteen);
-        assert_eq!(rate_for(FrameRate::NTSC_30), fifteen);
-        assert_eq!(rate_for(FrameRate::FILM), fifteen);
+    fn a_fast_file_is_copied_at_thirty() {
+        let thirty = FrameRate::from_int(30);
+        assert_eq!(rate_for(FrameRate::SIXTY), thirty);
+        assert_eq!(rate_for(FrameRate::from_int(120)), thirty);
+        assert_eq!(rate_for(FrameRate::NTSC_30), FrameRate::NTSC_30);
+        assert_eq!(rate_for(FrameRate::FILM), FrameRate::FILM);
         assert_eq!(rate_for(FrameRate::from_int(12)), FrameRate::from_int(12));
     }
 
-    /// A sixty-frame file's copy is fifteen frames a second, each the file's
+    /// A sixty-frame file's copy is thirty frames a second, each the file's
     /// frame nearest that instant, and is adopted and read by a scrubbing
     /// request while a paused one still reads the file.
     #[test]
@@ -297,15 +325,15 @@ mod tests {
         let copy = path_for(&project, &source, None).expect("a path");
         let info = concat_media::probe(&copy).expect("the copy was written");
         let video = info.video.expect("has pictures");
-        assert_eq!((video.width, video.height), (480, 270));
-        assert_eq!(video.frame_rate, FrameRate::from_int(15));
+        assert_eq!((video.width, video.height), (640, 360));
+        assert_eq!(video.frame_rate, FrameRate::from_int(30));
         let pool = crate::scheduler().pool();
         assert_eq!(
             pool.scrub_of(Path::new(&source)).as_deref(),
             Some(copy.as_path())
         );
-        // Two thirds of a second in, the file's frame 40 (red 160); the copy's
-        // frame there is the file's nearest, two frames earlier.
+        // Two thirds of a second in, the file's frame 40 (red 160), which is
+        // the copy's frame there too.
         let time = FrameRate::SIXTY.time_of_frame(40);
         let scrubbing = pool
             .frame(&concat_media::FrameRequest::new(&source, time, 320, 180).for_scrub(true))

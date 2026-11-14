@@ -115,11 +115,12 @@ pub(crate) fn write(
     for index in 0..frames {
         let at = (index as f64 * 1e6 / f64::from(fps)).round() as i64;
         let mut picture = session
-            .frame(
+            .frame_reading(
                 at.min(duration_us - 1),
                 width,
                 height,
                 crate::session::Motion::Playing,
+                false,
             )
             .map_err(|error| error.to_string())?;
         if picture.width != width || picture.height != height {

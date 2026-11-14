@@ -76,6 +76,7 @@ fn shoot(path: &Path) {
         hardware: false,
         threads: 0,
         software_only: false,
+        keyframe_seconds: 0,
     };
     let mut encoder = Encoder::create(path, WIDTH, HEIGHT, FrameRate::THIRTY, &options)
         .expect("the linked FFmpeg encodes");
@@ -299,6 +300,7 @@ fn a_shaky_shot_is_measured_and_held_still() {
                     moving: false,
                     proxy: false,
                     scrub: false,
+                    paused: false,
                     color_space: ColorSpace::default(),
                 },
             )
