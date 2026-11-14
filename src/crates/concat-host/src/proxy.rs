@@ -30,7 +30,9 @@ const PIXELS_WITHOUT_PROXY: u64 = 1920 * 1080;
 /// The proxy's long side is the original's divided by this, and never
 /// shorter than [`SHORTEST_LONG_SIDE`].
 const DIVISOR: u32 = 4;
-const SHORTEST_LONG_SIDE: u32 = 960;
+/// A phone's monitor is about this many pixels across: a 4K file's quarter,
+/// 960, was drawn a third larger than it was, and soft.
+const SHORTEST_LONG_SIDE: u32 = 1280;
 
 /// Whether a `width` by `height` file is worth a proxy.
 pub fn wanted(width: u32, height: u32) -> bool {
@@ -73,8 +75,9 @@ pub fn path_for(
         "hdr".hash(&mut hasher);
     }
     // A keyframe every second, where earlier builds wrote one every two
-    // or left it to the encoder: those copies are written again.
-    "keyframes-1s".hash(&mut hasher);
+    // or left it to the encoder, and the long side no shorter than it is
+    // now: those copies are written again.
+    ("keyframes-1s", SHORTEST_LONG_SIDE).hash(&mut hasher);
     if let Ok(modified) = meta.modified()
         && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
     {
@@ -135,6 +138,9 @@ pub fn ensure(
     }
     let source = media.to_owned();
     let size = size_for(width, height);
+    if let Ok(mut awaited) = awaited().lock() {
+        awaited.insert(source.clone());
+    }
     crate::scheduler().submit(Priority::Proxy, move || {
         match write(&source, &target, size, range) {
             Ok(()) => {
@@ -145,12 +151,28 @@ pub fn ensure(
             }
             Err(error) => log::warn!("{source}: no proxy: {error}"),
         }
+        if let Ok(mut awaited) = awaited().lock() {
+            awaited.remove(&source);
+        }
         writing
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&target);
     });
     true
+}
+
+/// The files whose proxy is queued or being written.
+fn awaited() -> &'static Mutex<HashSet<String>> {
+    static AWAITED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    AWAITED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Whether `media` is waiting for its proxy: queued or being written.
+pub fn pending(media: &str) -> bool {
+    awaited()
+        .lock()
+        .is_ok_and(|awaited| awaited.contains(media))
 }
 
 /// The proxies being written now, by target, so one is never queued
@@ -263,6 +285,7 @@ pub fn write(
             encoder
                 .write_frame(&frame)
                 .map_err(|error| error.to_string())?;
+            crate::preview::give_way();
         }
         encoder.finish().map_err(|error| error.to_string())
     })();
@@ -409,12 +432,12 @@ mod tests {
 
     #[test]
     fn a_proxy_is_a_quarter_of_the_long_side_but_never_tiny_or_larger() {
-        assert_eq!(size_for(3840, 2160), (960, 540));
         assert_eq!(size_for(7680, 4320), (1920, 1080));
+        // A file whose quarter is under the floor gets the floor: 4K too.
+        assert_eq!(size_for(3840, 2160), (1280, 720));
+        assert_eq!(size_for(2560, 1440), (1280, 720));
         // A tall file keeps its way up.
-        assert_eq!(size_for(2160, 3840), (540, 960));
-        // A file too small for a quarter gets the floor, never upscaled.
-        assert_eq!(size_for(2560, 1440), (960, 540));
+        assert_eq!(size_for(2160, 3840), (720, 1280));
         assert_eq!(size_for(640, 480), (640, 480));
         // Odd sizes come out even, and nothing is ever under two.
         let (w, h) = size_for(3841, 2161);
@@ -462,7 +485,7 @@ mod tests {
         let proxy = existing(&project, &source, None).expect("the proxy was written");
         let info = concat_media::probe(&proxy).expect("probes");
         let video = info.video.expect("has pictures");
-        assert_eq!((video.width, video.height), (960, 540));
+        assert_eq!((video.width, video.height), (1280, 720));
         let pool = crate::scheduler().pool();
         assert_eq!(
             pool.proxy_of(Path::new(&source)).as_deref(),

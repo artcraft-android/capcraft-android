@@ -32,6 +32,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -351,6 +352,14 @@ private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageB
     val meter = remember { ScrubMeter() }
     val session = vm.session
     val revision = vm.timeline?.revision
+    DisposableEffect(session, width, height) {
+        val s = session
+        val prime: (suspend (Long) -> Unit)? = if (s == null) null else { at ->
+            withContext(Threads.preview) { runCatching { s.frame(at, width.toUInt(), height.toUInt(), Motion.PLAYING) } }
+        }
+        vm.primer = prime
+        onDispose { if (vm.primer === prime) vm.primer = null }
+    }
     LaunchedEffect(session, revision, width, height, vm.playing) {
         val s = session ?: return@LaunchedEffect
         if (vm.playing) {

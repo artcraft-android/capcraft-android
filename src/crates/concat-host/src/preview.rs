@@ -18,7 +18,9 @@
 //! worker may do; see `texture_of`.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use concat_export::ExportClip;
 use concat_project::DocumentSettings;
@@ -27,6 +29,37 @@ use concat_project::model::ColorSpace;
 /// How far ahead of the playhead playback opens the file a cut leads to;
 /// see [`Monitor::prefetch`].
 const NEXT_CUT: f64 = 1.0;
+
+/// When a moving picture was last made, in milliseconds on [`clock`], and
+/// zero before the first.
+static MOVED: AtomicU64 = AtomicU64::new(0);
+/// A picture counts as moving for this long after its last frame.
+const MOVING_FOR: Duration = Duration::from_millis(500);
+/// How long a writer of copies waits after each frame while a picture is
+/// moving: the copies and the picture are read off the same chip, and three
+/// 4K decoders at once left the one that was playing a third of its frames.
+/// At this the writers go at something under half their pace.
+const GIVEN_WAY: Duration = Duration::from_millis(25);
+
+fn clock() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Whether a picture is playing now: one was made for a play within the
+/// last half second.
+pub fn moving() -> bool {
+    let last = MOVED.load(Ordering::Relaxed);
+    last != 0 && clock().saturating_sub(last) < MOVING_FOR.as_millis() as u64
+}
+
+/// For a writer of scrub copies or proxies, between its frames: a short
+/// wait while a picture is playing, and none otherwise.
+pub(crate) fn give_way() {
+    if moving() {
+        std::thread::sleep(GIVEN_WAY);
+    }
+}
 
 /// A frame request: the instant and the size, with the clips coming from
 /// the session that owns them.
@@ -322,6 +355,9 @@ impl Monitor {
         settings: &DocumentSettings,
         spec: FrameSpec,
     ) -> Result<Vec<u8>, String> {
+        if spec.moving {
+            MOVED.store(clock(), Ordering::Relaxed);
+        }
         let plan = self.plan_for(clips, settings, spec);
         let sources =
             concat_export::preview_sources_of(&self.pool, &plan, spec.time, spec.reading())?;

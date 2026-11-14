@@ -424,11 +424,15 @@ pub fn filmstrip_between(
     height: u32,
 ) -> Result<Frame, String> {
     if let Some(copy) = stand_in(path)
-        && let Ok(strip) = strip_of(&copy.to_string_lossy(), from, to, count, height)
+        && let Ok(strip) = strip_of(&copy.to_string_lossy(), from, to, count, height, false)
     {
         return Ok(strip);
     }
-    strip_of(path, from, to, count, height)
+    // A copy on its way: until it is written the strip is made of the
+    // file's keyframes, one decode a tile, rather than of a pass over the
+    // file that the copy's own writer is making already.
+    let coarse = crate::scrub::pending(path) || crate::proxy::pending(path);
+    strip_of(path, from, to, count, height, coarse)
 }
 
 /// The small copy of `path` a thumbnail is read from, where the reader
@@ -442,8 +446,16 @@ fn stand_in(path: &str) -> Option<PathBuf> {
         .or_else(|| pool.proxy_of(original).filter(|copy| copy.is_file()))
 }
 
-/// [`filmstrip_between`], of the file `path` itself.
-fn strip_of(path: &str, from: f64, to: f64, count: u32, height: u32) -> Result<Frame, String> {
+/// [`filmstrip_between`], of the file `path` itself. `coarse` takes each
+/// tile from the keyframe at or before its instant, whatever the length.
+fn strip_of(
+    path: &str,
+    from: f64,
+    to: f64,
+    count: u32,
+    height: u32,
+    coarse: bool,
+) -> Result<Frame, String> {
     let count = count.clamp(1, 60);
     let height = height.clamp(16, 240);
 
@@ -476,7 +488,12 @@ fn strip_of(path: &str, from: f64, to: f64, count: u32, height: u32) -> Result<F
     let instant = |index: usize| from + span * (index as f64 + 0.5) / f64::from(count);
     let mut tiles: Vec<Option<Frame>> = (0..count).map(|_| None).collect();
 
-    if span * fps <= STRIP_SEQUENTIAL_FRAMES {
+    if coarse {
+        seek_each(path, &instant, width, height, &mut tiles)?;
+    }
+    if tiles.iter().any(Option::is_some) {
+        // The keyframes will do.
+    } else if span * fps <= STRIP_SEQUENTIAL_FRAMES {
         // The pass is exact, but it decodes every frame at full size, and a
         // minute of 4K is many seconds of that. Where each tile's slice is
         // long enough to hold a keyframe, the keyframes are tried first:
@@ -1138,6 +1155,13 @@ mod tests {
             reds.windows(2).all(|pair| pair[1] > pair[0]),
             "strip is not in time order: {reds:?}"
         );
+
+        // From keyframes alone, as while a copy is on its way: the same
+        // shape, every tile filled from the one keyframe the file has.
+        let coarse =
+            strip_of(&path.to_string_lossy(), 0.0, f64::INFINITY, 4, 32, true).expect("strips");
+        assert_eq!((coarse.width(), coarse.height()), (4 * 64, 32));
+        assert!(!is_dead(&coarse), "no tile is left black");
 
         let poster = still_at(&path.to_string_lossy(), 1.0, 32).expect("still");
         assert_eq!(poster.width(), 32);
