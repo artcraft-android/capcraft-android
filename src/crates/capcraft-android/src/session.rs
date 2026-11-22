@@ -569,7 +569,7 @@ impl MobileSession {
     /// boundary nearest `at_us` (the end, for a timeline with nothing on
     /// it); later clips move along to make room. A project with nothing on
     /// it yet takes its frame from the first picture, as phone editors'
-    /// "original" ratio does.
+    /// "original" ratio does, and its frame rate from a first video's.
     pub fn add_to_main(
         &self,
         media_ids: Vec<String>,
@@ -598,6 +598,12 @@ impl MobileSession {
                 let (w, h) = fit_frame(width, height);
                 video.width = w;
                 video.height = h;
+                if item.kind == MediaKind::Video
+                    && let Some(rate) = item.frame_rate
+                {
+                    video.rate_num = i64::from(project_rate(rate));
+                    video.rate_den = 1;
+                }
                 commands.push(Command::SetTimelineVideo {
                     timeline_id: project.active_timeline_id.clone(),
                     video,
@@ -1936,6 +1942,26 @@ pub(crate) fn monitor_clips(session: &Session, settings: &DocumentSettings) -> V
         &mut clips,
     );
     clips
+}
+
+/// The frame rates a project is made at: those the export offers.
+const PROJECT_RATES: [u32; 5] = [24, 25, 30, 50, 60];
+
+/// The project rate a video of `rate` frames a second plays at: the nearest
+/// of [`PROJECT_RATES`], so a camera's 59.94 is 60 and slow motion's 240 the
+/// most there is.
+pub(crate) fn project_rate(rate: f64) -> u32 {
+    if !rate.is_finite() || rate <= 0.0 {
+        return 30;
+    }
+    PROJECT_RATES
+        .into_iter()
+        .min_by(|a, b| {
+            (f64::from(*a) - rate)
+                .abs()
+                .total_cmp(&(f64::from(*b) - rate).abs())
+        })
+        .unwrap_or(30)
 }
 
 /// A frame for a picture `width` by `height`: its shape, 1080 on the short

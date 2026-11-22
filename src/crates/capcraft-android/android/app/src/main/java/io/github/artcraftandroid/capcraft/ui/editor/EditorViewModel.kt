@@ -585,7 +585,11 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
 
     /** The export settings (the top bar's chip shows the resolution). */
     var exportResolution: Int? by mutableStateOf(null)
-    var exportFps by mutableStateOf(30)
+    var exportFps: Int
+        get() = chosenFps ?: timeline?.let { kotlin.math.round(it.fpsNum.toDouble() / it.fpsDen.coerceAtLeast(1L)).toInt() }?.takeIf { it in 24..60 } ?: 30
+        set(value) { chosenFps = value }
+    /** The frame rate chosen for the export; the project's own until one is. */
+    private var chosenFps: Int? by mutableStateOf(null)
     /** The bitrate chosen, megabits a second, or null for the one suggested for the video. */
     var exportMbps: Int? by mutableStateOf(null)
     /** The export settings sheet is down. */
