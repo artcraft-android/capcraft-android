@@ -48,6 +48,18 @@ fn a_project_is_made_listed_renamed_and_deleted() {
 }
 
 #[test]
+fn a_project_plays_at_the_rate_of_its_first_video() {
+    use crate::session::project_rate;
+    assert_eq!(project_rate(23.976), 24);
+    assert_eq!(project_rate(29.97), 30);
+    assert_eq!(project_rate(50.0), 50);
+    assert_eq!(project_rate(59.94), 60);
+    assert_eq!(project_rate(240.0), 60);
+    assert_eq!(project_rate(f64::NAN), 30);
+    assert_eq!(project_rate(0.0), 30);
+}
+
+#[test]
 fn titles_go_on_text_rows_above_the_main_track() {
     start();
     let made = create_project("Words".to_owned(), 1080, 1920, 30).expect("made");
