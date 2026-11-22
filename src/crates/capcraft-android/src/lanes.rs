@@ -142,7 +142,8 @@ pub struct ClipView {
     pub transition_id: String,
     /// How long that transition runs.
     pub transition_us: i64,
-    /// Where the clip's keys sit, as times from its start (all properties).
+    /// Where the clip's keys sit, as times from its start (all
+    /// properties, its mask's among them).
     pub keys_us: Vec<i64>,
     /// The whole clip as the engine holds it, as JSON, for the panels.
     pub json: String,
@@ -256,7 +257,9 @@ pub(crate) fn clip_view(project: &Project, clip: &Clip) -> ClipView {
     let mut keys: Vec<i64> = clip
         .keys
         .iter()
-        .map(|key| micros(key.at * clip.duration))
+        .map(|key| key.at)
+        .chain(crate::mask::key_times(clip))
+        .map(|at| micros(at * clip.duration))
         .collect();
     keys.sort_unstable();
     keys.dedup();

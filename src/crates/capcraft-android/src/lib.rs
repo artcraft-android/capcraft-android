@@ -48,6 +48,7 @@ pub mod library;
 pub mod linkage;
 pub mod looks;
 pub mod loudness;
+pub mod mask;
 pub mod motionblur;
 pub mod pauses;
 pub mod playback;

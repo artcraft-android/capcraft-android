@@ -98,6 +98,8 @@ pub struct ClipBox {
     pub offset_x: f64,
     /// The clip's offset down there.
     pub offset_y: f64,
+    /// The clip's opacity there, keys and all.
+    pub opacity: f64,
 }
 
 /// One file added to the project's bin.
@@ -1186,9 +1188,10 @@ impl MobileSession {
     }
 
     /// The keyframe button: a key at `time_us` on every property the clip
-    /// can key (its place, size, turn and opacity, and its volume when it
-    /// has sound), holding the values it shows there; or, when there is a
-    /// key there already, all of them taken off. One undo step.
+    /// can key (its place, size, turn and opacity, its volume when it has
+    /// sound, and its mask when it has one), holding the values it shows
+    /// there; or, when there is a key there already, all of them taken off.
+    /// One undo step.
     pub fn toggle_keyframe(
         &self,
         clip_id: String,
@@ -1217,9 +1220,20 @@ impl MobileSession {
             properties.retain(|property| *property == KeyProperty::Volume);
         }
         // a frame either side counts as "here"
-        let near = 1.0 / 30.0 / clip.duration.max(1e-6);
-        let here = clip.keys.iter().any(|key| (key.at - at).abs() <= near);
-        let commands = if here {
+        let near = crate::mask::near(clip.duration);
+        let here = clip
+            .keys
+            .iter()
+            .map(|key| key.at)
+            .chain(crate::mask::key_times(&clip))
+            .any(|key| (key - at).abs() <= near);
+        let masks = || {
+            clip.video_effects
+                .iter()
+                .enumerate()
+                .filter(|(_, link)| link.id == crate::mask::MASK)
+        };
+        let mut commands: Vec<Command> = if here {
             clip.keys
                 .iter()
                 .filter(|key| (key.at - at).abs() <= near)
@@ -1241,6 +1255,31 @@ impl MobileSession {
                 })
                 .collect()
         };
+        for (entry, link) in masks() {
+            if here {
+                for (key, run) in &link.keys {
+                    commands.extend(run.iter().filter(|held| (held.at - at).abs() <= near).map(
+                        |held| Command::ClearEffectKey {
+                            clip_id: clip_id.clone(),
+                            entry,
+                            key: key.clone(),
+                            at: held.at,
+                        },
+                    ));
+                }
+            } else {
+                for (key, default) in crate::mask::KEYED {
+                    commands.push(Command::SetEffectKey {
+                        clip_id: clip_id.clone(),
+                        entry,
+                        key: key.to_owned(),
+                        at,
+                        value: link.value_at(key, at, default),
+                        ease: KeyEase::LINEAR,
+                    });
+                }
+            }
+        }
         self.run(commands)
     }
 
@@ -1281,6 +1320,7 @@ impl MobileSession {
             let offset_x = clip.value_at(KeyProperty::OffsetX, at);
             let offset_y = clip.value_at(KeyProperty::OffsetY, at);
             let rotation = clip.value_at(KeyProperty::Rotation, at);
+            let opacity = clip.value_at(KeyProperty::Opacity, at);
             let (width, height, shift) = match clip.kind {
                 ClipKind::Video | ClipKind::Image => {
                     let media = project.media.iter().find(|item| item.id == clip.media_id);
@@ -1327,6 +1367,7 @@ impl MobileSession {
                     scale,
                     offset_x,
                     offset_y,
+                    opacity,
                 },
             ));
         }

@@ -54,12 +54,16 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.artcraftandroid.capcraft.core.ClipBox
+import io.github.artcraftandroid.capcraft.core.ClipView
+import io.github.artcraftandroid.capcraft.core.maskParamsAt
+import io.github.artcraftandroid.capcraft.core.maskSetAt
 import io.github.artcraftandroid.capcraft.engine.Threads
 import io.github.artcraftandroid.capcraft.ui.Glyph
 import io.github.artcraftandroid.capcraft.ui.LucideIcons
 import io.github.artcraftandroid.capcraft.ui.Palette
 import io.github.artcraftandroid.capcraft.ui.Type
 import io.github.artcraftandroid.capcraft.ui.editor.EditorViewModel
+import io.github.artcraftandroid.capcraft.ui.editor.KEY_NEAR_US
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.cos
@@ -99,26 +103,46 @@ private object MaskView {
     var box by mutableStateOf<ClipBox?>(null)
 }
 
-/** The mask's parameters on [clipId], or null when it has none. */
+/** Where the playhead is in [clip], as a fraction of it. */
+private fun fractionAt(vm: EditorViewModel, clip: ClipView): Double =
+    ((vm.playhead - clip.startUs).toDouble() / clip.durationUs.coerceAtLeast(1)).coerceIn(0.0, 1.0)
+
+/** [link]'s parameters at the playhead, its keys counted. */
+private fun paramsHere(vm: EditorViewModel, clipId: String, link: JSONObject): JSONObject {
+    val set = link.optJSONObject("params") ?: JSONObject()
+    val clip = vm.clip(clipId)
+    if (clip == null || link.optJSONObject("keys") == null) return set
+    return runCatching { JSONObject(maskParamsAt(link.toString(), fractionAt(vm, clip))) }.getOrDefault(set)
+}
+
+/** The mask's parameters on [clipId] at the playhead, or null when it has none. */
 private fun maskParams(vm: EditorViewModel, clipId: String): JSONObject? {
     val chain = vm.clipJson(clipId)?.optJSONArray("videoEffects") ?: return null
     for (i in 0 until chain.length()) {
         val link = chain.getJSONObject(i)
-        if (link.optString("id") == MASK) return link.optJSONObject("params") ?: JSONObject()
+        if (link.optString("id") == MASK) return paramsHere(vm, clipId, link)
     }
     return null
 }
 
-/** Puts the mask on [clipId] with [change] made to its parameters, in its place in the chain, or takes it off (null). */
+/**
+ * Puts the mask on [clipId] with [change] made to its parameters, in its place in the chain, or takes
+ * it off (null). A keyframed mask, or one changed on a keyframe of the clip, is set at the playhead.
+ */
 private fun setMask(vm: EditorViewModel, clipId: String, gesture: String?, change: (JSONObject.() -> Unit)?) {
     val chain = vm.clipJson(clipId)?.optJSONArray("videoEffects") ?: JSONArray()
     val next = JSONArray()
     var placed = false
     fun link(from: JSONObject?): JSONObject {
         val l = from ?: JSONObject().put("id", MASK)
-        val p = l.optJSONObject("params") ?: JSONObject()
+        val p = JSONObject(paramsHere(vm, clipId, l).toString())
         change?.invoke(p)
-        return l.put("params", p)
+        val clip = vm.clip(clipId)
+        val onKey = from != null && clip != null && clip.keysUs.any { abs(clip.startUs + it - vm.playhead) <= KEY_NEAR_US }
+        if (clip == null || (l.optJSONObject("keys") == null && !onKey)) return l.put("params", p)
+        // the keys are set where the playhead stands: it must not run on during the drag
+        if (vm.playing) vm.stop()
+        return JSONObject(maskSetAt(l.toString(), fractionAt(vm, clip), clip.durationUs / 1e6, onKey, p.toString()))
     }
     for (i in 0 until chain.length()) {
         val l = chain.getJSONObject(i)
@@ -160,7 +184,7 @@ private fun JSONObject.centred(aspect: Double) {
 @Composable
 fun MaskPanel(vm: EditorViewModel) {
     val clip = vm.selectedClip ?: run { vm.panel = null; return }
-    val params = remember(clip.json) { maskParams(vm, clip.id) }
+    val params = remember(clip.json, vm.pendingChain(clip.id), vm.playhead) { maskParams(vm, clip.id) }
     val shape = params?.optDouble("shape", 2.0)?.roundToInt() ?: -1
     var adjusting by remember(clip.id) { mutableStateOf(false) }
     if (adjusting && params != null) {
@@ -581,10 +605,9 @@ fun MaskSurface(vm: EditorViewModel, modifier: Modifier) {
         value = withContext(Threads.commands) { runCatching { s.clipBoxes(playhead) }.getOrDefault(emptyList()) }.firstOrNull { it.clipId == clip.id }
     }
     SideEffect { box?.let { MaskView.box = it } }
-    val saved = remember(clip.json) { maskParams(vm, clip.id) }
-    var live by remember { mutableStateOf<JSONObject?>(null) }
+    // the mask as last set, the edits still on their way to the engine counted
+    val saved = remember(clip.json, vm.pendingChain(clip.id), playhead) { maskParams(vm, clip.id) }
     val latestBox by rememberUpdatedState(box)
-    val latestParams by rememberUpdatedState(saved)
     val upDown = rememberVectorPainter(LucideIcons.MoveVertical)
     val across = rememberVectorPainter(LucideIcons.MoveHorizontal)
     val soften = rememberVectorPainter(LucideIcons.ChevronsDown)
@@ -596,7 +619,7 @@ fun MaskSurface(vm: EditorViewModel, modifier: Modifier) {
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false)
                 val b = latestBox ?: return@awaitEachGesture
-                val start = latestParams ?: return@awaitEachGesture
+                val start = maskParams(vm, clip.id) ?: return@awaitEachGesture
                 val w = size.width.toFloat()
                 val h = size.height.toFloat()
                 val first = MaskPlace(b, w, h, start)
@@ -648,17 +671,15 @@ fun MaskSurface(vm: EditorViewModel, modifier: Modifier) {
                         }
                     }
                     val next = JSONObject(current.toString())
-                    live = next
                     setMask(vm, clip.id, "mask-" + (grab ?: "move")) { next.keys().forEach { k -> put(k, next.get(k)) } }
                     e.changes.forEach { it.consume() }
                 }
-                live = null
                 vm.endGesture()
             }
         },
     ) {
         val b = box ?: return@Canvas
-        val params = live ?: saved ?: return@Canvas
+        val params = saved ?: return@Canvas
         val place = MaskPlace(b, size.width, size.height, params)
         val stroke = 1.5.dp.toPx()
         clipRect {
