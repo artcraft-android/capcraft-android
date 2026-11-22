@@ -141,10 +141,10 @@ fun EditorScreen(path: String, incoming: List<Uri>, then: String? = null, close:
     // The player's clock, once a frame, while playing.
     LaunchedEffect(vm.playing) {
         if (!vm.playing) return@LaunchedEffect
+        vm.startClock()
         withContext(AndroidUiDispatcher.Main) {
             while (isActive && vm.playing) {
-                androidx.compose.runtime.withFrameNanos { }
-                vm.tick()
+                vm.tick(androidx.compose.runtime.withFrameNanos { it })
             }
         }
     }
