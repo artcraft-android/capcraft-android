@@ -1028,6 +1028,7 @@ impl MobileSession {
             )?;
             if let Some(id) = &created {
                 let _ = copy_look(&mut state, &clip, id, &gesture);
+                let _ = copy_notes(&mut state, &clip_id, id, &gesture);
             }
             state.session.end_gesture();
             return Ok(Self::changed(&mut state, created));
@@ -1077,6 +1078,14 @@ impl MobileSession {
                 name: clip.name.clone(),
                 sound: false,
             },
+            ClipKind::Shape => Command::AddShapeClip {
+                track_id: Some(track),
+                above: false,
+                start: end,
+                style: clip.shape.clone(),
+                duration: Some(clip.duration),
+                name: clip.name.clone(),
+            },
             _ => Command::AddClip {
                 media_id: clip.media_id.clone(),
                 track_id: track,
@@ -1087,6 +1096,7 @@ impl MobileSession {
         let created = Self::apply_all(&mut state, vec![add], Some(&gesture))?;
         if let Some(id) = &created {
             let _ = copy_look(&mut state, &clip, id, &gesture);
+            let _ = copy_notes(&mut state, &clip_id, id, &gesture);
         }
         state.session.end_gesture();
         Ok(Self::changed(&mut state, created))
@@ -1965,9 +1975,45 @@ fn extracted_name(timeline: &Timeline) -> String {
     format!("{NAME}{}", last + 1)
 }
 
+/// What the app notes on the timeline by clip, beside what the engine holds:
+/// which animations and which of Video quality's tools made its keys and its
+/// chain.
+const NOTES_BY_CLIP: [&str; 2] = ["capcraftAnimations", "capcraftQuality"];
+
+/// Notes of clip `to`, a copy, what is noted of `from`: its animations and
+/// quality, and that it is a caption, when it is one.
+fn copy_notes(state: &mut State, from: &str, to: &str, gesture: &str) -> Result<(), MobileError> {
+    let extra = &state.session.project().active().extra;
+    let mut commands = Vec::new();
+    for key in NOTES_BY_CLIP {
+        if let Some(Value::Object(notes)) = extra.get(key)
+            && let Some(note) = notes.get(from)
+        {
+            let mut notes = notes.clone();
+            notes.insert(to.to_owned(), note.clone());
+            commands.push(Command::SetTimelineExtra {
+                key: key.to_owned(),
+                value: Some(Value::Object(notes)),
+            });
+        }
+    }
+    if let Some(Value::Array(captions)) = extra.get(crate::speech::CAPTIONS)
+        && captions.iter().any(|id| id.as_str() == Some(from))
+    {
+        let mut captions = captions.clone();
+        captions.push(Value::String(to.to_owned()));
+        commands.push(Command::SetTimelineExtra {
+            key: crate::speech::CAPTIONS.to_owned(),
+            value: Some(Value::Array(captions)),
+        });
+    }
+    MobileSession::apply_all(state, commands, Some(gesture))?;
+    Ok(())
+}
+
 /// Gives clip `to` - just added, from the same file - the cut and look of
-/// `from`: its speed, in-point and length, placement and keys, sound and
-/// chains, under `gesture`. The length goes last, once the speed has set
+/// `from`: its speed, in-point and length, and everything else it has, as
+/// the engine's [`Command::MatchClip`] carries it, under `gesture`. The length goes last, once the speed has set
 /// the copy's.
 pub(crate) fn copy_look(
     state: &mut State,
@@ -1989,45 +2035,6 @@ pub(crate) fn copy_look(
             ripple: false,
         });
     }
-    let mut value = serde_json::to_value(from).unwrap_or(Value::Null);
-    let mut patch = serde_json::Map::new();
-    if let Some(object) = value.as_object_mut() {
-        for key in [
-            "volume",
-            "fadeIn",
-            "fadeOut",
-            "opacity",
-            "flipH",
-            "flipV",
-            "blend",
-            "crop",
-            "filters",
-            "videoEffects",
-            "text",
-            "muted",
-            "preservePitch",
-        ] {
-            if let Some(field) = object.remove(key) {
-                patch.insert(key.to_owned(), field);
-            }
-        }
-    }
-    if let Ok(command) = serde_json::from_value::<Command>(json!({
-        "op": "updateClip",
-        "clipId": to,
-        "patch": Value::Object(patch),
-    })) {
-        commands.push(command);
-    }
-    commands.push(Command::SetClipTransform {
-        clip_id: to.to_owned(),
-        scale: Some(from.scale),
-        offset_x: Some(from.offset_x),
-        offset_y: Some(from.offset_y),
-        rotation: Some(from.rotation),
-        stretch_x: Some(from.stretch_x),
-        stretch_y: Some(from.stretch_y),
-    });
     // the in-point: the same file again, from where the original starts
     if from.source_start > 1e-9
         && let Some(path) = state
@@ -2047,15 +2054,11 @@ pub(crate) fn copy_look(
             offset: 0.0,
         });
     }
-    for key in &from.keys {
-        commands.push(Command::SetClipKey {
-            clip_id: to.to_owned(),
-            property: key.property,
-            at: key.at,
-            value: key.value,
-            ease: key.ease,
-        });
-    }
+    // after the file is put in, which starts some of it afresh
+    commands.push(Command::MatchClip {
+        clip_id: to.to_owned(),
+        like: Box::new(from.clone()),
+    });
     MobileSession::apply_all(state, commands, Some(gesture))?;
     let now = state
         .session

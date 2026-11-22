@@ -260,7 +260,8 @@ impl MobileSession {
                 command(json!({
                     "op": "updateClip",
                     "clipId": copy,
-                    "patch": {"videoEffects": person, "volume": 0.0},
+                    // what is behind the picture stays behind the original
+                    "patch": {"videoEffects": person, "volume": 0.0, "background": null},
                 }))?,
                 Command::SetClipCutout {
                     clip_id: copy.clone(),

@@ -981,6 +981,92 @@ fn a_body_effect_lays_a_cut_out_copy_over_the_clip_and_comes_off_cleanly() {
     delete_project(made.path).expect("deleted");
 }
 
+/// The clip of that id, as the engine holds it.
+fn held(view: &crate::session::TimelineView, clip_id: &str) -> serde_json::Value {
+    let clip = view
+        .rows
+        .iter()
+        .flat_map(|row| row.clips.iter())
+        .find(|clip| clip.id == clip_id)
+        .expect("the clip is there");
+    serde_json::from_str(&clip.json).expect("parses")
+}
+
+#[test]
+fn a_duplicate_keeps_every_change() {
+    start();
+    let made = create_project("Twice".to_owned(), 1080, 1920, 30).expect("made");
+    let session = MobileSession::open(made.path.clone()).expect("opens");
+    let id = session
+        .add_text(0, 2_000_000, String::new())
+        .expect("a title lands")
+        .created_id;
+    let set = |command: serde_json::Value| {
+        session.apply(command.to_string(), None).expect("applied");
+    };
+    set(
+        serde_json::json!({"op": "updateClip", "clipId": id, "patch": {
+            "opacity": 0.5,
+            "background": {"kind": "color", "color": "#0a141e"},
+            "mask": {"shape": "circle"},
+            "videoEffects": [{"id": "concat.mask", "params": {"x": 30}, "keys": {"x": [{"at": 0.0, "value": 30}]}}],
+        }}),
+    );
+    set(
+        serde_json::json!({"op": "setClipTransform", "clipId": id, "scale": 1.5, "offsetX": 0.1, "rotation": 20.0}),
+    );
+    set(
+        serde_json::json!({"op": "setClipKey", "clipId": id, "property": "opacity", "at": 0.5, "value": 0.2}),
+    );
+    set(
+        serde_json::json!({"op": "setTimelineExtra", "key": "capcraftAnimations", "value": {id.clone(): {"in": {"name": "Fade in", "seconds": 0.5}}}}),
+    );
+    let view = session.duplicate(id.clone()).expect("duplicated");
+    let copy = view.created_id.clone();
+    let (first, second) = (held(&view, &id), held(&view, &copy));
+    for field in [
+        "opacity",
+        "background",
+        "mask",
+        "videoEffects",
+        "scale",
+        "offsetX",
+        "rotation",
+        "keys",
+        "text",
+    ] {
+        assert!(!first[field].is_null(), "{field} was set");
+        assert_eq!(first[field], second[field], "{field}");
+    }
+    let notes: serde_json::Value =
+        serde_json::from_str(&session.extra("capcraftAnimations".to_owned())).expect("parses");
+    assert_eq!(notes[&copy], notes[&id], "its animations are still known");
+    let view = session.undo();
+    assert!(
+        view.rows
+            .iter()
+            .all(|row| row.clips.iter().all(|clip| clip.id != copy)),
+        "one undo step"
+    );
+}
+
+#[test]
+fn a_sticker_is_duplicated() {
+    start();
+    let made = create_project("Sticky".to_owned(), 1080, 1920, 30).expect("made");
+    let session = MobileSession::open(made.path.clone()).expect("opens");
+    let style = serde_json::to_string(&concat_project::model::ShapeStyle::default()).expect("json");
+    let id = session
+        .add_shape(0, 2_000_000, style, "Star".to_owned())
+        .expect("a sticker lands")
+        .created_id;
+    let view = session.duplicate(id.clone()).expect("duplicated");
+    let (first, second) = (held(&view, &id), held(&view, &view.created_id));
+    assert_eq!(first["shape"], second["shape"]);
+    assert_eq!(first["kind"], second["kind"]);
+    assert_eq!(first["name"], second["name"]);
+}
+
 #[test]
 fn a_duplicate_keeps_the_cut_and_the_placement() {
     start();
