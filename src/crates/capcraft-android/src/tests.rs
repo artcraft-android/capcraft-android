@@ -1698,3 +1698,98 @@ fn a_drag_shows_what_the_playhead_at_rest_will() {
         delete_project(made.path).expect("deleted");
     }
 }
+
+/// The clip of that id as the engine holds it.
+fn clip_json(session: &MobileSession, clip_id: &str) -> serde_json::Value {
+    let view = session.view();
+    let clip = view
+        .rows
+        .iter()
+        .flat_map(|row| row.clips.iter())
+        .find(|clip| clip.id == clip_id)
+        .expect("the clip is there");
+    serde_json::from_str(&clip.json).expect("parses")
+}
+
+#[test]
+fn an_opacity_key_shows_where_it_is_set() {
+    start();
+    let made = create_project("Fade".to_owned(), 1080, 1920, 30).expect("made");
+    let session = MobileSession::open(made.path.clone()).expect("opens");
+    let id = session
+        .add_text(0, 4_000_000, String::new())
+        .expect("a title lands")
+        .created_id;
+    session
+        .toggle_keyframe(id.clone(), 0)
+        .expect("a key at the head");
+    session
+        .toggle_keyframe(id.clone(), 2_000_000)
+        .expect("a key in the middle");
+    let opacity = |time: i64| {
+        session
+            .clip_boxes(time)
+            .into_iter()
+            .find(|b| b.clip_id == id)
+            .expect("on the frame")
+            .opacity
+    };
+    // the clip's own value is not what a keyed clip shows
+    session
+        .apply(
+            serde_json::json!({"op": "updateClip", "clipId": id, "patch": {"opacity": 0.2}})
+                .to_string(),
+            None,
+        )
+        .expect("set");
+    assert_eq!(opacity(0), 1.0);
+    // its key is
+    session
+        .apply(
+            serde_json::json!({"op": "setClipKey", "clipId": id, "property": "opacity", "at": 0.5, "value": 0.0})
+                .to_string(),
+            None,
+        )
+        .expect("keyed");
+    assert_eq!(opacity(2_000_000), 0.0);
+    assert!((opacity(1_000_000) - 0.5).abs() < 1e-6);
+}
+
+#[test]
+fn the_keyframe_button_keys_the_mask_too() {
+    start();
+    let made = create_project("Masked".to_owned(), 1080, 1920, 30).expect("made");
+    let session = MobileSession::open(made.path.clone()).expect("opens");
+    let id = session
+        .add_text(0, 4_000_000, String::new())
+        .expect("a title lands")
+        .created_id;
+    session
+        .apply(
+            serde_json::json!({"op": "updateClip", "clipId": id, "patch": {"videoEffects": [
+                {"id": "concat.mask", "params": {"shape": 2, "x": 30}}
+            ]}})
+            .to_string(),
+            None,
+        )
+        .expect("masked");
+    session
+        .toggle_keyframe(id.clone(), 2_000_000)
+        .expect("a key");
+    let json = clip_json(&session, &id);
+    assert_eq!(
+        json["videoEffects"][0]["keys"]["x"][0]["value"], 30.0,
+        "{json}"
+    );
+    session
+        .toggle_keyframe(id.clone(), 2_000_000)
+        .expect("taken off");
+    let json = clip_json(&session, &id);
+    assert!(json["videoEffects"][0].get("keys").is_none(), "{json}");
+    session.undo();
+    let json = clip_json(&session, &id);
+    assert!(
+        json["videoEffects"][0].get("keys").is_some(),
+        "one undo step: {json}"
+    );
+}

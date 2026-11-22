@@ -43,6 +43,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -59,7 +60,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.artcraftandroid.capcraft.core.ClipView
 import io.github.artcraftandroid.capcraft.core.RowKind
+import io.github.artcraftandroid.capcraft.engine.Threads
 import io.github.artcraftandroid.capcraft.ui.Glyph
 import io.github.artcraftandroid.capcraft.ui.LucideIcons
 import io.github.artcraftandroid.capcraft.ui.Palette
@@ -72,6 +75,7 @@ import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.roundToInt
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -713,7 +717,6 @@ private fun BlendPanel(vm: EditorViewModel) {
     val clip = vm.selectedClip ?: run { vm.panel = null; return }
     val json = remember(clip.json) { vm.clipJson(clip.id) }
     val current = json?.optString("blend")?.ifEmpty { "normal" } ?: "normal"
-    var v by remember(clip.id) { mutableFloatStateOf(((json?.optDouble("opacity", 1.0) ?: 1.0) * 100).toFloat()) }
     PanelFrame("Splice", vm, height = 190.dp) {
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(start = 6.dp, end = 6.dp, top = 10.dp)) {
             BLENDS.forEach { (id, label) ->
@@ -724,11 +727,46 @@ private fun BlendPanel(vm: EditorViewModel) {
                 }
             }
         }
-        ValueSlider(v, 0f..100f, { "${it.roundToInt()}" }, {
-            v = it
-            vm.patch(clip.id, JSONObject().put("opacity", it / 100.0), gesture = "blend-opacity")
-        }, { vm.endGesture() })
+        OpacitySlider(vm, clip, "blend-opacity")
     }
+}
+
+/** [clip]'s opacity at the playhead on a slider; where it is keyframed, moving it sets the key there. */
+@Composable
+private fun OpacitySlider(vm: EditorViewModel, clip: ClipView, gesture: String) {
+    val opacity = opacityHere(vm, clip)
+    var held by remember(clip.id) { mutableStateOf<Float?>(null) }
+    var dragging by remember(clip.id) { mutableStateOf(false) }
+    // the finger's value stays up until the engine's catches up with it
+    LaunchedEffect(opacity, vm.playhead) { if (!dragging) held = null }
+    ValueSlider(
+        value = held ?: opacity,
+        range = 0f..100f,
+        label = { "${it.roundToInt()}" },
+        onChange = {
+            dragging = true
+            held = it
+            vm.setOpacity(clip, it / 100.0, gesture)
+        },
+        onDone = {
+            dragging = false
+            vm.endGesture()
+        },
+    )
+}
+
+/** The opacity [clip] shows at the playhead, per cent: its keys' where it has them, and its own otherwise. */
+@Composable
+private fun opacityHere(vm: EditorViewModel, clip: ClipView): Float {
+    val session = vm.session
+    val playhead = vm.playhead
+    val own = remember(clip.json) { vm.clipJson(clip.id)?.optDouble("opacity", 1.0) ?: 1.0 }
+    val shown by produceState<Double?>(null, session, vm.timeline?.revision, playhead, clip.id) {
+        val s = session ?: return@produceState
+        value = withContext(Threads.commands) { runCatching { s.clipBoxes(playhead) }.getOrDefault(emptyList()) }
+            .firstOrNull { it.clipId == clip.id }?.opacity
+    }
+    return ((shown ?: own) * 100).toFloat()
 }
 
 // ── Volume, opacity, fade ──
@@ -869,20 +907,9 @@ fun CheckChip(label: String, on: Boolean, onClick: () -> Unit) {
 @Composable
 private fun OpacityPanel(vm: EditorViewModel) {
     val clip = vm.selectedClip ?: run { vm.panel = null; return }
-    val start = remember(clip.id) { vm.clipJson(clip.id)?.optDouble("opacity", 1.0) ?: 1.0 }
-    var v by remember(clip.id) { mutableFloatStateOf((start * 100).toFloat()) }
     PanelFrame("Opacity", vm, height = 170.dp) {
         Spacer(Modifier.height(40.dp))
-        ValueSlider(
-            value = v,
-            range = 0f..100f,
-            label = { "${it.roundToInt()}" },
-            onChange = {
-                v = it
-                vm.patch(clip.id, JSONObject().put("opacity", v / 100.0), gesture = "opacity")
-            },
-            onDone = { vm.endGesture() },
-        )
+        OpacitySlider(vm, clip, "opacity")
     }
 }
 

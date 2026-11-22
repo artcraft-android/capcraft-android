@@ -4,6 +4,7 @@ import android.app.Application
 import android.net.Uri
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
@@ -106,6 +107,8 @@ sealed interface Panel {
 
 /** Where the timeline keeps beat marks, by media id. */
 private const val BEATS = "capcraftBeats"
+/** How far from a keyframe the playhead counts as on it, microseconds: a frame, as the engine's toggle has it. */
+internal const val KEY_NEAR_US = 1_000_000.0 / 30
 
 /** The app's settings file, and the linkage switch in it. */
 private const val SETTINGS = "capcraft-settings"
@@ -341,10 +344,11 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
     }
 
     /** Runs an edit on the engine's thread and shows the result. */
-    fun edit(select: ((TimelineView) -> String?)? = null, block: MobileSession.() -> TimelineView) {
+    fun edit(select: ((TimelineView) -> String?)? = null, settled: (() -> Unit)? = null, block: MobileSession.() -> TimelineView) {
         val s = session ?: return
         viewModelScope.launch {
             val result = withContext(Threads.commands) { runCatching { s.block() } }
+            settled?.invoke()
             result.onSuccess { v ->
                 timeline = v
                 if (select != null) selected = select(v)
@@ -605,7 +609,36 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
 
     /** Applies one engine command; with [gesture] named, moves under it fold into one undo step. */
     fun command(json: JSONObject, gesture: String? = null) {
-        edit { apply(json.toString(), gesture) }
+        if (session == null) return
+        val chains = HashMap<String, String>()
+        chainsIn(json, chains)
+        chains.forEach { (id, chain) -> pendingChains[id] = PendingChain(chain, (pendingChains[id]?.edits ?: 0) + 1) }
+        edit(settled = {
+            chains.keys.forEach { id ->
+                val left = pendingChains[id] ?: return@forEach
+                if (left.edits <= 1) pendingChains.remove(id) else pendingChains[id] = left.copy(edits = left.edits - 1)
+            }
+        }) { apply(json.toString(), gesture) }
+    }
+
+    /** A clip's effect chain as the newest edit leaves it, and how many edits of it the engine has still to make. */
+    private data class PendingChain(val chain: String, val edits: Int)
+
+    /**
+     * The effect chains of edits on their way to the engine, by clip. A chain is replaced whole, so an
+     * edit built on the engine's last answer rather than on these would take back the ones before it.
+     */
+    private val pendingChains = mutableStateMapOf<String, PendingChain>()
+
+    /** [clipId]'s effect chain on its way to the engine (JSON), or null when the engine is up to date. */
+    fun pendingChain(clipId: String): String? = pendingChains[clipId]?.chain
+
+    /** The effect chains [json] sets, a batch's included, into [into] by clip. */
+    private fun chainsIn(json: JSONObject, into: MutableMap<String, String>) {
+        when (json.optString("op")) {
+            "updateClip" -> json.optJSONObject("patch")?.optJSONArray("videoEffects")?.let { into[json.optString("clipId")] = it.toString() }
+            "batch" -> json.optJSONArray("commands")?.let { all -> for (i in 0 until all.length()) all.optJSONObject(i)?.let { chainsIn(it, into) } }
+        }
     }
 
     /** Ends a slider drag: the next move is a new undo step. */
@@ -617,6 +650,29 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
     /** Changes clip properties: [patch] holds the engine's field names (volume, opacity, flipH...). */
     fun patch(clipId: String, patch: JSONObject, gesture: String? = null) {
         command(JSONObject().put("op", "updateClip").put("clipId", clipId).put("patch", patch), gesture)
+    }
+
+    /**
+     * Sets [clip]'s opacity, 0 to 1. Where it is keyframed the keys are what shows, so the value goes
+     * on the key under the playhead (a frame either side counts, as the keyframe button has it), added
+     * there if missing; that key keeps its curve.
+     */
+    fun setOpacity(clip: ClipView, value: Double, gesture: String? = null) {
+        val keys = clipJson(clip.id)?.optJSONArray("keys")?.let { k -> (0 until k.length()).map { k.getJSONObject(it) } }.orEmpty()
+            .filter { it.optString("property") == "opacity" }
+        if (keys.isEmpty()) {
+            patch(clip.id, JSONObject().put("opacity", value), gesture)
+            return
+        }
+        // the key is set where the playhead stands: it must not run on during the drag
+        if (playing) stop()
+        val length = clip.durationUs.coerceAtLeast(1).toDouble()
+        val at = ((playhead - clip.startUs) / length).coerceIn(0.0, 1.0)
+        val here = keys.minByOrNull { kotlin.math.abs(it.optDouble("at") - at) }?.takeIf { kotlin.math.abs(it.optDouble("at") - at) <= KEY_NEAR_US / length }
+        val set = JSONObject().put("op", "setClipKey").put("clipId", clip.id).put("property", "opacity")
+            .put("at", here?.optDouble("at") ?: at).put("value", value)
+        here?.opt("ease")?.let { set.put("ease", it) }
+        command(set, gesture)
     }
 
     private var beatsRead: Pair<ULong?, Map<String, List<Double>>> = null to emptyMap()
@@ -690,8 +746,10 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
         message = if (had) "$name off" else "$name on"
     }
 
-    /** The clip as the engine holds it. */
-    fun clipJson(id: String): JSONObject? = clip(id)?.json?.let { runCatching { JSONObject(it) }.getOrNull() }
+    /** The clip as the engine holds it, with the effect chain on its way there when there is one. */
+    fun clipJson(id: String): JSONObject? = clip(id)?.json?.let { runCatching { JSONObject(it) }.getOrNull() }?.also { json ->
+        pendingChain(id)?.let { json.put("videoEffects", JSONArray(it)) }
+    }
 
     fun toggleMainSound() {
         val main = timeline?.rows?.firstOrNull { it.kind == RowKind.MAIN } ?: return
