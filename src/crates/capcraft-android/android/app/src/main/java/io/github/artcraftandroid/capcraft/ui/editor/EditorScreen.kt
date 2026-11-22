@@ -69,6 +69,8 @@ import io.github.artcraftandroid.capcraft.ui.Type
 import io.github.artcraftandroid.capcraft.ui.common.Toast
 import io.github.artcraftandroid.capcraft.ui.editor.panels.PanelHost
 import io.github.artcraftandroid.capcraft.ui.export.ExportScreen
+import java.util.concurrent.ConcurrentLinkedDeque
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.conflate
@@ -330,12 +332,18 @@ private class ScrubMeter {
     }
 }
 
+/** How far ahead of the playhead a frame made may be and still be waited for. */
+private const val AHEAD_MOST = 6L
+
+/** How many frames are made ahead while playing. */
+private const val MADE_AHEAD = 3
+
 /**
- * Three bitmaps the engine draws into in turn: the one on screen, the one made ahead of it while playing, and one
- * more, so the one on screen is never written mid-frame.
+ * [count] bitmaps the engine draws into in turn: the one on screen, the ones made ahead of it while playing, the one
+ * being made, and one more, so the one on screen is never written mid-frame.
  */
-private class FrameBuffers {
-    private val bitmaps = arrayOfNulls<Bitmap>(3)
+private class FrameBuffers(count: Int) {
+    private val bitmaps = arrayOfNulls<Bitmap>(count)
     private var next = 0
     fun take(): Bitmap? = bitmaps[next]
     fun put(b: Bitmap) {
@@ -347,7 +355,9 @@ private class FrameBuffers {
 @Composable
 private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageBitmap? {
     var image by remember { mutableStateOf<ImageBitmap?>(null) }
-    val buffers = remember { FrameBuffers() }
+    val buffers = remember { FrameBuffers(3) }
+    // a play's frames have bitmaps of their own: its last may still be being made when the picture at rest is
+    val playBuffers = remember { FrameBuffers(MADE_AHEAD + 3) }
     val meter = remember { ScrubMeter() }
     val session = vm.session
     val revision = vm.timeline?.revision
@@ -361,30 +371,47 @@ private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageB
             val den = (vm.timeline?.fpsDen ?: 1L).coerceAtLeast(1L)
             fun frameAt(us: Long) = us * num / (den * 1_000_000L)
             fun timeOf(frame: Long) = (4 * frame + 1) * den * 1_000_000L / (4 * num)
-            suspend fun make(frame: Long): Bitmap? {
-                val pic = withContext(Threads.preview) {
-                    runCatching { s.frame(timeOf(frame), width.toUInt(), height.toUInt(), Motion.PLAYING) }.getOrNull()
-                } ?: return null
-                val b = pic.intoBitmap(buffers.take()) ?: return null
-                buffers.put(b)
-                return b
+            suspend fun make(frame: Long): Bitmap? = withContext(Threads.preview) {
+                runCatching { s.frame(timeOf(frame), width.toUInt(), height.toUInt(), Motion.PLAYING) }.getOrNull()
+                    ?.intoBitmap(playBuffers.take())?.also { playBuffers.put(it) }
             }
             var shown = -1L
-            var ready: Bitmap? = null
-            var readyFrame = -1L
+            // frames made and not yet shown, the soonest first: made one after another on the preview's thread while
+            // the one before is on screen, so neither waits for the other
+            val made = ConcurrentLinkedDeque<Pair<Long, Bitmap>>()
             var frames = 0
             var skipped = 0L
             var since = System.nanoTime()
             withContext(AndroidUiDispatcher.Main) {
-                while (isActive && vm.playing) {
-                    // each frame of the timeline is made once, while the one before it is on screen, and shown on the
-                    // display frame the playhead reaches it; one the engine was too slow for is skipped, not caught up
-                    // on, so the picture keeps time with the sound
+                val maker = launch(Dispatchers.Default) {
+                    // how long a frame takes to make, microseconds, as it has lately: the next is made for when it
+                    // will be done, so one the engine is slow for is not late before it is begun
+                    var cost = 15_000.0
+                    var last = -1L
+                    while (isActive && vm.playing) {
+                        if (made.size >= MADE_AHEAD) {
+                            delay(2)
+                            continue
+                        }
+                        val due = frameAt(vm.playhead + cost.toLong())
+                        // after a seek back, from where the playhead is
+                        val next = if (last > due + AHEAD_MOST) due else maxOf(last + 1, due)
+                        val began = System.nanoTime()
+                        val b = make(next) ?: break
+                        cost += ((System.nanoTime() - began) / 1000.0 - cost) * 0.2
+                        last = next
+                        made.addLast(next to b)
+                    }
+                }
+                while (isActive && vm.playing && (maker.isActive || made.isNotEmpty())) {
                     androidx.compose.runtime.withFrameNanos { }
-                    val frame = frameAt(vm.playhead)
-                    if (frame == shown) continue
+                    val due = frameAt(vm.playhead)
+                    // the latest that is due; what it passes by is skipped, so the picture keeps time with the sound
+                    while (made.size > 1 && made.elementAt(1).first <= due) made.pollFirst()
+                    val (frame, b) = made.peekFirst() ?: continue
+                    if (frame > due && frame - due <= AHEAD_MOST) continue
+                    made.pollFirst()
                     if (shown >= 0 && frame > shown + 1) skipped += frame - shown - 1
-                    val b = (if (frame == readyFrame) ready else null) ?: make(frame) ?: break
                     image = b.asImageBitmap()
                     shown = frame
                     frames++
@@ -395,9 +422,8 @@ private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageB
                         skipped = 0
                         since = now
                     }
-                    readyFrame = frame + 1
-                    ready = make(readyFrame) ?: break
                 }
+                maker.cancel()
             }
         } else {
             suspend fun show(at: Long, motion: Motion) {
