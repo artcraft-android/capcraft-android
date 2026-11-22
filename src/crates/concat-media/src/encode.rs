@@ -721,6 +721,20 @@ enum Attempt {
     Component(&'static str),
 }
 
+/// Whether `encoder_name` is left to put its headers in the stream, for the
+/// muxer to take from the first packet, and not asked for them up front.
+///
+/// MediaCodec has none to give until it has encoded something, so FFmpeg's
+/// wrapper, asked up front, encodes a picture of its own, ends the stream and
+/// flushes the codec to begin again. What a codec does after that is its
+/// vendor's. A file from one phone began without a keyframe, its first a
+/// frame short of two seconds in, as if the group of pictures the wrapper's
+/// own began went on (#45); and Android's own H.264 encoder took one frame
+/// more and never another.
+fn headers_in_the_stream(encoder_name: &str) -> bool {
+    matches!(encoder_name, "h264_mediacodec" | "hevc_mediacodec")
+}
+
 /// The ways to ask `encoder_name`, in order.
 fn attempts(encoder_name: &str) -> &'static [Attempt] {
     use Attempt::*;
@@ -841,7 +855,7 @@ fn open_video(
             (*context).thread_count = i32::from(options.threads);
         }
     }
-    if global_header {
+    if global_header && !headers_in_the_stream(encoder_name) {
         video.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
     }
     if pq {
@@ -2307,6 +2321,23 @@ mod tests {
         assert_eq!(count, FRAMES, "every encoded frame should decode back");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A phone's encoders are never asked for their headers up front: see
+    /// [`headers_in_the_stream`].
+    #[test]
+    fn a_phones_encoders_put_their_headers_in_the_stream() {
+        assert!(headers_in_the_stream("h264_mediacodec"));
+        assert!(headers_in_the_stream("hevc_mediacodec"));
+        for other in [
+            "libx264",
+            "libx265",
+            "h264_videotoolbox",
+            "hevc_nvenc",
+            "prores_ks",
+        ] {
+            assert!(!headers_in_the_stream(other), "{other}");
+        }
     }
 
     #[test]
