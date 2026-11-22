@@ -350,8 +350,7 @@ private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageB
     val buffers = remember { FrameBuffers() }
     val meter = remember { ScrubMeter() }
     val session = vm.session
-    val revision = vm.timeline?.revision
-    LaunchedEffect(session, revision, width, height, vm.playing) {
+    LaunchedEffect(session, width, height, vm.playing) {
         val s = session ?: return@LaunchedEffect
         if (vm.playing) {
             // which frame of the timeline an instant falls in, and the instant a frame is made for: a quarter of the way
@@ -413,8 +412,10 @@ private fun rememberFrames(vm: EditorViewModel, width: Int, height: Int): ImageB
             }
             var rest: Job? = null
             // every frame made is shown, and the next is made for wherever the playhead is by then:
-            // a drag moves it faster than frames are made, and waiting for it to hold still showed few
-            snapshotFlow { vm.playhead }.conflate().collect { playhead ->
+            // a drag moves it faster than frames are made, and waiting for it to hold still showed few. The same goes
+            // for edits: begun again at each, a frame slower to make than the next edit was to come was never shown,
+            // and a picture moved by its frame stood still until it was let go
+            snapshotFlow { vm.playhead to vm.timeline?.revision }.conflate().collect { (playhead, _) ->
                 rest?.cancel()
                 // the last frame, not the black just past it, at the very end
                 val end = vm.timeline?.durationUs ?: 0L
