@@ -104,6 +104,9 @@ sealed interface Panel {
     enum class Target { Clip, Layer }
 }
 
+/** A difference from the player's clock too large for the sound device's bursts, microseconds. */
+private const val CLOCK_LEAP_US = 150_000.0
+
 /** Where the timeline keeps beat marks, by media id. */
 private const val BEATS = "capcraftBeats"
 
@@ -553,10 +556,43 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
         viewModelScope.launch(Threads.commands) { runCatching { pause() } }
     }
 
-    /** Follows the player's clock while playing; stops at the end. Called once a frame. */
-    fun tick() {
+    /** The picture's clock, microseconds, and the display frame it was read at, nanoseconds (0 before a play's first). */
+    private var clock = 0.0
+    private var clockAt = 0L
+    private var clockRan = 0.0
+
+    /**
+     * The player's clock as the picture follows it at display frame [nanos]. The player's own is told by the sound
+     * device's buffers, which a phone asks for in bursts: it stands, leaps and steps back by tens of milliseconds, and a
+     * picture drawn by it drops frames no one was late with. This one runs by the display and is drawn to the player's,
+     * so it keeps to the sound and moves evenly; only a leap too large to be a burst is followed at once.
+     */
+    private fun evenClock(nanos: Long): Long {
+        val heard = positionUs().toDouble()
+        val step = (nanos - clockAt) / 1000.0
+        if (clockAt == 0L || step !in 0.0..CLOCK_LEAP_US || kotlin.math.abs(heard - clock) > CLOCK_LEAP_US) {
+            clock = heard
+            clockRan = 0.0
+        } else {
+            val run = clock + step
+            clockRan += step
+            // settles quickly after a start, then only drifts
+            val settle = if (clockRan < 600_000) 100_000.0 else 400_000.0
+            clock = maxOf(clock, run + (heard - run) * (1 - kotlin.math.exp(-step / settle)))
+        }
+        clockAt = nanos
+        return clock.toLong()
+    }
+
+    /** A play begins: the picture's clock is taken from the player's afresh. */
+    fun startClock() {
+        clockAt = 0L
+    }
+
+    /** Follows the player's clock while playing; stops at the end. Called once a frame, with the frame's time. */
+    fun tick(nanos: Long) {
         if (!playing) return
-        val t = positionUs()
+        val t = evenClock(nanos)
         val end = timeline?.durationUs ?: 0L
         if (t >= end && end > 0) {
             playhead = end
@@ -565,7 +601,9 @@ class EditorViewModel(app: Application, val path: String) : AndroidViewModel(app
             playhead = t
         }
         if (!isPlaying() && playing) {
-            // the player stopped by itself (end of sound, an error)
+            // the player stopped by itself (end of sound, an error); at the end, which the even clock may trail by a
+            // few frames, the playhead is put there
+            if (end - t < 250_000) playhead = end
             playing = false
         }
     }
